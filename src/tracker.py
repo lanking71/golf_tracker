@@ -24,6 +24,14 @@ tracking.min_move_distance 미만) 기록하지 않아서, 점이 촘촘하게
 "멀리 떨어진 값"이 연속 max_consecutive_jumps번 이상 나오면, 오검출이
 아니라 공을 실제로 다른 곳에 옮겨 놓은 것으로 보고 그 위치를 새로
 받아들인다.
+
+TRACKING 중에는 매 프레임 update_detection()을 호출해 정지·이탈을
+판정한다 (PROJECT_PLAN.md "5. 공이 멈춘 것은 어떻게 판단하나요?" 참고).
+- 정지: 프레임 간 이동량이 stop_threshold 미만인 상태가
+  stop_duration초 이상 유지되면 정지로 보고 FINISHED로 전환한다.
+- 이탈: 공 검출 실패가 lost_duration초 이상 지속되면 화면 이탈로 보고
+  FINISHED로 전환한다.
+전환 사유는 finish_reason에 "정지 감지" / "화면 이탈"로 남는다.
 """
 
 from dataclasses import dataclass
@@ -35,6 +43,13 @@ from src.config import load_settings
 DEFAULT_MIN_MOVE_DISTANCE = 6
 DEFAULT_MAX_JUMP_DISTANCE = 80
 DEFAULT_MAX_CONSECUTIVE_JUMPS = 10
+DEFAULT_STOP_THRESHOLD = 3
+DEFAULT_STOP_DURATION = 1.0
+DEFAULT_LOST_DURATION = 2.0
+
+# finish_reason에 남는 종료 사유 문구 (상태 배지에 그대로 표시됨)
+STOP_REASON = "정지 감지"
+LOST_REASON = "화면 이탈"
 
 
 class TrackerState(Enum):
@@ -91,6 +106,10 @@ class Tracker:
         self.start_position: tuple[int, int] | None = None
         # 기록된 이동 궤적 (TrajectoryPoint 목록), 시간 순서대로 쌓인다
         self.trajectory: list[TrajectoryPoint] = []
+        # 정지 판정으로 멈춘 위치 (x, y) - 없으면 None
+        self.stop_position: tuple[int, int] | None = None
+        # FINISHED로 전환된 사유 ("정지 감지" / "화면 이탈"), 없으면 None
+        self.finish_reason: str | None = None
 
         loaded = settings if settings is not None else load_settings().get("tracking", {})
         self._min_move_distance = loaded.get("min_move_distance", DEFAULT_MIN_MOVE_DISTANCE)
@@ -99,8 +118,18 @@ class Tracker:
         self._max_consecutive_jumps = loaded.get(
             "max_consecutive_jumps", DEFAULT_MAX_CONSECUTIVE_JUMPS
         )
+        self._stop_threshold = loaded.get("stop_threshold", DEFAULT_STOP_THRESHOLD)
+        self._stop_duration = loaded.get("stop_duration", DEFAULT_STOP_DURATION)
+        self._lost_duration = loaded.get("lost_duration", DEFAULT_LOST_DURATION)
+
         # 직전 점과 너무 멀어서(오검출로 보고) 연속으로 버린 횟수
         self._consecutive_jump_count = 0
+        # 정지 판정용: 마지막으로 본 원시 검출 좌표와, 그 위치 근처에서
+        # 멈춰 있기 시작한(프레임 간 이동이 stop_threshold 미만이 된) 시각
+        self._last_raw_position: tuple[int, int] | None = None
+        self._stop_since: float | None = None
+        # 이탈 판정용: 공을 못 찾기 시작한 시각
+        self._lost_since: float | None = None
 
     def can(self, action: str) -> bool:
         """지금 상태에서 이 동작을 해도 되는지 확인한다. (버튼 활성화 여부에 사용)"""
@@ -131,10 +160,18 @@ class Tracker:
         """'추적 준비' 버튼.
 
         원래는 공 움직임을 자동으로 감지해서 TRACKING으로 넘어가야 하지만
-        (# TODO: 6~7단계에서 실제 움직임 감지로 교체), 이번 단계는 상태
+        (# TODO: 6단계에서 실제 움직임 감지로 교체), 이번 단계는 상태
         전환 자체가 목적이라 버튼을 누르면 바로 TRACKING으로 전환한다.
+        정지·이탈 판정에 쓰는 타이머들도 새로 시작하도록 초기화한다.
         """
-        return self._transition("start_tracking", TrackerState.TRACKING)
+        if not self._transition("start_tracking", TrackerState.TRACKING):
+            return False
+        self.stop_position = None
+        self.finish_reason = None
+        self._last_raw_position = None
+        self._stop_since = None
+        self._lost_since = None
+        return True
 
     def add_trajectory_point(self, x: int, y: int, timestamp: float) -> bool:
         """TRACKING 상태일 때, 검출된 공 좌표를 궤적에 기록한다.
@@ -172,6 +209,51 @@ class Tracker:
         self.trajectory.append(TrajectoryPoint(x=x, y=y, timestamp=timestamp))
         return True
 
+    def update_detection(self, x: int | None, y: int | None, timestamp: float) -> str | None:
+        """TRACKING 상태에서 매 프레임 호출해 정지·이탈 여부를 판정한다.
+
+        공을 찾았으면 (x, y)를, 못 찾았으면 (None, None)을 넘긴다.
+        조건을 만족해 FINISHED로 전환됐으면 종료 사유
+        (STOP_REASON/LOST_REASON)를 반환하고, 아니면 내부 타이머만
+        갱신하고 None을 반환한다.
+        """
+        if self.state != TrackerState.TRACKING:
+            return None
+
+        if x is None or y is None:
+            # 공을 못 찾음 -> 이탈 타이머 시작/유지
+            if self._lost_since is None:
+                self._lost_since = timestamp
+            elif timestamp - self._lost_since >= self._lost_duration:
+                return self._finish_with_reason(LOST_REASON)
+            return None
+
+        # 공을 다시 찾았으면 이탈 타이머는 리셋
+        self._lost_since = None
+
+        if self._last_raw_position is not None:
+            prev_x, prev_y = self._last_raw_position
+            distance = ((x - prev_x) ** 2 + (y - prev_y) ** 2) ** 0.5
+            if distance > self._stop_threshold:
+                # 의미 있게 움직였다 -> 정지 타이머 리셋
+                self._stop_since = None
+            elif self._stop_since is None:
+                # 방금 정지 상태로 들어왔다 -> 타이머 시작
+                self._stop_since = timestamp
+
+        self._last_raw_position = (x, y)
+
+        if self._stop_since is not None and timestamp - self._stop_since >= self._stop_duration:
+            self.stop_position = (x, y)
+            return self._finish_with_reason(STOP_REASON)
+
+        return None
+
+    def _finish_with_reason(self, reason: str) -> str:
+        self.finish_tracking()
+        self.finish_reason = reason
+        return reason
+
     def stop_tracking(self) -> bool:
         """'추적 중지' 버튼: 오검출 등 문제가 생겼을 때 수동으로 중지하고 READY로 되돌아간다."""
         return self._transition("stop_tracking", TrackerState.READY)
@@ -179,7 +261,7 @@ class Tracker:
     def finish_tracking(self) -> bool:
         """공이 멈추거나 화면을 벗어났을 때 호출해서 추적을 정상 종료한다.
 
-        # TODO: 7단계(정지·이탈 판정)에서 실제로 연결한다.
+        update_detection()이 정지/이탈을 판정하면 자동으로 호출한다.
         지금은 어떤 버튼과도 연결돼 있지 않다.
         """
         return self._transition("finish_tracking", TrackerState.FINISHED)
@@ -190,5 +272,10 @@ class Tracker:
             return False
         self.start_position = None
         self.trajectory = []
+        self.stop_position = None
+        self.finish_reason = None
         self._consecutive_jump_count = 0
+        self._last_raw_position = None
+        self._stop_since = None
+        self._lost_since = None
         return True

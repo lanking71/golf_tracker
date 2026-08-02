@@ -1,8 +1,8 @@
 {
     "camera": {
-        "width": 1280,
-        "height": 720,
-        "fps": 90,
+        "width": 1280,   
+        "height": 720,  
+        "fps": 0,
         "use_mjpg": true,
         "rotate": 0
     },
@@ -62,6 +62,9 @@
     "tracking": {
         "min_move_distance": 6,
         "max_jump_distance": 80,
-        "max_consecutive_jumps": 10
+        "max_consecutive_jumps": 10,
+        "stop_threshold": 3,
+        "stop_duration": 1.0,
+        "lost_duration": 2.0
     }
 }

@@ -1,16 +1,17 @@
 """
-볼 트래커 - 6단계: 이동 좌표 저장 + 궤적 표시 (메인 창)
+볼 트래커 - 7단계: 정지·이탈 판정 (메인 창)
 
 - 왼쪽 위: 실시간 카메라 화면
   - 지금 검출된 공: 흰 원 + 빨간 중심점
   - 등록된 시작점(있으면): 골드 십자가 + 링, 계속 표시됨
 - 왼쪽 아래: 궤적 결과 화면. TRACKING 중 기록된 궤적을 실시간으로
-  그린다 - 시작점은 골드, 이동 경로는 라임(#95D5B2) 선, 현재 위치는
-  흰 점.
+  그린다 - 시작점은 골드 점, 정지 위치는 골드 링, 이동 경로는
+  라임(#95D5B2) 선, 현재 위치는 흰 점.
 - 오른쪽: 세로로 배치된 버튼 6개. 각 버튼은 src.tracker.Tracker의 상태
   전환을 호출하고, 지금 상태에서 허용되지 않는 버튼은 자동으로
   비활성화된다.
-- 위쪽: 상태 배지(Tracker.state) + 검출 좌표 배지 + 시작점 배지 + FPS 배지
+- 위쪽: 상태 배지(Tracker.state, FINISHED면 정지/이탈 사유도 표시) +
+  검출 좌표 배지 + 시작점 배지 + 정지점 배지 + FPS 배지
 - 상단 메뉴 "설정 > 검출 설정...": HSV 튜닝 다이얼로그를 연다.
   다이얼로그가 열려 있는 동안에는 카메라 패널에 원본 대신
   마스크 미리보기(검출되는 영역이 흰색으로 보이는 화면)를 보여준다.
@@ -18,14 +19,19 @@
 '시작 위치 등록' 버튼을 누른 순간 검출된 공이 없으면 등록하지 않고,
 상태 배지에 "공이 감지되지 않습니다"를 잠깐 보여준 뒤 원래 상태
 문구로 되돌린다 (상태 전환 자체는 일어나지 않는다).
-TRACKING 중 공이 잠깐 검출되지 않는 프레임은 기록을 건너뛰고,
+TRACKING 중 공이 잠깐 검출되지 않는 프레임은 궤적 기록을 건너뛰고,
 다시 검출되면 이어서 기록한다 (프로그램이 멈추지 않는다).
 직전 점과 너무 멀리 떨어진 검출(오검출로 추정)은 기록하지 않고,
 연속으로 max_consecutive_jumps번 이상 그런 값이 나오면 공을 실제로
 옮긴 것으로 보고 받아들인다 (Tracker.add_trajectory_point 참고).
 궤적을 그릴 때도 점 사이 거리가 너무 크면 선으로 잇지 않아서 매트를
 가로지르는 가짜 직선이 생기지 않는다.
-'궤적 초기화'를 누르면 시작점과 궤적이 카메라/궤적 패널 모두에서
+
+TRACKING 중 매 프레임 Tracker.update_detection()을 호출해 정지·이탈을
+자동으로 판정한다 - 공이 거의 안 움직인 채 stop_duration초 이상
+지나면 "정지 감지"로, 공이 lost_duration초 이상 검출되지 않으면
+"화면 이탈"로 보고 자동으로 FINISHED로 전환된다.
+'궤적 초기화'를 누르면 시작점·정지점·궤적이 카메라/궤적 패널 모두에서
 함께 지워진다.
 
 카메라가 연결되어 있지 않으면 에러 없이 카메라 패널에
@@ -58,7 +64,7 @@ from src.detector import (
     BallDetector,
     build_mask,
 )
-from src.tracker import Tracker
+from src.tracker import Tracker, TrackerState
 from src.ui.styles import QSS
 from src.ui.tuning_dialog import TuningDialog
 
@@ -94,6 +100,8 @@ TRAJECTORY_PATH_COLOR_BGR = (178, 213, 149)  # 라임 (#95D5B2)
 TRAJECTORY_PATH_THICKNESS = 2
 TRAJECTORY_CURRENT_COLOR_BGR = (255, 255, 255)  # 현재 위치는 흰 점
 TRAJECTORY_CURRENT_RADIUS = 6
+TRAJECTORY_STOP_RADIUS = 14  # 정지 위치는 골드 "링"(테두리만)으로 표시
+TRAJECTORY_STOP_THICKNESS = 3
 
 # 시작 위치 등록 시 공이 검출되지 않았을 때 잠깐 보여줄 안내 문구
 NOT_DETECTED_MESSAGE = "공이 감지되지 않습니다"
@@ -108,7 +116,7 @@ CAMERA_NOT_CONNECTED_TEXT = "카메라를 연결해주세요"
 
 
 class MainWindow(QMainWindow):
-    """볼 트래커 메인 창 (6단계: 이동 좌표 저장 + 궤적 표시까지 구현)"""
+    """볼 트래커 메인 창 (7단계: 정지·이탈 판정까지 구현)"""
 
     def __init__(self):
         super().__init__()
@@ -145,6 +153,10 @@ class MainWindow(QMainWindow):
         self.start_point_label = QLabel("시작점: -")
         self.start_point_label.setObjectName("status")
         top_layout.addWidget(self.start_point_label)
+
+        self.stop_point_label = QLabel("정지점: -")
+        self.stop_point_label.setObjectName("status")
+        top_layout.addWidget(self.stop_point_label)
 
         self.fps_label = QLabel("FPS: -")
         self.fps_label.setObjectName("status")
@@ -188,6 +200,7 @@ class MainWindow(QMainWindow):
         self._update_status_badge()
         self._update_button_states()
         self._update_start_point_label()
+        self._update_stop_point_label()
         self._render_trajectory_panel()
 
     def _build_menu(self) -> None:
@@ -259,6 +272,7 @@ class MainWindow(QMainWindow):
 
         self._update_button_states()
         self._update_start_point_label()
+        self._update_stop_point_label()
         self._render_trajectory_panel()
 
     def _register_start_position(self) -> None:
@@ -281,8 +295,15 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(NOT_DETECTED_MESSAGE_DURATION_MS, self._update_status_badge)
 
     def _update_status_badge(self) -> None:
-        """상단 상태 배지를 현재 Tracker 상태 문구로 갱신한다."""
-        self.status_label.setText(f"상태: {self.tracker.state.value}")
+        """상단 상태 배지를 현재 Tracker 상태 문구로 갱신한다.
+
+        FINISHED 상태이고 종료 사유(Tracker.finish_reason)가 있으면
+        "상태: 추적 완료 (정지 감지)"처럼 사유도 함께 보여준다.
+        """
+        text = f"상태: {self.tracker.state.value}"
+        if self.tracker.state == TrackerState.FINISHED and self.tracker.finish_reason:
+            text += f" ({self.tracker.finish_reason})"
+        self.status_label.setText(text)
 
     def _update_button_states(self) -> None:
         """현재 상태에서 허용되지 않는 버튼은 비활성화한다."""
@@ -297,6 +318,14 @@ class MainWindow(QMainWindow):
         else:
             x, y = self.tracker.start_position
             self.start_point_label.setText(f"시작점: ({x}, {y})")
+
+    def _update_stop_point_label(self) -> None:
+        """정지 판정으로 멈춘 좌표를 배지에 표시한다. 없으면 '-'."""
+        if self.tracker.stop_position is None:
+            self.stop_point_label.setText("정지점: -")
+        else:
+            x, y = self.tracker.stop_position
+            self.stop_point_label.setText(f"정지점: ({x}, {y})")
 
     def _open_tuning_dialog(self) -> None:
         """'설정 > 검출 설정...' 메뉴를 눌렀을 때 HSV 튜닝 창을 연다."""
@@ -383,17 +412,33 @@ class MainWindow(QMainWindow):
         detection = self.detector.detect(frame)
         self._last_detection = detection
         self._update_coord_label(detection)
+
+        now = time.time()
         if detection is not None:
             self._draw_detection(frame, detection)
             # TRACKING 상태일 때만 실제로 기록된다 (Tracker가 알아서 상태를 확인한다).
-            if self.tracker.add_trajectory_point(detection.x, detection.y, time.time()):
+            if self.tracker.add_trajectory_point(detection.x, detection.y, now):
                 self._render_trajectory_panel()
+            finish_reason = self.tracker.update_detection(detection.x, detection.y, now)
+        else:
+            finish_reason = self.tracker.update_detection(None, None, now)
+
+        if finish_reason is not None:
+            self._on_tracking_finished()
+
         if self.tracker.start_position is not None:
             self._draw_start_point(frame, self.tracker.start_position)
 
         self._update_fps()
         pixmap = self._frame_to_pixmap(frame, self.camera_label.size())
         self.camera_label.setPixmap(pixmap)
+
+    def _on_tracking_finished(self) -> None:
+        """정지·이탈 판정으로 TRACKING -> FINISHED 자동 전환이 일어났을 때 UI를 갱신한다."""
+        self._update_status_badge()
+        self._update_button_states()
+        self._update_stop_point_label()
+        self._render_trajectory_panel()
 
     def _update_coord_label(self, detection: BallDetection | None) -> None:
         """검출된 공의 중심 좌표를 상태 라벨 옆 배지에 표시한다."""
@@ -483,6 +528,9 @@ class MainWindow(QMainWindow):
 
         if points:
             cv2.circle(canvas, points[-1], TRAJECTORY_CURRENT_RADIUS, TRAJECTORY_CURRENT_COLOR_BGR, -1)
+
+        if self.tracker.stop_position is not None:
+            cv2.circle(canvas, self.tracker.stop_position, TRAJECTORY_STOP_RADIUS, START_POINT_COLOR_BGR, TRAJECTORY_STOP_THICKNESS)
 
         pixmap = self._frame_to_pixmap(canvas, self.trajectory_label.size())
         self.trajectory_label.setPixmap(pixmap)
