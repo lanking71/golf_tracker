@@ -537,6 +537,18 @@ class MainWindow(QMainWindow):
             Qt.SmoothTransformation,
         )
 
+    def resizeEvent(self, event) -> None:
+        """창 크기가 바뀔 때 궤적 결과 패널을 새 크기에 맞게 다시 그린다.
+
+        카메라 패널은 8ms마다 도는 타이머가 다음 프레임에 알아서 현재
+        라벨 크기로 다시 스케일링해서 그리지만(_frame_to_pixmap), 궤적
+        패널은 새 궤적 점이 생길 때만 다시 그려지므로, 창 크기 변경
+        시점에 즉시 다시 그려주지 않으면 리사이즈 전 크기로 남아 있게
+        된다.
+        """
+        super().resizeEvent(event)
+        self._render_trajectory_panel()
+
     def closeEvent(self, event) -> None:
         """창을 닫을 때 타이머를 멈추고 카메라 장치를 반납한다."""
         self._camera_timer.stop()
