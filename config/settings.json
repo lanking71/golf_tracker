@@ -1,0 +1,8 @@
+{
+    "camera": {
+        "width": 1920,
+        "height": 1080,
+        "fps": 90,
+        "use_mjpg": true
+    }
+}

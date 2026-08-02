@@ -30,8 +30,10 @@ from PySide6.QtWidgets import (
 from src.camera import Camera
 from src.ui.styles import QSS
 
-# 카메라를 몇 밀리초마다 확인할지 (약 30번/초)
-CAMERA_POLL_INTERVAL_MS = 33
+# 카메라를 몇 밀리초마다 확인할지.
+# 카메라 자체 FPS(설정상 최대 90)보다 충분히 짧게 잡아야, 우리가 폴링하는
+# 주기가 병목이 되지 않고 실제 카메라 FPS가 그대로 측정/표시된다.
+CAMERA_POLL_INTERVAL_MS = 8
 # 카메라가 없을 때, 다시 연결됐는지 확인하는 문구
 CAMERA_NOT_CONNECTED_TEXT = "카메라를 연결해주세요"
 
