@@ -1,7 +1,13 @@
 """
-볼 트래커 - 8단계: 궤적 요약 통계 (메인 창)
+볼 트래커 - 9단계: 매트 캘리브레이션 (메인 창)
 
 - 왼쪽 위: 실시간 카메라 화면
+  - CALIBRATING 상태에서는 화면을 클릭해 매트 네 모서리를
+    좌상단->우상단->우하단->좌하단 순서로 지정한다. 클릭한 점은
+    골드 번호(1~4)로 표시된다. 4점을 다 찍으면 원근 변환 행렬을
+    만들어 config/settings.json에 저장한다 (src.calibration 담당).
+    '캘리브레이션' 버튼을 다시 누르면 지금까지 찍은 점을 지우고
+    '다시 지정'할 수 있다.
   - 지금 검출된 공: 흰 원 + 빨간 중심점
   - 등록된 시작점(있으면): 골드 십자가 + 링, 계속 표시됨
 - 왼쪽 아래: 궤적 결과 화면. TRACKING 중 기록된 궤적을 실시간으로
@@ -61,6 +67,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from src.calibration import CORNER_NAMES, Calibration
 from src.camera import Camera
 from src.config import load_settings, save_settings
 from src.detector import (
@@ -71,6 +78,7 @@ from src.detector import (
 )
 from src.stats import compute_trajectory_stats
 from src.tracker import Tracker, TrackerState
+from src.ui.camera_label import CameraLabel
 from src.ui.styles import QSS
 from src.ui.tuning_dialog import TuningDialog
 
@@ -99,6 +107,11 @@ START_POINT_MARKER_SIZE = 16
 START_POINT_RING_RADIUS = 10
 START_POINT_THICKNESS = 2
 
+# 캘리브레이션 중 클릭한 매트 모서리 표시 (골드 점 + 번호)
+CALIBRATION_POINT_RADIUS = 6
+CALIBRATION_FONT_SCALE = 0.8
+CALIBRATION_FONT_THICKNESS = 2
+
 # 궤적 결과 패널 색상 (OpenCV는 BGR 순서)
 TRAJECTORY_BG_COLOR_BGR = (79, 106, 45)  # 패널 배경 (#2D6A4F)과 동일
 TRAJECTORY_START_RADIUS = 10  # 궤적 패널의 시작점(골드) 반지름
@@ -126,7 +139,7 @@ CAMERA_NOT_CONNECTED_TEXT = "카메라를 연결해주세요"
 
 
 class MainWindow(QMainWindow):
-    """볼 트래커 메인 창 (8단계: 궤적 요약 통계까지 구현)"""
+    """볼 트래커 메인 창 (9단계: 매트 캘리브레이션까지 구현)"""
 
     def __init__(self):
         super().__init__()
@@ -136,6 +149,7 @@ class MainWindow(QMainWindow):
 
         # 버튼 활성화 여부를 계산하려면 레이아웃을 만들기 전에 필요하다.
         self.tracker = Tracker()
+        self.calibration = Calibration()
         self._buttons: dict[str, QPushButton] = {}
 
         self._build_menu()
@@ -179,6 +193,8 @@ class MainWindow(QMainWindow):
 
         body_layout.addLayout(self._build_left_panel(), 3)
         body_layout.addLayout(self._build_right_panel(), 1)
+
+        self.camera_label.clicked.connect(self._on_camera_clicked)
 
         # 전체 창에 QSS 스타일 적용
         self.setStyleSheet(QSS)
@@ -224,7 +240,7 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout()
         layout.setSpacing(12)
 
-        self.camera_label = QLabel("실시간 카메라 화면\n(다음 단계에서 연결)")
+        self.camera_label = CameraLabel("실시간 카메라 화면\n(다음 단계에서 연결)")
         self.camera_label.setObjectName("panel")
         self.camera_label.setMinimumSize(400, 250)
         layout.addWidget(self.camera_label, 1)
@@ -290,6 +306,12 @@ class MainWindow(QMainWindow):
                 # 저장은 상태를 바꾸지 않는 동작이다.
                 # TODO: 12단계(결과 저장)에서 JSON/CSV·스크린샷 저장 로직을 연결한다.
                 pass
+            elif action == "calibrate":
+                # 캘리브레이션 버튼은 다시 눌러도(이미 CALIBRATING이어도) 항상
+                # 지금까지 찍은 모서리를 지우고 새로 찍기 시작한다. 이렇게 하면
+                # 잘못 찍었을 때 같은 버튼으로 '다시 지정'할 수 있다.
+                self.calibration.reset_corners()
+                self.tracker.calibrate()
             elif action is not None:
                 getattr(self.tracker, action)()
             self._update_status_badge()
@@ -298,6 +320,19 @@ class MainWindow(QMainWindow):
         self._update_start_point_label()
         self._update_stop_point_label()
         self._render_trajectory_panel()
+
+    def _on_camera_clicked(self, x: int, y: int) -> None:
+        """카메라 화면 클릭. CALIBRATING 상태일 때만 매트 모서리로 등록한다.
+
+        4번째 점을 찍으면 원근 변환 행렬이 자동으로 만들어지고
+        config/settings.json에 저장된다 (재실행 시 자동으로 다시 불러온다).
+        """
+        if self.tracker.state != TrackerState.CALIBRATING:
+            return
+        if self.calibration.add_corner(x, y):
+            if self.calibration.is_calibrated():
+                self.calibration.save()
+            self._update_status_badge()
 
     def _register_start_position(self) -> None:
         """검출된 공의 현재 좌표를 시작점으로 등록한다.
@@ -323,10 +358,17 @@ class MainWindow(QMainWindow):
 
         FINISHED 상태이고 종료 사유(Tracker.finish_reason)가 있으면
         "상태: 추적 완료 (정지 감지)"처럼 사유도 함께 보여준다.
+        CALIBRATING 상태면 몇 번째 모서리를 찍어야 하는지 안내한다.
         """
         text = f"상태: {self.tracker.state.value}"
         if self.tracker.state == TrackerState.FINISHED and self.tracker.finish_reason:
             text += f" ({self.tracker.finish_reason})"
+        elif self.tracker.state == TrackerState.CALIBRATING:
+            count = len(self.calibration.corners)
+            if count < 4:
+                text += f" ({count}/4 - {CORNER_NAMES[count]} 클릭)"
+            else:
+                text += " (4/4 완료)"
         self.status_label.setText(text)
 
     def _update_button_states(self) -> None:
@@ -420,6 +462,7 @@ class MainWindow(QMainWindow):
         new_frame_size = (frame.shape[1], frame.shape[0])
         if self._frame_size != new_frame_size:
             self._frame_size = new_frame_size
+            self.camera_label.set_frame_size(self._frame_size)
             self._render_trajectory_panel()
 
         if self._mask_preview_active and self._preview_hsv is not None:
@@ -452,6 +495,9 @@ class MainWindow(QMainWindow):
 
         if self.tracker.start_position is not None:
             self._draw_start_point(frame, self.tracker.start_position)
+
+        if self.tracker.state == TrackerState.CALIBRATING:
+            self._draw_calibration_corners(frame, self.calibration.corners)
 
         self._update_fps()
         pixmap = self._frame_to_pixmap(frame, self.camera_label.size())
@@ -490,6 +536,22 @@ class MainWindow(QMainWindow):
             thickness=START_POINT_THICKNESS,
         )
         cv2.circle(frame, position, START_POINT_RING_RADIUS, START_POINT_COLOR_BGR, START_POINT_THICKNESS)
+
+    @staticmethod
+    def _draw_calibration_corners(frame, corners: list) -> None:
+        """캘리브레이션 중 클릭한 매트 모서리를 골드 점 + 번호로 그린다. (frame을 그 자리에서 수정)"""
+        for i, (x, y) in enumerate(corners, start=1):
+            cv2.circle(frame, (x, y), CALIBRATION_POINT_RADIUS, START_POINT_COLOR_BGR, -1)
+            cv2.putText(
+                frame,
+                str(i),
+                (x + 10, y - 10),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                CALIBRATION_FONT_SCALE,
+                START_POINT_COLOR_BGR,
+                CALIBRATION_FONT_THICKNESS,
+                cv2.LINE_AA,
+            )
 
     def _show_camera_not_connected(self) -> None:
         """카메라 패널에 안내 문구를 표시하고 FPS·좌표·검출 상태를 초기화한다."""
