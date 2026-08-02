@@ -4,5 +4,26 @@
         "height": 720,
         "fps": 90,
         "use_mjpg": true
+    },
+    "detection": {
+        "active_profile": "practice",
+        "profiles": {
+            "practice": {
+                "name": "연습용 (흰 공)",
+                "hsv_lower": [0, 0, 180],
+                "hsv_upper": [180, 60, 255],
+                "min_area": 200,
+                "max_area": 8000,
+                "min_circularity": 0.7
+            },
+            "real": {
+                "name": "실전용 (분홍 공)",
+                "hsv_lower": [140, 80, 80],
+                "hsv_upper": [170, 255, 255],
+                "min_area": 200,
+                "max_area": 8000,
+                "min_circularity": 0.7
+            }
+        }
     }
 }

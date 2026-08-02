@@ -1,13 +1,15 @@
 """
-볼 트래커 - 2단계: 카메라 영상 연결 (메인 창)
+볼 트래커 - 3단계: HSV 공 검출 연결 (메인 창)
 
-- 왼쪽 위: 실시간 카메라 화면 (USB 카메라 영상을 그대로 표시)
+- 왼쪽 위: 실시간 카메라 화면 (검출된 공에 원 + 중심점을 그려서 표시)
 - 왼쪽 아래: 궤적 결과 화면 자리 (다음 단계에서 연결)
 - 오른쪽: 세로로 배치된 버튼 6개
-- 위쪽: 현재 상태 배지 + 실제 측정 FPS 배지
+- 위쪽: 현재 상태 배지 + 검출 좌표 배지 + 실제 측정 FPS 배지
 
 카메라가 연결되어 있지 않으면 에러 없이 카메라 패널에
 "카메라를 연결해주세요" 안내 문구를 보여준다.
+공이 검출되지 않으면(조명, 공이 화면 밖으로 나감 등) 조용히 넘어가고
+좌표 배지만 "-"로 표시한다.
 버튼을 누르면 아직 실제 동작은 하지 않고,
 상단 상태 라벨의 문구만 바뀝니다. (추적 관련 기능은 다음 단계에서 연결합니다)
 """
@@ -28,7 +30,14 @@ from PySide6.QtWidgets import (
 )
 
 from src.camera import Camera
+from src.detector import BallDetection, BallDetector
 from src.ui.styles import QSS
+
+# 검출된 공 표시 색상 (OpenCV는 BGR 순서)
+BALL_CIRCLE_COLOR_BGR = (23, 160, 212)  # 골드 (#D4A017)
+BALL_CENTER_COLOR_BGR = (0, 0, 255)  # 중심점은 빨간색으로 눈에 띄게
+BALL_CIRCLE_THICKNESS = 2
+BALL_CENTER_RADIUS = 4
 
 # 카메라를 몇 밀리초마다 확인할지.
 # 카메라 자체 FPS(설정상 최대 90)보다 충분히 짧게 잡아야, 우리가 폴링하는
@@ -39,7 +48,7 @@ CAMERA_NOT_CONNECTED_TEXT = "카메라를 연결해주세요"
 
 
 class MainWindow(QMainWindow):
-    """볼 트래커 메인 창 (2단계: 카메라 영상 연결까지 구현)"""
+    """볼 트래커 메인 창 (3단계: HSV 공 검출까지 구현)"""
 
     def __init__(self):
         super().__init__()
@@ -63,6 +72,10 @@ class MainWindow(QMainWindow):
         self.status_label.setObjectName("status")
         top_layout.addWidget(self.status_label, 1)
 
+        self.coord_label = QLabel("좌표: -")
+        self.coord_label.setObjectName("status")
+        top_layout.addWidget(self.coord_label)
+
         self.fps_label = QLabel("FPS: -")
         self.fps_label.setObjectName("status")
         top_layout.addWidget(self.fps_label)
@@ -80,6 +93,7 @@ class MainWindow(QMainWindow):
 
         # 3) 카메라 연결 + 실시간 영상 표시 준비
         self.camera = Camera()
+        self.detector = BallDetector()
         self._last_frame_time: float | None = None
         self._fps: float = 0.0
 
@@ -160,14 +174,35 @@ class MainWindow(QMainWindow):
             self._show_camera_not_connected()
             return
 
+        # 공 검출 (못 찾아도 예외 없이 None만 돌아온다)
+        detection = self.detector.detect(frame)
+        self._update_coord_label(detection)
+        if detection is not None:
+            self._draw_detection(frame, detection)
+
         self._update_fps()
         pixmap = self._frame_to_pixmap(frame)
         self.camera_label.setPixmap(pixmap)
 
+    def _update_coord_label(self, detection: BallDetection | None) -> None:
+        """검출된 공의 중심 좌표를 상태 라벨 옆 배지에 표시한다."""
+        if detection is None:
+            self.coord_label.setText("좌표: -")
+        else:
+            self.coord_label.setText(f"좌표: ({detection.x}, {detection.y})")
+
+    @staticmethod
+    def _draw_detection(frame, detection: BallDetection) -> None:
+        """검출된 공 위치에 원과 중심점을 그린다. (frame을 그 자리에서 수정)"""
+        center = (detection.x, detection.y)
+        cv2.circle(frame, center, detection.radius, BALL_CIRCLE_COLOR_BGR, BALL_CIRCLE_THICKNESS)
+        cv2.circle(frame, center, BALL_CENTER_RADIUS, BALL_CENTER_COLOR_BGR, -1)
+
     def _show_camera_not_connected(self) -> None:
-        """카메라 패널에 안내 문구를 표시하고 FPS 표시를 초기화한다."""
+        """카메라 패널에 안내 문구를 표시하고 FPS·좌표 표시를 초기화한다."""
         self.camera_label.setText(CAMERA_NOT_CONNECTED_TEXT)
         self.fps_label.setText("FPS: -")
+        self.coord_label.setText("좌표: -")
         self._last_frame_time = None
         self._fps = 0.0
 
