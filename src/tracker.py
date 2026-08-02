@@ -150,10 +150,25 @@ class Tracker:
 
         공이 검출되지 않았을 때 호출하지 않는 것은(좌표를 모르니까)
         호출하는 쪽(UI)의 책임이다. 여기서는 상태 전환 허용 여부만 본다.
+
+        새 시작점을 등록한다는 것은 새로운 시도(퍼팅)를 시작한다는
+        뜻이므로, 이전 시도의 궤적·정지 정보를 모두 정리한다. 이걸
+        안 하면 '궤적 초기화'를 누르지 않고 재시도할 때 새 공 위치가
+        이전 궤적의 마지막 점과 비교되어 "너무 멀리 떨어진 오검출"로
+        계속 무시되는 문제가 있었다 (연속 max_consecutive_jumps번을
+        채워야만 다시 기록되기 시작해서, 시도할 때마다 되다 안 되다
+        했음).
         """
         if not self._transition("register_start_position", TrackerState.READY):
             return False
         self.start_position = (x, y)
+        self.trajectory = []
+        self.stop_position = None
+        self.finish_reason = None
+        self._consecutive_jump_count = 0
+        self._last_raw_position = None
+        self._stop_since = None
+        self._lost_since = None
         return True
 
     def start_tracking(self) -> bool:
