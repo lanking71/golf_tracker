@@ -120,4 +120,14 @@ QSlider::handle:horizontal {
     margin: -6px 0;
     border-radius: 8px;
 }
+
+/* 궤적 패널 오른쪽의 요약 통계 카드 */
+QLabel#stats_card {
+    background-color: #1F4A38;
+    color: white;
+    border: 2px solid #D4A017;
+    border-radius: 8px;
+    padding: 14px;
+    font-size: 15px;
+}
 """
