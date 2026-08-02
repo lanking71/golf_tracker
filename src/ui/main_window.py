@@ -1,15 +1,22 @@
 """
-볼 트래커 - 4단계: 프로그램 상태 관리 (메인 창)
+볼 트래커 - 5단계: 시작 위치 등록 (메인 창)
 
-- 왼쪽 위: 실시간 카메라 화면 (검출된 공에 원 + 중심점을 그려서 표시)
+- 왼쪽 위: 실시간 카메라 화면
+  - 지금 검출된 공: 흰 원 + 빨간 중심점
+  - 등록된 시작점(있으면): 골드 십자가 + 링, 계속 표시됨
 - 왼쪽 아래: 궤적 결과 화면 자리 (다음 단계에서 연결)
 - 오른쪽: 세로로 배치된 버튼 6개. 각 버튼은 src.tracker.Tracker의 상태
   전환을 호출하고, 지금 상태에서 허용되지 않는 버튼은 자동으로
   비활성화된다.
-- 위쪽: 현재 상태 배지(Tracker.state) + 검출 좌표 배지 + 실제 측정 FPS 배지
+- 위쪽: 상태 배지(Tracker.state) + 검출 좌표 배지 + 시작점 배지 + FPS 배지
 - 상단 메뉴 "설정 > 검출 설정...": HSV 튜닝 다이얼로그를 연다.
   다이얼로그가 열려 있는 동안에는 카메라 패널에 원본 대신
   마스크 미리보기(검출되는 영역이 흰색으로 보이는 화면)를 보여준다.
+
+'시작 위치 등록' 버튼을 누른 순간 검출된 공이 없으면 등록하지 않고,
+상태 배지에 "공이 감지되지 않습니다"를 잠깐 보여준 뒤 원래 상태
+문구로 되돌린다 (상태 전환 자체는 일어나지 않는다).
+'궤적 초기화'를 누르면 시작점도 함께 지워진다.
 
 카메라가 연결되어 있지 않으면 에러 없이 카메라 패널에
 "카메라를 연결해주세요" 안내 문구를 보여준다.
@@ -56,11 +63,22 @@ BUTTON_ACTIONS = {
     "저장": "save",
 }
 
-# 검출된 공 표시 색상 (OpenCV는 BGR 순서)
-BALL_CIRCLE_COLOR_BGR = (23, 160, 212)  # 골드 (#D4A017)
+# 검출된 공 표시 색상 (OpenCV는 BGR 순서). 골드는 시작점 전용 색이라
+# 매 프레임 바뀌는 검출 표시는 흰색으로 구분한다.
+BALL_CIRCLE_COLOR_BGR = (255, 255, 255)  # 흰색
 BALL_CENTER_COLOR_BGR = (0, 0, 255)  # 중심점은 빨간색으로 눈에 띄게
 BALL_CIRCLE_THICKNESS = 2
 BALL_CENTER_RADIUS = 4
+
+# 등록된 시작점 표시 색상/크기 (골드 십자가 + 링)
+START_POINT_COLOR_BGR = (23, 160, 212)  # 골드 (#D4A017)
+START_POINT_MARKER_SIZE = 16
+START_POINT_RING_RADIUS = 10
+START_POINT_THICKNESS = 2
+
+# 시작 위치 등록 시 공이 검출되지 않았을 때 잠깐 보여줄 안내 문구
+NOT_DETECTED_MESSAGE = "공이 감지되지 않습니다"
+NOT_DETECTED_MESSAGE_DURATION_MS = 1500
 
 # 카메라를 몇 밀리초마다 확인할지.
 # 카메라 자체 FPS(설정상 최대 90)보다 충분히 짧게 잡아야, 우리가 폴링하는
@@ -71,7 +89,7 @@ CAMERA_NOT_CONNECTED_TEXT = "카메라를 연결해주세요"
 
 
 class MainWindow(QMainWindow):
-    """볼 트래커 메인 창 (4단계: 프로그램 상태 관리까지 구현)"""
+    """볼 트래커 메인 창 (5단계: 시작 위치 등록까지 구현)"""
 
     def __init__(self):
         super().__init__()
@@ -105,6 +123,10 @@ class MainWindow(QMainWindow):
         self.coord_label.setObjectName("status")
         top_layout.addWidget(self.coord_label)
 
+        self.start_point_label = QLabel("시작점: -")
+        self.start_point_label.setObjectName("status")
+        top_layout.addWidget(self.start_point_label)
+
         self.fps_label = QLabel("FPS: -")
         self.fps_label.setObjectName("status")
         top_layout.addWidget(self.fps_label)
@@ -125,6 +147,9 @@ class MainWindow(QMainWindow):
         self.detector = BallDetector()
         self._last_frame_time: float | None = None
         self._fps: float = 0.0
+        # 가장 최근 프레임에서 검출된 공 (없으면 None). '시작 위치 등록'
+        # 버튼을 눌렀을 때 이 값을 시작점으로 쓴다.
+        self._last_detection: BallDetection | None = None
 
         # HSV 튜닝 다이얼로그 (검출 설정 메뉴에서 연다). 열려 있는 동안은
         # 마스크 미리보기를 카메라 패널에 대신 보여준다.
@@ -140,6 +165,7 @@ class MainWindow(QMainWindow):
         # 시작 상태(IDLE)에 맞게 배지 문구와 버튼 활성화 상태를 맞춘다.
         self._update_status_badge()
         self._update_button_states()
+        self._update_start_point_label()
 
     def _build_menu(self) -> None:
         """상단 메뉴 바에 '설정 > 검출 설정...' 항목을 만든다."""
@@ -196,16 +222,39 @@ class MainWindow(QMainWindow):
 
     def _on_button_clicked(self, button_name: str) -> None:
         """버튼 클릭 시 호출되는 공통 슬롯. 버튼에 맞는 상태 전환을 시도한다."""
-        action = BUTTON_ACTIONS.get(button_name)
-        if action == "save":
-            # 저장은 상태를 바꾸지 않는 동작이다.
-            # TODO: 12단계(결과 저장)에서 JSON/CSV·스크린샷 저장 로직을 연결한다.
-            pass
-        elif action is not None:
-            getattr(self.tracker, action)()
+        if button_name == "시작 위치 등록":
+            self._register_start_position()
+        else:
+            action = BUTTON_ACTIONS.get(button_name)
+            if action == "save":
+                # 저장은 상태를 바꾸지 않는 동작이다.
+                # TODO: 12단계(결과 저장)에서 JSON/CSV·스크린샷 저장 로직을 연결한다.
+                pass
+            elif action is not None:
+                getattr(self.tracker, action)()
+            self._update_status_badge()
 
-        self._update_status_badge()
         self._update_button_states()
+        self._update_start_point_label()
+
+    def _register_start_position(self) -> None:
+        """검출된 공의 현재 좌표를 시작점으로 등록한다.
+
+        등록 순간 공이 검출되지 않았다면 등록하지 않고, 상태 배지에
+        안내 문구만 잠깐 보여준 뒤 원래 상태 문구로 되돌린다
+        (상태 전환은 일어나지 않는다).
+        """
+        if self._last_detection is None:
+            self._show_temporary_status(NOT_DETECTED_MESSAGE)
+            return
+
+        if self.tracker.register_start_position(self._last_detection.x, self._last_detection.y):
+            self._update_status_badge()
+
+    def _show_temporary_status(self, message: str) -> None:
+        """상태 배지에 message를 잠깐 보여준 뒤 원래 상태 문구로 되돌린다."""
+        self.status_label.setText(f"상태: {message}")
+        QTimer.singleShot(NOT_DETECTED_MESSAGE_DURATION_MS, self._update_status_badge)
 
     def _update_status_badge(self) -> None:
         """상단 상태 배지를 현재 Tracker 상태 문구로 갱신한다."""
@@ -216,6 +265,14 @@ class MainWindow(QMainWindow):
         for name, button in self._buttons.items():
             action = BUTTON_ACTIONS[name]
             button.setEnabled(self.tracker.can(action))
+
+    def _update_start_point_label(self) -> None:
+        """등록된 시작점 좌표를 배지에 표시한다. 없으면 '-'."""
+        if self.tracker.start_position is None:
+            self.start_point_label.setText("시작점: -")
+        else:
+            x, y = self.tracker.start_position
+            self.start_point_label.setText(f"시작점: ({x}, {y})")
 
     def _open_tuning_dialog(self) -> None:
         """'설정 > 검출 설정...' 메뉴를 눌렀을 때 HSV 튜닝 창을 연다."""
@@ -285,6 +342,7 @@ class MainWindow(QMainWindow):
             # 튜닝 중에는 원본 대신 마스크(검출 영역이 흰색)를 보여준다.
             lower, upper = self._preview_hsv
             mask = build_mask(frame, lower, upper)
+            self._last_detection = None
             self.coord_label.setText("좌표: -")
             self._update_fps()
             self.camera_label.setPixmap(self._mask_to_pixmap(mask))
@@ -292,9 +350,12 @@ class MainWindow(QMainWindow):
 
         # 공 검출 (못 찾아도 예외 없이 None만 돌아온다)
         detection = self.detector.detect(frame)
+        self._last_detection = detection
         self._update_coord_label(detection)
         if detection is not None:
             self._draw_detection(frame, detection)
+        if self.tracker.start_position is not None:
+            self._draw_start_point(frame, self.tracker.start_position)
 
         self._update_fps()
         pixmap = self._frame_to_pixmap(frame)
@@ -314,11 +375,25 @@ class MainWindow(QMainWindow):
         cv2.circle(frame, center, detection.radius, BALL_CIRCLE_COLOR_BGR, BALL_CIRCLE_THICKNESS)
         cv2.circle(frame, center, BALL_CENTER_RADIUS, BALL_CENTER_COLOR_BGR, -1)
 
+    @staticmethod
+    def _draw_start_point(frame, position: tuple) -> None:
+        """등록된 시작점 위치에 골드 십자가 + 링을 그린다. (frame을 그 자리에서 수정)"""
+        cv2.drawMarker(
+            frame,
+            position,
+            START_POINT_COLOR_BGR,
+            markerType=cv2.MARKER_CROSS,
+            markerSize=START_POINT_MARKER_SIZE,
+            thickness=START_POINT_THICKNESS,
+        )
+        cv2.circle(frame, position, START_POINT_RING_RADIUS, START_POINT_COLOR_BGR, START_POINT_THICKNESS)
+
     def _show_camera_not_connected(self) -> None:
-        """카메라 패널에 안내 문구를 표시하고 FPS·좌표 표시를 초기화한다."""
+        """카메라 패널에 안내 문구를 표시하고 FPS·좌표·검출 상태를 초기화한다."""
         self.camera_label.setText(CAMERA_NOT_CONNECTED_TEXT)
         self.fps_label.setText("FPS: -")
         self.coord_label.setText("좌표: -")
+        self._last_detection = None
         self._last_frame_time = None
         self._fps = 0.0
 

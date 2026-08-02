@@ -10,6 +10,9 @@ register_start_position 등)를 호출한다. 현재 상태에서 그 동작이
 허용되지 않으면 아무 것도 바꾸지 않고 False만 반환한다
 (예외를 던지지 않는다). 어떤 동작이 지금 허용되는지는 can()으로
 미리 물어볼 수 있어서, UI 쪽에서 버튼을 활성/비활성화하는 데 쓴다.
+
+등록된 공의 시작 위치(start_position)도 여기서 함께 관리한다.
+'궤적 초기화'를 누르면 캘리브레이션은 남기고 시작점만 지운다.
 """
 
 from enum import Enum
@@ -56,6 +59,8 @@ class Tracker:
 
     def __init__(self):
         self.state = TrackerState.IDLE
+        # 등록된 공의 시작 위치 (x, y) - 픽셀 좌표, 없으면 None
+        self.start_position: tuple[int, int] | None = None
 
     def can(self, action: str) -> bool:
         """지금 상태에서 이 동작을 해도 되는지 확인한다. (버튼 활성화 여부에 사용)"""
@@ -71,9 +76,16 @@ class Tracker:
         """'캘리브레이션' 버튼: 매트 모서리 지정을 시작한다."""
         return self._transition("calibrate", TrackerState.CALIBRATING)
 
-    def register_start_position(self) -> bool:
-        """'시작 위치 등록' 버튼: 현재 공 위치를 시작점으로 저장한다."""
-        return self._transition("register_start_position", TrackerState.READY)
+    def register_start_position(self, x: int, y: int) -> bool:
+        """'시작 위치 등록' 버튼: 검출된 공 좌표를 시작점(원점)으로 저장한다.
+
+        공이 검출되지 않았을 때 호출하지 않는 것은(좌표를 모르니까)
+        호출하는 쪽(UI)의 책임이다. 여기서는 상태 전환 허용 여부만 본다.
+        """
+        if not self._transition("register_start_position", TrackerState.READY):
+            return False
+        self.start_position = (x, y)
+        return True
 
     def start_tracking(self) -> bool:
         """'추적 준비' 버튼.
@@ -97,5 +109,8 @@ class Tracker:
         return self._transition("finish_tracking", TrackerState.FINISHED)
 
     def reset_trajectory(self) -> bool:
-        """'궤적 초기화' 버튼: 캘리브레이션은 유지하고 이전 경로만 지운 뒤 READY로 돌아간다."""
-        return self._transition("reset_trajectory", TrackerState.READY)
+        """'궤적 초기화' 버튼: 캘리브레이션은 유지하고 시작점 + 이전 경로를 지운 뒤 READY로 돌아간다."""
+        if not self._transition("reset_trajectory", TrackerState.READY):
+            return False
+        self.start_position = None
+        return True
