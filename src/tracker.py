@@ -15,6 +15,11 @@ register_start_position 등)를 호출한다. 현재 상태에서 그 동작이
 여기서 함께 관리한다. '궤적 초기화'를 누르면 캘리브레이션은 남기고
 시작점 + 궤적을 함께 지운다.
 
+'시작 위치 등록'은 IDLE에서도 허용된다 - 캘리브레이션(모서리·변환
+행렬)은 config/settings.json에 저장되어 프로그램을 재시작해도 남아
+있으므로, 이전에 이미 캘리브레이션을 해뒀다면 매번 다시 캘리브레이션
+버튼을 누르지 않고 바로 시작 위치 등록부터 이어서 할 수 있어야 한다.
+
 궤적 기록 시 직전 점과 너무 가까우면(config/settings.json의
 tracking.min_move_distance 미만) 기록하지 않아서, 점이 촘촘하게
 쌓여 무거워지는 것을 막는다.
@@ -89,6 +94,7 @@ class Tracker:
             TrackerState.FINISHED,
         },
         "register_start_position": {
+            TrackerState.IDLE,
             TrackerState.CALIBRATING,
             TrackerState.READY,
             TrackerState.FINISHED,

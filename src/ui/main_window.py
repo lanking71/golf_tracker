@@ -148,7 +148,12 @@ STATS_NEEDS_CALIBRATION_TEXT = "<b>요약 통계</b><br><br>캘리브레이션 �
 
 # 시작 위치 등록 시 공이 검출되지 않았을 때 잠깐 보여줄 안내 문구
 NOT_DETECTED_MESSAGE = "공이 감지되지 않습니다"
+# 공은 보이지만 매트 영역 밖이라 무시됐을 때 보여줄 안내 문구
+OUTSIDE_MAT_MESSAGE = "공이 매트 밖에 있습니다"
 NOT_DETECTED_MESSAGE_DURATION_MS = 1500
+
+# 매트 영역 밖에서 검출됐지만 무시된 공 표시 색 (경고색)
+OUTSIDE_MAT_DETECTION_COLOR_BGR = (0, 100, 255)  # 주황빛 빨강
 
 # 카메라를 몇 밀리초마다 확인할지.
 # 카메라 자체 FPS(설정상 최대 90)보다 충분히 짧게 잡아야, 우리가 폴링하는
@@ -227,6 +232,9 @@ class MainWindow(QMainWindow):
         # 가장 최근 프레임에서 검출된 공 (없으면 None). '시작 위치 등록'
         # 버튼을 눌렀을 때 이 값을 시작점으로 쓴다.
         self._last_detection: BallDetection | None = None
+        # 방금 프레임에서 공을 찾긴 했지만 매트 영역 밖이라 무시했는지.
+        # '공을 아예 못 찾음'과 구분해서 안내 문구를 다르게 보여주는 데 쓴다.
+        self._last_detection_outside_mat = False
         # 실제로 카메라에서 읽어온 프레임의 (너비, 높이). 궤적 결과 패널을
         # 카메라와 같은 좌표계로 그리기 위해 첫 프레임을 받은 뒤 채워진다.
         self._frame_size: tuple[int, int] | None = None
@@ -371,10 +379,12 @@ class MainWindow(QMainWindow):
 
         등록 순간 공이 검출되지 않았다면 등록하지 않고, 상태 배지에
         안내 문구만 잠깐 보여준 뒤 원래 상태 문구로 되돌린다
-        (상태 전환은 일어나지 않는다).
+        (상태 전환은 일어나지 않는다). 공은 보이지만 매트 영역 밖이라
+        무시된 경우에는 그 사실을 알 수 있는 문구를 따로 보여준다.
         """
         if self._last_detection is None:
-            self._show_temporary_status(NOT_DETECTED_MESSAGE)
+            message = OUTSIDE_MAT_MESSAGE if self._last_detection_outside_mat else NOT_DETECTED_MESSAGE
+            self._show_temporary_status(message)
             return
 
         if self.tracker.register_start_position(self._last_detection.x, self._last_detection.y):
@@ -530,22 +540,30 @@ class MainWindow(QMainWindow):
             lower, upper = self._preview_hsv
             mask = build_mask(frame, lower, upper)
             self._last_detection = None
+            self._last_detection_outside_mat = False
             self.coord_label.setText("좌표: -")
             self._update_fps()
             self.camera_label.setPixmap(self._mask_to_pixmap(mask))
             return
 
         # 공 검출 (못 찾아도 예외 없이 None만 돌아온다)
-        detection = self.detector.detect(frame)
+        raw_detection = self.detector.detect(frame)
+        detection = raw_detection
+        outside_mat = False
         if (
-            detection is not None
+            raw_detection is not None
             and self.calibration.filter_outside_mat
-            and not self.calibration.is_inside(detection.x, detection.y)
+            and not self.calibration.is_inside(raw_detection.x, raw_detection.y)
         ):
-            # 매트 영역 밖에서 검출된 건 오검출로 보고 무시한다 (검출 안 된 것과 동일하게 처리).
+            # 매트 영역 밖에서 검출된 건 오검출로 보고 추적/기록에서는 무시한다
+            # (검출 안 된 것과 동일하게 처리). 다만 화면에는 "찾았지만 무시했다"는
+            # 걸 알 수 있게 경고색으로 표시한다 - 그냥 "-"로만 보이면 공을 아예
+            # 못 찾은 것과 구분이 안 돼서, 왜 궤적이 안 그려지는지 알기 어렵다.
+            outside_mat = True
             detection = None
         self._last_detection = detection
-        self._update_coord_label(detection)
+        self._last_detection_outside_mat = outside_mat
+        self._update_coord_label(detection, outside_mat)
 
         now = time.time()
         if detection is not None:
@@ -555,6 +573,8 @@ class MainWindow(QMainWindow):
                 self._render_trajectory_panel()
             finish_reason = self.tracker.update_detection(detection.x, detection.y, now)
         else:
+            if outside_mat:
+                self._draw_outside_mat_detection(frame, raw_detection)
             finish_reason = self.tracker.update_detection(None, None, now)
 
         if finish_reason is not None:
@@ -581,10 +601,18 @@ class MainWindow(QMainWindow):
         self._update_stop_point_label()
         self._render_trajectory_panel()
 
-    def _update_coord_label(self, detection: BallDetection | None) -> None:
-        """검출된 공의 중심 좌표를 상태 라벨 옆 배지에 표시한다."""
-        point = (detection.x, detection.y) if detection is not None else None
-        self.coord_label.setText(f"좌표: {self._format_point(point)}")
+    def _update_coord_label(self, detection: BallDetection | None, outside_mat: bool = False) -> None:
+        """검출된 공의 중심 좌표를 상태 라벨 옆 배지에 표시한다.
+
+        공을 아예 못 찾았을 때는 "-", 찾긴 했지만 매트 밖이라 무시된
+        경우에는 "매트 밖"으로 구분해서 보여준다.
+        """
+        if detection is not None:
+            self.coord_label.setText(f"좌표: {self._format_point((detection.x, detection.y))}")
+        elif outside_mat:
+            self.coord_label.setText("좌표: 매트 밖")
+        else:
+            self.coord_label.setText("좌표: -")
 
     @staticmethod
     def _draw_detection(frame, detection: BallDetection) -> None:
@@ -592,6 +620,18 @@ class MainWindow(QMainWindow):
         center = (detection.x, detection.y)
         cv2.circle(frame, center, detection.radius, BALL_CIRCLE_COLOR_BGR, BALL_CIRCLE_THICKNESS)
         cv2.circle(frame, center, BALL_CENTER_RADIUS, BALL_CENTER_COLOR_BGR, -1)
+
+    @staticmethod
+    def _draw_outside_mat_detection(frame, detection: BallDetection) -> None:
+        """매트 영역 밖이라 무시된 검출을 경고색 원으로 그린다. (frame을 그 자리에서 수정)
+
+        공을 아예 못 찾은 것과 달리, 카메라에는 보이지만 캘리브레이션한
+        매트 영역 밖이라 추적/기록에서 제외됐다는 것을 한눈에 알 수
+        있게 한다 (매트 영역이 실제 이동 경로보다 좁게 잡혀서 궤적이
+        중간에 끊기는 문제를 바로 알아챌 수 있다).
+        """
+        center = (detection.x, detection.y)
+        cv2.circle(frame, center, detection.radius, OUTSIDE_MAT_DETECTION_COLOR_BGR, BALL_CIRCLE_THICKNESS)
 
     @staticmethod
     def _draw_start_point(frame, position: tuple) -> None:
@@ -636,6 +676,7 @@ class MainWindow(QMainWindow):
         self.fps_label.setText("FPS: -")
         self.coord_label.setText("좌표: -")
         self._last_detection = None
+        self._last_detection_outside_mat = False
         self._last_frame_time = None
         self._fps = 0.0
 
