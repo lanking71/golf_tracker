@@ -1,12 +1,14 @@
 """
-볼 트래커 - 7단계: 정지·이탈 판정 (메인 창)
+볼 트래커 - 8단계: 궤적 요약 통계 (메인 창)
 
 - 왼쪽 위: 실시간 카메라 화면
   - 지금 검출된 공: 흰 원 + 빨간 중심점
   - 등록된 시작점(있으면): 골드 십자가 + 링, 계속 표시됨
 - 왼쪽 아래: 궤적 결과 화면. TRACKING 중 기록된 궤적을 실시간으로
   그린다 - 시작점은 골드 점, 정지 위치는 골드 링, 이동 경로는
-  라임(#95D5B2) 선, 현재 위치는 흰 점.
+  라임(#95D5B2) 선, 현재 위치는 흰 점. FINISHED가 되면 오른쪽 위에
+  총 거리·소요 시간·평균/최고 속도·직진성을 보여주는 요약 통계
+  카드가 뜬다 (계산은 src.stats.compute_trajectory_stats 담당).
 - 오른쪽: 세로로 배치된 버튼 6개. 각 버튼은 src.tracker.Tracker의 상태
   전환을 호출하고, 지금 상태에서 허용되지 않는 버튼은 자동으로
   비활성화된다.
@@ -32,7 +34,8 @@ TRACKING 중 매 프레임 Tracker.update_detection()을 호출해 정지·이�
 지나면 "정지 감지"로, 공이 lost_duration초 이상 검출되지 않으면
 "화면 이탈"로 보고 자동으로 FINISHED로 전환된다.
 '궤적 초기화'를 누르면 시작점·정지점·궤적이 카메라/궤적 패널 모두에서
-함께 지워진다.
+함께 지워지고, 요약 통계 카드도(궤적 데이터가 없어져 계산이 안 되므로)
+자연히 사라진다.
 
 카메라가 연결되어 있지 않으면 에러 없이 카메라 패널에
 "카메라를 연결해주세요" 안내 문구를 보여준다.
@@ -64,6 +67,7 @@ from src.detector import (
     BallDetector,
     build_mask,
 )
+from src.stats import TrajectoryStats, compute_trajectory_stats
 from src.tracker import Tracker, TrackerState
 from src.ui.styles import QSS
 from src.ui.tuning_dialog import TuningDialog
@@ -103,6 +107,19 @@ TRAJECTORY_CURRENT_RADIUS = 6
 TRAJECTORY_STOP_RADIUS = 14  # 정지 위치는 골드 "링"(테두리만)으로 표시
 TRAJECTORY_STOP_THICKNESS = 3
 
+# 요약 통계 카드 (궤적 패널 오른쪽 위, FINISHED일 때만 표시)
+STATS_CARD_MARGIN = 16
+STATS_CARD_PADDING = 12
+STATS_CARD_LINE_HEIGHT = 22
+STATS_CARD_BG_COLOR_BGR = (50, 66, 28)  # 패널 배경보다 살짝 어두운 초록
+STATS_CARD_BORDER_COLOR_BGR = START_POINT_COLOR_BGR  # 골드 테두리
+STATS_CARD_TITLE_COLOR_BGR = START_POINT_COLOR_BGR  # 골드
+STATS_CARD_TEXT_COLOR_BGR = (255, 255, 255)  # 흰 글씨
+STATS_CARD_FONT = cv2.FONT_HERSHEY_SIMPLEX
+STATS_CARD_TITLE_FONT_SCALE = 0.55
+STATS_CARD_TEXT_FONT_SCALE = 0.5
+STATS_CARD_FONT_THICKNESS = 1
+
 # 시작 위치 등록 시 공이 검출되지 않았을 때 잠깐 보여줄 안내 문구
 NOT_DETECTED_MESSAGE = "공이 감지되지 않습니다"
 NOT_DETECTED_MESSAGE_DURATION_MS = 1500
@@ -116,7 +133,7 @@ CAMERA_NOT_CONNECTED_TEXT = "카메라를 연결해주세요"
 
 
 class MainWindow(QMainWindow):
-    """볼 트래커 메인 창 (7단계: 정지·이탈 판정까지 구현)"""
+    """볼 트래커 메인 창 (8단계: 궤적 요약 통계까지 구현)"""
 
     def __init__(self):
         super().__init__()
@@ -532,8 +549,71 @@ class MainWindow(QMainWindow):
         if self.tracker.stop_position is not None:
             cv2.circle(canvas, self.tracker.stop_position, TRAJECTORY_STOP_RADIUS, START_POINT_COLOR_BGR, TRAJECTORY_STOP_THICKNESS)
 
+        if self.tracker.state == TrackerState.FINISHED:
+            stats = compute_trajectory_stats(
+                self.tracker.trajectory, self.tracker.start_position, self.tracker.stop_position
+            )
+            if stats is not None:
+                self._draw_stats_card(canvas, stats)
+
         pixmap = self._frame_to_pixmap(canvas, self.trajectory_label.size())
         self.trajectory_label.setPixmap(pixmap)
+
+    @staticmethod
+    def _draw_stats_card(canvas, stats: TrajectoryStats) -> None:
+        """궤적 패널 오른쪽 위에 요약 통계 카드를 그린다. (frame을 그 자리에서 수정)
+
+        지금은 픽셀 단위 그대로 보여준다 (9~10단계 캘리브레이션 이후
+        src.stats.compute_trajectory_stats에 pixels_per_unit만 넘기면
+        실제 단위로 바뀐다 - 이 그리기 코드는 손댈 필요 없다).
+        """
+        lines = [
+            ("요약 통계", True),
+            (f"총 거리: {stats.total_distance:.0f}px", False),
+            (f"소요 시간: {stats.duration:.2f}초", False),
+            (f"평균 속도: {stats.average_speed:.0f}px/초", False),
+            (f"최고 속도: {stats.max_speed:.0f}px/초", False),
+            (f"직진성: {stats.straightness:.2f}", False),
+        ]
+
+        text_widths = [
+            cv2.getTextSize(
+                text,
+                STATS_CARD_FONT,
+                STATS_CARD_TITLE_FONT_SCALE if is_title else STATS_CARD_TEXT_FONT_SCALE,
+                STATS_CARD_FONT_THICKNESS,
+            )[0][0]
+            for text, is_title in lines
+        ]
+        card_width = max(text_widths) + STATS_CARD_PADDING * 2
+        card_height = STATS_CARD_PADDING * 2 + STATS_CARD_LINE_HEIGHT * len(lines)
+
+        canvas_height, canvas_width = canvas.shape[:2]
+        x2 = canvas_width - STATS_CARD_MARGIN
+        x1 = max(0, x2 - card_width)
+        y1 = STATS_CARD_MARGIN
+        y2 = min(canvas_height, y1 + card_height)
+
+        # 살짝 반투명한 느낌을 주기 위해 카드를 덧그린 뒤 원본과 섞는다.
+        overlay = canvas.copy()
+        cv2.rectangle(overlay, (x1, y1), (x2, y2), STATS_CARD_BG_COLOR_BGR, -1)
+        cv2.addWeighted(overlay, 0.85, canvas, 0.15, 0, dst=canvas)
+        cv2.rectangle(canvas, (x1, y1), (x2, y2), STATS_CARD_BORDER_COLOR_BGR, 2)
+
+        for i, (text, is_title) in enumerate(lines):
+            text_y = y1 + STATS_CARD_PADDING + STATS_CARD_LINE_HEIGHT * (i + 1) - 6
+            color = STATS_CARD_TITLE_COLOR_BGR if is_title else STATS_CARD_TEXT_COLOR_BGR
+            scale = STATS_CARD_TITLE_FONT_SCALE if is_title else STATS_CARD_TEXT_FONT_SCALE
+            cv2.putText(
+                canvas,
+                text,
+                (x1 + STATS_CARD_PADDING, text_y),
+                STATS_CARD_FONT,
+                scale,
+                color,
+                STATS_CARD_FONT_THICKNESS,
+                cv2.LINE_AA,
+            )
 
     @staticmethod
     def _draw_trajectory_path(canvas, points: list, max_jump_distance: float) -> None:
