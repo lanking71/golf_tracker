@@ -1,5 +1,5 @@
 """
-볼 트래커 - 9단계: 매트 캘리브레이션 (메인 창)
+볼 트래커 - 10단계: 실제 좌표 변환 적용 (메인 창)
 
 - 왼쪽 위: 실시간 카메라 화면
   - CALIBRATING 상태에서는 화면을 클릭해 매트 네 모서리를
@@ -8,15 +8,22 @@
     만들어 config/settings.json에 저장한다 (src.calibration 담당).
     '캘리브레이션' 버튼을 다시 누르면 지금까지 찍은 점을 지우고
     '다시 지정'할 수 있다.
-  - 지금 검출된 공: 흰 원 + 빨간 중심점
+  - 캘리브레이션이 됐으면 매트 영역을 얇은 골드 선으로 계속 표시한다.
+  - 지금 검출된 공: 흰 원 + 빨간 중심점 (단, 캘리브레이션됐고
+    필터가 켜져 있으면 매트 영역 밖 검출은 무시한다 -
+    config/settings.json의 calibration.filter_outside_mat)
   - 등록된 시작점(있으면): 골드 십자가 + 링, 계속 표시됨
 - 왼쪽 아래: 궤적 결과 화면. TRACKING 중 기록된 궤적을 실시간으로
   그린다 - 시작점은 골드 점, 정지 위치는 골드 링, 이동 경로는
-  라임(#95D5B2) 선, 현재 위치는 흰 점. 그 오른쪽에는 별도 Qt 패널로
-  요약 통계(총 거리·소요 시간·평균/최고 속도·직진성)를 보여준다
-  (계산은 src.stats.compute_trajectory_stats 담당). 캔버스에 직접
-  그리지 않고 별도 QLabel로 분리해서, 카메라 해상도나 창 크기와
-  무관하게 글씨가 항상 선명하게 보인다.
+  라임(#95D5B2) 선, 현재 위치는 흰 점. 캘리브레이션이 됐으면 캔버스를
+  매트 실제 비율(가로:세로)로 그리고 좌표도 mm로 변환해서 찍는다 -
+  안 됐으면 기존처럼 카메라 프레임 비율 그대로 픽셀 좌표로 그린다.
+  그 오른쪽에는 별도 Qt 패널로 요약 통계(총 거리·소요 시간·평균/최고
+  속도·직진성)를 보여준다 (계산은 src.stats.compute_trajectory_stats
+  담당). 캘리브레이션이 됐으면 cm·cm/초 단위로, 안 됐으면 "캘리브레이션
+  후 표시됩니다" 안내로 대신한다 (px 단위는 더 이상 보여주지 않는다).
+  캔버스에 직접 그리지 않고 별도 QLabel로 분리해서, 카메라 해상도나
+  창 크기와 무관하게 글씨가 항상 선명하게 보인다.
 - 오른쪽: 세로로 배치된 버튼 6개. 각 버튼은 src.tracker.Tracker의 상태
   전환을 호출하고, 지금 상태에서 허용되지 않는 버튼은 자동으로
   비활성화된다.
@@ -77,7 +84,7 @@ from src.detector import (
     build_mask,
 )
 from src.stats import compute_trajectory_stats
-from src.tracker import Tracker, TrackerState
+from src.tracker import Tracker, TrackerState, TrajectoryPoint
 from src.ui.camera_label import CameraLabel
 from src.ui.styles import QSS
 from src.ui.tuning_dialog import TuningDialog
@@ -112,6 +119,15 @@ CALIBRATION_POINT_RADIUS = 6
 CALIBRATION_FONT_SCALE = 0.8
 CALIBRATION_FONT_THICKNESS = 2
 
+# 캘리브레이션된 매트 영역을 카메라 화면에 표시하는 얇은 골드 선
+MAT_OUTLINE_COLOR_BGR = START_POINT_COLOR_BGR
+MAT_OUTLINE_THICKNESS = 1
+
+# 캘리브레이션됐을 때 궤적 패널을 매트 실제 비율(가로:세로)로 그리는
+# 기준 해상도. 라벨 크기에 맞춰 다시 스케일되므로 절대값은 중요하지
+# 않고 비율만 정확하면 된다.
+TRAJECTORY_REAL_CANVAS_WIDTH = 1000
+
 # 궤적 결과 패널 색상 (OpenCV는 BGR 순서)
 TRAJECTORY_BG_COLOR_BGR = (79, 106, 45)  # 패널 배경 (#2D6A4F)과 동일
 TRAJECTORY_START_RADIUS = 10  # 궤적 패널의 시작점(골드) 반지름
@@ -125,6 +141,9 @@ TRAJECTORY_STOP_THICKNESS = 3
 # 요약 통계 패널 (궤적 캔버스 오른쪽의 별도 Qt 라벨). 캔버스에 직접 그리지
 # 않고 Qt 텍스트로 표시해서, 카메라 해상도/창 크기와 무관하게 항상 선명하다.
 STATS_PLACEHOLDER_TEXT = "<b>요약 통계</b><br><br>추적이 끝나면<br>여기에 표시됩니다"
+# 캘리브레이션이 안 된 상태로 FINISHED가 되면, 픽셀 통계 대신 이 안내를 보여준다
+# (요구사항: px 단위는 더 이상 화면에 보여주지 않는다).
+STATS_NEEDS_CALIBRATION_TEXT = "<b>요약 통계</b><br><br>캘리브레이션 후<br>실제 단위(cm)로<br>표시됩니다"
 
 # 시작 위치 등록 시 공이 검출되지 않았을 때 잠깐 보여줄 안내 문구
 NOT_DETECTED_MESSAGE = "공이 감지되지 않습니다"
@@ -139,7 +158,7 @@ CAMERA_NOT_CONNECTED_TEXT = "카메라를 연결해주세요"
 
 
 class MainWindow(QMainWindow):
-    """볼 트래커 메인 창 (9단계: 매트 캘리브레이션까지 구현)"""
+    """볼 트래커 메인 창 (10단계: 실제 좌표 변환 적용까지 구현)"""
 
     def __init__(self):
         super().__init__()
@@ -379,19 +398,27 @@ class MainWindow(QMainWindow):
 
     def _update_start_point_label(self) -> None:
         """등록된 시작점 좌표를 배지에 표시한다. 없으면 '-'."""
-        if self.tracker.start_position is None:
-            self.start_point_label.setText("시작점: -")
-        else:
-            x, y = self.tracker.start_position
-            self.start_point_label.setText(f"시작점: ({x}, {y})")
+        self.start_point_label.setText(f"시작점: {self._format_point(self.tracker.start_position)}")
 
     def _update_stop_point_label(self) -> None:
         """정지 판정으로 멈춘 좌표를 배지에 표시한다. 없으면 '-'."""
-        if self.tracker.stop_position is None:
-            self.stop_point_label.setText("정지점: -")
-        else:
-            x, y = self.tracker.stop_position
-            self.stop_point_label.setText(f"정지점: ({x}, {y})")
+        self.stop_point_label.setText(f"정지점: {self._format_point(self.tracker.stop_position)}")
+
+    def _format_point(self, pixel_point: tuple | None) -> str:
+        """좌표 배지에 표시할 문자열을 만든다.
+
+        캘리브레이션이 됐으면 매트 실제 좌표(mm)로 바꿔서 보여주고,
+        아직 안 됐으면 픽셀 좌표를 px 단위로 보여준다 (캘리브레이션
+        전에도 앱을 계속 쓸 수 있도록 하는 대체 표시).
+        """
+        if pixel_point is None:
+            return "-"
+        if self.calibration.is_calibrated():
+            real = self.calibration.pixel_to_real(*pixel_point)
+            if real is not None:
+                return f"({real[0]:.0f}, {real[1]:.0f})mm"
+        x, y = pixel_point
+        return f"({x}, {y})px"
 
     def _open_tuning_dialog(self) -> None:
         """'설정 > 검출 설정...' 메뉴를 눌렀을 때 HSV 튜닝 창을 연다."""
@@ -477,6 +504,13 @@ class MainWindow(QMainWindow):
 
         # 공 검출 (못 찾아도 예외 없이 None만 돌아온다)
         detection = self.detector.detect(frame)
+        if (
+            detection is not None
+            and self.calibration.filter_outside_mat
+            and not self.calibration.is_inside(detection.x, detection.y)
+        ):
+            # 매트 영역 밖에서 검출된 건 오검출로 보고 무시한다 (검출 안 된 것과 동일하게 처리).
+            detection = None
         self._last_detection = detection
         self._update_coord_label(detection)
 
@@ -498,6 +532,10 @@ class MainWindow(QMainWindow):
 
         if self.tracker.state == TrackerState.CALIBRATING:
             self._draw_calibration_corners(frame, self.calibration.corners)
+        if self.calibration.is_calibrated():
+            # 4점을 다 찍은 직후(아직 CALIBRATING 상태일 때)도 매트 영역이
+            # 바로 확인되도록, 두 그리기를 동시에 할 수 있게 elif가 아닌 if로 둔다.
+            self._draw_mat_outline(frame, self.calibration.corners)
 
         self._update_fps()
         pixmap = self._frame_to_pixmap(frame, self.camera_label.size())
@@ -512,10 +550,8 @@ class MainWindow(QMainWindow):
 
     def _update_coord_label(self, detection: BallDetection | None) -> None:
         """검출된 공의 중심 좌표를 상태 라벨 옆 배지에 표시한다."""
-        if detection is None:
-            self.coord_label.setText("좌표: -")
-        else:
-            self.coord_label.setText(f"좌표: ({detection.x}, {detection.y})")
+        point = (detection.x, detection.y) if detection is not None else None
+        self.coord_label.setText(f"좌표: {self._format_point(point)}")
 
     @staticmethod
     def _draw_detection(frame, detection: BallDetection) -> None:
@@ -552,6 +588,14 @@ class MainWindow(QMainWindow):
                 CALIBRATION_FONT_THICKNESS,
                 cv2.LINE_AA,
             )
+
+    @staticmethod
+    def _draw_mat_outline(frame, corners: list) -> None:
+        """캘리브레이션된 매트 영역(모서리 4점)을 얇은 골드 선으로 그린다. (frame을 그 자리에서 수정)"""
+        if len(corners) != 4:
+            return
+        points = np.array(corners, dtype=np.int32)
+        cv2.polylines(frame, [points], isClosed=True, color=MAT_OUTLINE_COLOR_BGR, thickness=MAT_OUTLINE_THICKNESS)
 
     def _show_camera_not_connected(self) -> None:
         """카메라 패널에 안내 문구를 표시하고 FPS·좌표·검출 상태를 초기화한다."""
@@ -596,98 +640,164 @@ class MainWindow(QMainWindow):
     def _render_trajectory_panel(self) -> None:
         """궤적 리스트를 바탕으로 아래쪽 궤적 결과 캔버스와 오른쪽 통계 패널을 새로 그린다.
 
-        시작점은 골드, 이동 경로는 라임(#95D5B2) 선, 현재 위치는 흰 점.
-        아직 카메라에서 실제 프레임 크기를 모르면(연결 전) 캔버스는
-        그리지 않는다(처음 안내 문구 그대로 남는다) - 통계 패널은
-        캔버스와 무관하므로 그와 별개로 항상 갱신한다.
+        캘리브레이션이 됐으면 매트 실제 비율(가로:세로)에 맞춘 캔버스에
+        mm 좌표로 변환해서 그리고, 안 됐으면(또는 아직 카메라 프레임
+        크기를 모르면) 기존처럼 카메라 프레임 비율 그대로 픽셀 좌표로
+        그린다. 통계 패널은 캔버스와 무관하므로 항상 별도로 갱신한다.
         """
         self._update_stats_panel()
 
-        if self._frame_size is None:
+        if self.calibration.is_calibrated():
+            canvas = self._build_real_trajectory_canvas()
+        elif self._frame_size is not None:
+            canvas = self._build_pixel_trajectory_canvas()
+        else:
             return
-
-        width, height = self._frame_size
-        canvas = np.full((height, width, 3), TRAJECTORY_BG_COLOR_BGR, dtype=np.uint8)
-
-        if self.tracker.start_position is not None:
-            cv2.circle(canvas, self.tracker.start_position, TRAJECTORY_START_RADIUS, START_POINT_COLOR_BGR, -1)
-
-        points = [(p.x, p.y) for p in self.tracker.trajectory]
-        self._draw_trajectory_path(canvas, points, self.tracker.max_jump_distance)
-
-        if points:
-            cv2.circle(canvas, points[-1], TRAJECTORY_CURRENT_RADIUS, TRAJECTORY_CURRENT_COLOR_BGR, -1)
-
-        if self.tracker.stop_position is not None:
-            cv2.circle(canvas, self.tracker.stop_position, TRAJECTORY_STOP_RADIUS, START_POINT_COLOR_BGR, TRAJECTORY_STOP_THICKNESS)
 
         pixmap = self._frame_to_pixmap(canvas, self.trajectory_label.size())
         self.trajectory_label.setPixmap(pixmap)
 
-    def _update_stats_panel(self) -> None:
-        """오른쪽 요약 통계 패널을 갱신한다.
+    def _build_pixel_trajectory_canvas(self):
+        """캘리브레이션이 안 됐을 때: 카메라 프레임과 같은 비율·좌표로 궤적 캔버스를 만든다."""
+        width, height = self._frame_size
+        canvas = np.full((height, width, 3), TRAJECTORY_BG_COLOR_BGR, dtype=np.uint8)
+        points = [(p.x, p.y) for p in self.tracker.trajectory]
+        self._paint_trajectory(canvas, points, self.tracker.start_position, self.tracker.stop_position)
+        return canvas
 
-        FINISHED 상태이고 통계를 계산할 수 있으면(궤적 점 2개 이상)
-        수치를 보여주고, 그 외에는 안내 문구를 보여준다. 지금은 픽셀
-        단위 그대로다 - 9~10단계 캘리브레이션 이후
-        compute_trajectory_stats에 pixels_per_unit만 넘기면 실제 단위로
-        바뀌고, 이 표시 코드는 손댈 필요 없다.
-        """
-        stats = None
-        if self.tracker.state == TrackerState.FINISHED:
-            stats = compute_trajectory_stats(
-                self.tracker.trajectory, self.tracker.start_position, self.tracker.stop_position
+    def _build_real_trajectory_canvas(self):
+        """캘리브레이션됐을 때: 매트 실제 비율(가로:세로)로 캔버스를 만들고 mm 좌표로 그린다."""
+        width = TRAJECTORY_REAL_CANVAS_WIDTH
+        height = max(1, round(width * self.calibration.mat_height_mm / self.calibration.mat_width_mm))
+        canvas = np.full((height, width, 3), TRAJECTORY_BG_COLOR_BGR, dtype=np.uint8)
+
+        def to_canvas(mm_point):
+            mx, my = mm_point
+            return (
+                int(mx / self.calibration.mat_width_mm * width),
+                int(my / self.calibration.mat_height_mm * height),
             )
 
-        if stats is None:
-            self.stats_label.setText(STATS_PLACEHOLDER_TEXT)
-            return
+        points = [to_canvas(self.calibration.pixel_to_real(p.x, p.y)) for p in self.tracker.trajectory]
+        start = to_canvas(self.calibration.pixel_to_real(*self.tracker.start_position)) \
+            if self.tracker.start_position is not None else None
+        stop = to_canvas(self.calibration.pixel_to_real(*self.tracker.stop_position)) \
+            if self.tracker.stop_position is not None else None
 
-        self.stats_label.setText(
-            "<b>요약 통계</b><br>"
-            f"총 거리: {stats.total_distance:.0f}px<br>"
-            f"소요 시간: {stats.duration:.2f}초<br>"
-            f"평균 속도: {stats.average_speed:.0f}px/초<br>"
-            f"최고 속도: {stats.max_speed:.0f}px/초<br>"
-            f"직진성: {stats.straightness:.2f}"
-        )
+        self._paint_trajectory(canvas, points, start, stop)
+        return canvas
 
-    @staticmethod
-    def _draw_trajectory_path(canvas, points: list, max_jump_distance: float) -> None:
-        """궤적 점들을 선으로 잇는다.
+    def _paint_trajectory(self, canvas, points: list, start_point: tuple | None, stop_point: tuple | None) -> None:
+        """캔버스 위에 시작점(골드 점)·경로(라임 선)·현재 위치(흰 점)·정지 위치(골드 링)를 그린다.
 
-        연속된 두 점 사이 거리가 max_jump_distance 이상이면(오검출이
-        섞였거나 공을 다시 옮겨서 생긴 점프) 선으로 잇지 않고 그 지점에서
-        구간을 끊어서, 매트를 가로지르는 가짜 직선(부챗살)이 그려지지
-        않게 한다.
+        points/start_point/stop_point는 이미 캔버스 좌표계로 변환된
+        값이어야 한다 (픽셀 그대로거나, mm을 캔버스 크기로 스케일한 값).
+        """
+        if start_point is not None:
+            cv2.circle(canvas, start_point, TRAJECTORY_START_RADIUS, START_POINT_COLOR_BGR, -1)
+
+        self._draw_trajectory_segments(canvas, points)
+
+        if points:
+            cv2.circle(canvas, points[-1], TRAJECTORY_CURRENT_RADIUS, TRAJECTORY_CURRENT_COLOR_BGR, -1)
+
+        if stop_point is not None:
+            cv2.circle(canvas, stop_point, TRAJECTORY_STOP_RADIUS, START_POINT_COLOR_BGR, TRAJECTORY_STOP_THICKNESS)
+
+    def _draw_trajectory_segments(self, canvas, points: list) -> None:
+        """points(캔버스 좌표계, 픽셀 그대로거나 mm 변환됨)를 선으로 잇는다.
+
+        오검출이 섞였거나 공을 다시 옮겨서 생긴 큰 점프는 선으로 잇지
+        않고 구간을 끊어서, 매트를 가로지르는 가짜 직선(부챗살)이 그려지지
+        않게 한다. 점프 여부는 항상 '원본 픽셀' 궤적의 이동 거리 기준
+        (Tracker.max_jump_distance)으로 판단한다 - 캔버스 좌표가 mm로
+        바뀌어도(원근 변환 때문에 픽셀 거리와 mm 거리가 비례하지 않아도)
+        판단 기준이 흔들리지 않게 하기 위해서다. points는 항상
+        self.tracker.trajectory와 같은 순서·개수로 만들어진다고 가정한다.
         """
         if len(points) < 2:
             return
 
+        px_trajectory = self.tracker.trajectory
+        max_jump_distance = self.tracker.max_jump_distance
+
         segment = [points[0]]
-        for prev, curr in zip(points, points[1:]):
-            distance = ((curr[0] - prev[0]) ** 2 + (curr[1] - prev[1]) ** 2) ** 0.5
-            if distance >= max_jump_distance:
+        for i in range(1, len(points)):
+            prev_px, curr_px = px_trajectory[i - 1], px_trajectory[i]
+            px_distance = ((curr_px.x - prev_px.x) ** 2 + (curr_px.y - prev_px.y) ** 2) ** 0.5
+            if px_distance >= max_jump_distance:
                 if len(segment) >= 2:
-                    cv2.polylines(
-                        canvas,
-                        [np.array(segment, dtype=np.int32)],
-                        isClosed=False,
-                        color=TRAJECTORY_PATH_COLOR_BGR,
-                        thickness=TRAJECTORY_PATH_THICKNESS,
-                    )
-                segment = [curr]
+                    self._draw_polyline(canvas, segment)
+                segment = [points[i]]
             else:
-                segment.append(curr)
+                segment.append(points[i])
 
         if len(segment) >= 2:
-            cv2.polylines(
-                canvas,
-                [np.array(segment, dtype=np.int32)],
-                isClosed=False,
-                color=TRAJECTORY_PATH_COLOR_BGR,
-                thickness=TRAJECTORY_PATH_THICKNESS,
-            )
+            self._draw_polyline(canvas, segment)
+
+    @staticmethod
+    def _draw_polyline(canvas, segment: list) -> None:
+        cv2.polylines(
+            canvas,
+            [np.array(segment, dtype=np.int32)],
+            isClosed=False,
+            color=TRAJECTORY_PATH_COLOR_BGR,
+            thickness=TRAJECTORY_PATH_THICKNESS,
+        )
+
+    def _trajectory_to_real(self) -> list[TrajectoryPoint]:
+        """현재 궤적 전체를 매트 실제 좌표(mm)로 변환한다.
+
+        호출하기 전에 self.calibration.is_calibrated()가 True인지
+        확인해야 한다 (그래야 pixel_to_real이 항상 값을 돌려준다).
+        """
+        result = []
+        for p in self.tracker.trajectory:
+            real_x, real_y = self.calibration.pixel_to_real(p.x, p.y)
+            result.append(TrajectoryPoint(x=real_x, y=real_y, timestamp=p.timestamp))
+        return result
+
+    def _update_stats_panel(self) -> None:
+        """오른쪽 요약 통계 패널을 갱신한다.
+
+        FINISHED 상태이고 캘리브레이션이 됐고 궤적 점이 2개 이상이면
+        cm·cm/초 단위로 실제 수치를 보여준다. 캘리브레이션이 안 됐으면
+        px 대신 "캘리브레이션 후 표시됩니다" 안내로 대신한다.
+        """
+        if self.tracker.state != TrackerState.FINISHED:
+            self.stats_label.setText(STATS_PLACEHOLDER_TEXT)
+            return
+
+        if not self.calibration.is_calibrated():
+            self.stats_label.setText(STATS_NEEDS_CALIBRATION_TEXT)
+            return
+
+        real_trajectory = self._trajectory_to_real()
+        real_start = (
+            self.calibration.pixel_to_real(*self.tracker.start_position)
+            if self.tracker.start_position is not None
+            else None
+        )
+        real_stop = (
+            self.calibration.pixel_to_real(*self.tracker.stop_position)
+            if self.tracker.stop_position is not None
+            else None
+        )
+
+        stats = compute_trajectory_stats(real_trajectory, real_start, real_stop)
+        if stats is None:
+            self.stats_label.setText(STATS_PLACEHOLDER_TEXT)
+            return
+
+        # mm -> cm
+        self.stats_label.setText(
+            "<b>요약 통계</b><br>"
+            f"총 거리: {stats.total_distance / 10:.1f}cm<br>"
+            f"소요 시간: {stats.duration:.2f}초<br>"
+            f"평균 속도: {stats.average_speed / 10:.1f}cm/초<br>"
+            f"최고 속도: {stats.max_speed / 10:.1f}cm/초<br>"
+            f"직진성: {stats.straightness:.2f}"
+        )
 
     def _mask_to_pixmap(self, mask) -> QPixmap:
         """흑백 마스크(numpy 2차원 배열)를 카메라 패널에 그릴 QPixmap으로 바꾼다."""
