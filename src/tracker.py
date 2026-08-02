@@ -41,7 +41,11 @@ from src.config import load_settings
 
 # config/settings.json에 "tracking" 항목이 없거나 값이 빠져 있을 때 쓸 기본값
 DEFAULT_MIN_MOVE_DISTANCE = 6
-DEFAULT_MAX_JUMP_DISTANCE = 80
+# 프레임 간 이 값(px) 이상 떨어지면 일단 오검출 의심 대상이 된다.
+# 너무 작으면 빠르게 구르는 공(특히 카메라 실효 FPS가 낮을 때)의
+# 정상적인 이동까지 오검출로 오인해 궤적이 거의 안 남는 문제가 생긴다.
+# 카메라·매트 크기에 따라 config/settings.json에서 조정한다.
+DEFAULT_MAX_JUMP_DISTANCE = 200
 DEFAULT_MAX_CONSECUTIVE_JUMPS = 10
 DEFAULT_STOP_THRESHOLD = 3
 DEFAULT_STOP_DURATION = 1.0
@@ -124,6 +128,10 @@ class Tracker:
 
         # 직전 점과 너무 멀어서(오검출로 보고) 연속으로 버린 횟수
         self._consecutive_jump_count = 0
+        # add_trajectory_point가 (기록 여부와 무관하게) 매번 실제로 관측한
+        # 마지막 좌표. 점프 판정 시 '기록된 마지막 점'뿐 아니라 이 값과도
+        # 비교해서, 빠르게 계속 움직이는 공을 오검출로 착각하지 않게 한다.
+        self._last_seen_position: tuple[int, int] | None = None
         # 정지 판정용: 마지막으로 본 원시 검출 좌표와, 그 위치 근처에서
         # 멈춰 있기 시작한(프레임 간 이동이 stop_threshold 미만이 된) 시각
         self._last_raw_position: tuple[int, int] | None = None
@@ -166,6 +174,7 @@ class Tracker:
         self.stop_position = None
         self.finish_reason = None
         self._consecutive_jump_count = 0
+        self._last_seen_position = None
         self._last_raw_position = None
         self._stop_since = None
         self._lost_since = None
@@ -192,18 +201,30 @@ class Tracker:
         """TRACKING 상태일 때, 검출된 공 좌표를 궤적에 기록한다.
 
         TRACKING 상태가 아니면 기록하지 않는다 (False 반환).
-        직전에 기록한 점 기준으로:
+        직전에 '기록된' 점 기준으로:
         - min_move_distance보다 가까우면: 너무 촘촘해지지 않도록 건너뛴다.
-        - max_jump_distance보다 멀면: 오검출로 보고 건너뛴다. 단, 이렇게
-          멀리 떨어진 값이 연속 max_consecutive_jumps번 나오면 공을 실제로
-          옮긴 것으로 보고 이번 값을 새 위치로 받아들인다.
+        - max_jump_distance보다 멀면: 오검출일 수도, 공이 빠르게 계속
+          움직이는 중일 수도 있다. 이번 좌표가 직전에 '실제로 관측한'
+          좌표(기록 여부와 무관하게 매번 갱신됨)와는 가까우면, 공이
+          부드럽게 계속 움직이는 중이라 마지막 기록점과만 멀어진 것으로
+          보고 바로 받아들인다. 그렇지 않으면 오검출로 보고 건너뛰되,
+          이런 값이 연속 max_consecutive_jumps번 나오면 공을 실제로
+          옮긴 것으로 보고 받아들인다.
         첫 점은 비교 대상이 없으므로 무조건 기록한다.
+
+        (이 '직전 관측 좌표'와의 비교가 없으면, 공이 빨라서 프레임마다
+        max_jump_distance를 넘는 상황에서 거부될 때마다 기준점이
+        갱신되지 않아 이후 프레임들도 계속 거부되고, 결국 궤적이 거의
+        기록되지 않는 문제가 있었다. update_detection()의 정지/이탈
+        판정은 매 프레임 기준점을 갱신하므로 이 문제와 무관하게 정상
+        동작해서, "정지 감지"는 뜨는데 궤적은 비어 있는 것처럼 보였다.)
         """
         if self.state != TrackerState.TRACKING:
             return False
 
         if not self.trajectory:
             self._consecutive_jump_count = 0
+            self._last_seen_position = (x, y)
             self.trajectory.append(TrajectoryPoint(x=x, y=y, timestamp=timestamp))
             return True
 
@@ -211,15 +232,27 @@ class Tracker:
         distance = ((x - last.x) ** 2 + (y - last.y) ** 2) ** 0.5
 
         if distance >= self.max_jump_distance:
-            self._consecutive_jump_count += 1
-            if self._consecutive_jump_count < self._max_consecutive_jumps:
-                return False  # 오검출로 보고 이번 값은 버린다
-            # 연속으로 계속 멀리 떨어진 값이 나왔다 = 공을 실제로 옮긴 것으로 본다
+            consistent_with_last_seen = False
+            if self._last_seen_position is not None:
+                seen_x, seen_y = self._last_seen_position
+                seen_distance = ((x - seen_x) ** 2 + (y - seen_y) ** 2) ** 0.5
+                consistent_with_last_seen = seen_distance < self.max_jump_distance
+
+            self._last_seen_position = (x, y)
+
+            if not consistent_with_last_seen:
+                self._consecutive_jump_count += 1
+                if self._consecutive_jump_count < self._max_consecutive_jumps:
+                    return False  # 오검출로 보고 이번 값은 버린다
+            # 직전 관측 좌표와 이어지거나(빠른 이동), 연속으로 계속 멀리
+            # 떨어진 값이 나왔다(공을 실제로 옮김) - 둘 다 받아들인다.
             self._consecutive_jump_count = 0
         elif distance < self._min_move_distance:
+            self._last_seen_position = (x, y)
             return False
         else:
             self._consecutive_jump_count = 0
+            self._last_seen_position = (x, y)
 
         self.trajectory.append(TrajectoryPoint(x=x, y=y, timestamp=timestamp))
         return True
@@ -290,6 +323,7 @@ class Tracker:
         self.stop_position = None
         self.finish_reason = None
         self._consecutive_jump_count = 0
+        self._last_seen_position = None
         self._last_raw_position = None
         self._stop_since = None
         self._lost_since = None
