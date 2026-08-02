@@ -23,3 +23,14 @@ def load_settings() -> dict:
         return {}
     with open(SETTINGS_PATH, encoding="utf-8") as f:
         return json.load(f)
+
+
+def save_settings(settings: dict) -> None:
+    """설정 dict를 config/settings.json에 저장한다.
+
+    HSV 튜닝 화면에서 '저장'을 누르면 이 함수로 파일에 반영된다.
+    """
+    SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
+        json.dump(settings, f, ensure_ascii=False, indent=4)
+        f.write("\n")

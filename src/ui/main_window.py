@@ -5,6 +5,9 @@
 - 왼쪽 아래: 궤적 결과 화면 자리 (다음 단계에서 연결)
 - 오른쪽: 세로로 배치된 버튼 6개
 - 위쪽: 현재 상태 배지 + 검출 좌표 배지 + 실제 측정 FPS 배지
+- 상단 메뉴 "설정 > 검출 설정...": HSV 튜닝 다이얼로그를 연다.
+  다이얼로그가 열려 있는 동안에는 카메라 패널에 원본 대신
+  마스크 미리보기(검출되는 영역이 흰색으로 보이는 화면)를 보여준다.
 
 카메라가 연결되어 있지 않으면 에러 없이 카메라 패널에
 "카메라를 연결해주세요" 안내 문구를 보여준다.
@@ -30,8 +33,15 @@ from PySide6.QtWidgets import (
 )
 
 from src.camera import Camera
-from src.detector import BallDetection, BallDetector
+from src.config import load_settings, save_settings
+from src.detector import (
+    DEFAULT_DETECTION_SETTINGS,
+    BallDetection,
+    BallDetector,
+    build_mask,
+)
 from src.ui.styles import QSS
+from src.ui.tuning_dialog import TuningDialog
 
 # 검출된 공 표시 색상 (OpenCV는 BGR 순서)
 BALL_CIRCLE_COLOR_BGR = (23, 160, 212)  # 골드 (#D4A017)
@@ -55,6 +65,8 @@ class MainWindow(QMainWindow):
 
         self.setWindowTitle("볼 트래커")
         self.resize(1100, 650)
+
+        self._build_menu()
 
         # 중앙 위젯 + 전체를 세로로 나누는 레이아웃
         central_widget = QWidget()
@@ -97,10 +109,22 @@ class MainWindow(QMainWindow):
         self._last_frame_time: float | None = None
         self._fps: float = 0.0
 
+        # HSV 튜닝 다이얼로그 (검출 설정 메뉴에서 연다). 열려 있는 동안은
+        # 마스크 미리보기를 카메라 패널에 대신 보여준다.
+        self.tuning_dialog: TuningDialog | None = None
+        self._mask_preview_active = False
+        self._preview_hsv: tuple[list, list] | None = None
+
         self._camera_timer = QTimer(self)
         self._camera_timer.setInterval(CAMERA_POLL_INTERVAL_MS)
         self._camera_timer.timeout.connect(self._update_camera_frame)
         self._camera_timer.start()
+
+    def _build_menu(self) -> None:
+        """상단 메뉴 바에 '설정 > 검출 설정...' 항목을 만든다."""
+        settings_menu = self.menuBar().addMenu("설정")
+        tuning_action = settings_menu.addAction("검출 설정...")
+        tuning_action.triggered.connect(self._open_tuning_dialog)
 
     def _build_left_panel(self) -> QVBoxLayout:
         """왼쪽 영역: 위(실시간 카메라) / 아래(궤적 결과) QLabel 두 개를 세로로 배치"""
@@ -156,6 +180,52 @@ class MainWindow(QMainWindow):
         """
         self.status_label.setText(f"상태: {button_name} 클릭됨")
 
+    def _open_tuning_dialog(self) -> None:
+        """'설정 > 검출 설정...' 메뉴를 눌렀을 때 HSV 튜닝 창을 연다."""
+        detection_settings = load_settings().get("detection", {})
+        profiles = {
+            **DEFAULT_DETECTION_SETTINGS["profiles"],
+            **detection_settings.get("profiles", {}),
+        }
+        active_profile = detection_settings.get(
+            "active_profile", DEFAULT_DETECTION_SETTINGS["active_profile"]
+        )
+
+        if self.tuning_dialog is None:
+            self.tuning_dialog = TuningDialog(profiles, active_profile, self)
+            self.tuning_dialog.values_changed.connect(self._on_tuning_values_changed)
+            self.tuning_dialog.saved.connect(self._on_tuning_profile_saved)
+            self.tuning_dialog.finished.connect(self._on_tuning_dialog_closed)
+        else:
+            self.tuning_dialog.refresh_profiles(profiles, active_profile)
+
+        self._mask_preview_active = True
+        self.tuning_dialog.show()
+        self.tuning_dialog.raise_()
+        self.tuning_dialog.activateWindow()
+
+    def _on_tuning_values_changed(self, lower: list, upper: list) -> None:
+        """튜닝 창 슬라이더가 움직일 때마다 마스크 미리보기에 쓸 범위를 갱신한다."""
+        self._preview_hsv = (lower, upper)
+
+    def _on_tuning_dialog_closed(self) -> None:
+        """튜닝 창이 닫히면 마스크 미리보기를 끄고 원래 카메라 화면으로 돌아간다."""
+        self._mask_preview_active = False
+        self._preview_hsv = None
+
+    def _on_tuning_profile_saved(self, key: str, profile: dict) -> None:
+        """'저장'을 누르면 config/settings.json에 반영하고 검출기를 새로 만든다."""
+        settings = load_settings()
+        detection_settings = settings.setdefault("detection", {})
+        profiles = detection_settings.setdefault("profiles", {})
+        profiles[key] = profile
+        detection_settings["active_profile"] = key
+        save_settings(settings)
+
+        # 저장한 설정을 바로 검출에 쓰도록 새로 불러온다.
+        self.detector = BallDetector()
+        self.status_label.setText(f"상태: '{profile.get('name', key)}' 프로필 저장됨")
+
     def _update_camera_frame(self) -> None:
         """타이머가 주기적으로 호출하는 함수. 카메라에서 한 프레임을 읽어 화면에 그린다.
 
@@ -172,6 +242,15 @@ class MainWindow(QMainWindow):
             # 읽기에 실패했다면 연결이 끊긴 것으로 보고 장치를 반납한다.
             self.camera.release()
             self._show_camera_not_connected()
+            return
+
+        if self._mask_preview_active and self._preview_hsv is not None:
+            # 튜닝 중에는 원본 대신 마스크(검출 영역이 흰색)를 보여준다.
+            lower, upper = self._preview_hsv
+            mask = build_mask(frame, lower, upper)
+            self.coord_label.setText("좌표: -")
+            self._update_fps()
+            self.camera_label.setPixmap(self._mask_to_pixmap(mask))
             return
 
         # 공 검출 (못 찾아도 예외 없이 None만 돌아온다)
@@ -237,8 +316,23 @@ class MainWindow(QMainWindow):
             Qt.SmoothTransformation,
         )
 
+    def _mask_to_pixmap(self, mask) -> QPixmap:
+        """흑백 마스크(numpy 2차원 배열)를 카메라 패널에 그릴 QPixmap으로 바꾼다."""
+        height, width = mask.shape
+        image = QImage(
+            mask.data, width, height, width, QImage.Format_Grayscale8
+        ).copy()
+        pixmap = QPixmap.fromImage(image)
+        return pixmap.scaled(
+            self.camera_label.size(),
+            Qt.KeepAspectRatio,
+            Qt.SmoothTransformation,
+        )
+
     def closeEvent(self, event) -> None:
         """창을 닫을 때 타이머를 멈추고 카메라 장치를 반납한다."""
         self._camera_timer.stop()
         self.camera.release()
+        if self.tuning_dialog is not None:
+            self.tuning_dialog.close()
         super().closeEvent(event)
