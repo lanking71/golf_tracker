@@ -38,39 +38,44 @@ class Camera:
 
     def open(self) -> bool:
         """카메라를 연다. 성공하면 True, 실패하면 False를 반환한다."""
+        params = self._build_open_params()
         # Windows에서는 CAP_DSHOW를 쓰면 카메라가 없을 때 더 빨리 실패한다.
-        capture = cv2.VideoCapture(self._camera_index, cv2.CAP_DSHOW)
+        capture = cv2.VideoCapture(self._camera_index, cv2.CAP_DSHOW, params)
         if not capture.isOpened():
             capture.release()
             return False
 
-        self._apply_settings(capture)
         self._capture = capture
         self._print_applied_settings(capture)
         return True
 
-    def _apply_settings(self, capture: cv2.VideoCapture) -> None:
-        """카메라에 해상도·FPS·압축 방식을 요청한다.
+    def _build_open_params(self) -> list:
+        """VideoCapture.open()에 한 번에 넘길 (속성, 값) 쌍 목록을 만든다.
 
-        순서가 중요하다: FOURCC(MJPG)를 가장 먼저 설정해야 한다.
-        카메라가 무압축(YUY2) 상태로 열린 뒤에 높은 해상도/FPS를 요청하면
-        USB 대역폭이 부족해 드라이버가 값을 조용히 낮춰버리는 경우가 많다.
-        MJPG로 먼저 압축을 걸어야 1080p·90fps 같은 스펙이 실제로 적용된다.
+        카메라를 먼저 기본(YUY2) 모드로 연 뒤 set()으로 MJPG를 요청하면,
+        DirectShow가 이미 잡은 영상 모드를 다시 협상하지 않아서 계속
+        YUY2로 남고 대역폭 부족으로 FPS가 크게 떨어지는 문제가 있었다.
+        그래서 open() 호출 시점에 FOURCC(MJPG)·해상도·FPS를 함께
+        전달해야 처음부터 고속 MJPEG 모드로 연결된다.
         """
+        params: list = []
+
         if self._settings.get("use_mjpg", True):
             fourcc = cv2.VideoWriter_fourcc(*"MJPG")
-            capture.set(cv2.CAP_PROP_FOURCC, fourcc)
+            params += [cv2.CAP_PROP_FOURCC, fourcc]
 
         width = self._settings.get("width")
         height = self._settings.get("height")
         if width:
-            capture.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+            params += [cv2.CAP_PROP_FRAME_WIDTH, width]
         if height:
-            capture.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+            params += [cv2.CAP_PROP_FRAME_HEIGHT, height]
 
         fps = self._settings.get("fps")
         if fps:
-            capture.set(cv2.CAP_PROP_FPS, fps)
+            params += [cv2.CAP_PROP_FPS, fps]
+
+        return params
 
     def _print_applied_settings(self, capture: cv2.VideoCapture) -> None:
         """카메라가 실제로 받아들인 해상도·FOURCC·FPS를 터미널에 출력한다.
@@ -82,11 +87,14 @@ class Camera:
         actual_width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
         actual_height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
         actual_fps = capture.get(cv2.CAP_PROP_FPS)
+        # 일부 카메라/드라이버는 이 속성을 지원하지 않아 -1을 돌려준다.
+        # 그럴 때는 화면 상단 FPS 배지(실측값)를 참고하라고 안내한다.
+        fps_text = f"{actual_fps:.1f}" if actual_fps > 0 else "드라이버 미보고 (화면 FPS 배지 참고)"
         fourcc_code = int(capture.get(cv2.CAP_PROP_FOURCC))
         fourcc_text = "".join(chr((fourcc_code >> (8 * i)) & 0xFF) for i in range(4))
         print(
             f"[카메라] 적용된 설정 -> 해상도: {actual_width}x{actual_height}, "
-            f"FOURCC: {fourcc_text}, FPS: {actual_fps:.1f}"
+            f"FOURCC: {fourcc_text}, FPS: {fps_text}"
         )
 
     def is_opened(self) -> bool:
