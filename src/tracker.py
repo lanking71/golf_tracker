@@ -18,6 +18,12 @@ register_start_position 등)를 호출한다. 현재 상태에서 그 동작이
 궤적 기록 시 직전 점과 너무 가까우면(config/settings.json의
 tracking.min_move_distance 미만) 기록하지 않아서, 점이 촘촘하게
 쌓여 무거워지는 것을 막는다.
+
+반대로 직전 점과 너무 멀리 떨어진 경우(max_jump_distance 이상)는
+오검출(잘못 잡힌 다른 물체 등)로 보고 기록하지 않는다. 다만 이런
+"멀리 떨어진 값"이 연속 max_consecutive_jumps번 이상 나오면, 오검출이
+아니라 공을 실제로 다른 곳에 옮겨 놓은 것으로 보고 그 위치를 새로
+받아들인다.
 """
 
 from dataclasses import dataclass
@@ -27,6 +33,8 @@ from src.config import load_settings
 
 # config/settings.json에 "tracking" 항목이 없거나 값이 빠져 있을 때 쓸 기본값
 DEFAULT_MIN_MOVE_DISTANCE = 6
+DEFAULT_MAX_JUMP_DISTANCE = 80
+DEFAULT_MAX_CONSECUTIVE_JUMPS = 10
 
 
 class TrackerState(Enum):
@@ -86,6 +94,13 @@ class Tracker:
 
         loaded = settings if settings is not None else load_settings().get("tracking", {})
         self._min_move_distance = loaded.get("min_move_distance", DEFAULT_MIN_MOVE_DISTANCE)
+        # 궤적 패널이 "선을 잇지 않을" 기준으로도 그대로 쓰므로 공개 속성으로 둔다.
+        self.max_jump_distance = loaded.get("max_jump_distance", DEFAULT_MAX_JUMP_DISTANCE)
+        self._max_consecutive_jumps = loaded.get(
+            "max_consecutive_jumps", DEFAULT_MAX_CONSECUTIVE_JUMPS
+        )
+        # 직전 점과 너무 멀어서(오검출로 보고) 연속으로 버린 횟수
+        self._consecutive_jump_count = 0
 
     def can(self, action: str) -> bool:
         """지금 상태에서 이 동작을 해도 되는지 확인한다. (버튼 활성화 여부에 사용)"""
@@ -125,17 +140,34 @@ class Tracker:
         """TRACKING 상태일 때, 검출된 공 좌표를 궤적에 기록한다.
 
         TRACKING 상태가 아니면 기록하지 않는다 (False 반환).
-        직전에 기록한 점과 min_move_distance 미만으로 가까우면
-        너무 촘촘해지지 않도록 기록을 건너뛴다 (첫 점은 무조건 기록).
+        직전에 기록한 점 기준으로:
+        - min_move_distance보다 가까우면: 너무 촘촘해지지 않도록 건너뛴다.
+        - max_jump_distance보다 멀면: 오검출로 보고 건너뛴다. 단, 이렇게
+          멀리 떨어진 값이 연속 max_consecutive_jumps번 나오면 공을 실제로
+          옮긴 것으로 보고 이번 값을 새 위치로 받아들인다.
+        첫 점은 비교 대상이 없으므로 무조건 기록한다.
         """
         if self.state != TrackerState.TRACKING:
             return False
 
-        if self.trajectory:
-            last = self.trajectory[-1]
-            distance = ((x - last.x) ** 2 + (y - last.y) ** 2) ** 0.5
-            if distance < self._min_move_distance:
-                return False
+        if not self.trajectory:
+            self._consecutive_jump_count = 0
+            self.trajectory.append(TrajectoryPoint(x=x, y=y, timestamp=timestamp))
+            return True
+
+        last = self.trajectory[-1]
+        distance = ((x - last.x) ** 2 + (y - last.y) ** 2) ** 0.5
+
+        if distance >= self.max_jump_distance:
+            self._consecutive_jump_count += 1
+            if self._consecutive_jump_count < self._max_consecutive_jumps:
+                return False  # 오검출로 보고 이번 값은 버린다
+            # 연속으로 계속 멀리 떨어진 값이 나왔다 = 공을 실제로 옮긴 것으로 본다
+            self._consecutive_jump_count = 0
+        elif distance < self._min_move_distance:
+            return False
+        else:
+            self._consecutive_jump_count = 0
 
         self.trajectory.append(TrajectoryPoint(x=x, y=y, timestamp=timestamp))
         return True
@@ -158,4 +190,5 @@ class Tracker:
             return False
         self.start_position = None
         self.trajectory = []
+        self._consecutive_jump_count = 0
         return True

@@ -20,6 +20,11 @@
 문구로 되돌린다 (상태 전환 자체는 일어나지 않는다).
 TRACKING 중 공이 잠깐 검출되지 않는 프레임은 기록을 건너뛰고,
 다시 검출되면 이어서 기록한다 (프로그램이 멈추지 않는다).
+직전 점과 너무 멀리 떨어진 검출(오검출로 추정)은 기록하지 않고,
+연속으로 max_consecutive_jumps번 이상 그런 값이 나오면 공을 실제로
+옮긴 것으로 보고 받아들인다 (Tracker.add_trajectory_point 참고).
+궤적을 그릴 때도 점 사이 거리가 너무 크면 선으로 잇지 않아서 매트를
+가로지르는 가짜 직선이 생기지 않는다.
 '궤적 초기화'를 누르면 시작점과 궤적이 카메라/궤적 패널 모두에서
 함께 지워진다.
 
@@ -474,19 +479,50 @@ class MainWindow(QMainWindow):
             cv2.circle(canvas, self.tracker.start_position, TRAJECTORY_START_RADIUS, START_POINT_COLOR_BGR, -1)
 
         points = [(p.x, p.y) for p in self.tracker.trajectory]
-        if len(points) >= 2:
-            cv2.polylines(
-                canvas,
-                [np.array(points, dtype=np.int32)],
-                isClosed=False,
-                color=TRAJECTORY_PATH_COLOR_BGR,
-                thickness=TRAJECTORY_PATH_THICKNESS,
-            )
+        self._draw_trajectory_path(canvas, points, self.tracker.max_jump_distance)
+
         if points:
             cv2.circle(canvas, points[-1], TRAJECTORY_CURRENT_RADIUS, TRAJECTORY_CURRENT_COLOR_BGR, -1)
 
         pixmap = self._frame_to_pixmap(canvas, self.trajectory_label.size())
         self.trajectory_label.setPixmap(pixmap)
+
+    @staticmethod
+    def _draw_trajectory_path(canvas, points: list, max_jump_distance: float) -> None:
+        """궤적 점들을 선으로 잇는다.
+
+        연속된 두 점 사이 거리가 max_jump_distance 이상이면(오검출이
+        섞였거나 공을 다시 옮겨서 생긴 점프) 선으로 잇지 않고 그 지점에서
+        구간을 끊어서, 매트를 가로지르는 가짜 직선(부챗살)이 그려지지
+        않게 한다.
+        """
+        if len(points) < 2:
+            return
+
+        segment = [points[0]]
+        for prev, curr in zip(points, points[1:]):
+            distance = ((curr[0] - prev[0]) ** 2 + (curr[1] - prev[1]) ** 2) ** 0.5
+            if distance >= max_jump_distance:
+                if len(segment) >= 2:
+                    cv2.polylines(
+                        canvas,
+                        [np.array(segment, dtype=np.int32)],
+                        isClosed=False,
+                        color=TRAJECTORY_PATH_COLOR_BGR,
+                        thickness=TRAJECTORY_PATH_THICKNESS,
+                    )
+                segment = [curr]
+            else:
+                segment.append(curr)
+
+        if len(segment) >= 2:
+            cv2.polylines(
+                canvas,
+                [np.array(segment, dtype=np.int32)],
+                isClosed=False,
+                color=TRAJECTORY_PATH_COLOR_BGR,
+                thickness=TRAJECTORY_PATH_THICKNESS,
+            )
 
     def _mask_to_pixmap(self, mask) -> QPixmap:
         """흑백 마스크(numpy 2차원 배열)를 카메라 패널에 그릴 QPixmap으로 바꾼다."""

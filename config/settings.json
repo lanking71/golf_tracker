@@ -59,6 +59,8 @@
         }
     },
     "tracking": {
-        "min_move_distance": 6
+        "min_move_distance": 6,
+        "max_jump_distance": 80,
+        "max_consecutive_jumps": 10
     }
 }
