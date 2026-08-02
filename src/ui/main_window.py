@@ -1,5 +1,5 @@
 """
-볼 트래커 - 10단계: 실제 좌표 변환 적용 (메인 창)
+볼 트래커 - 12단계: 결과 저장·조회 (메인 창)
 
 - 왼쪽 위: 실시간 카메라 화면
   - CALIBRATING 상태에서는 화면을 클릭해 매트 네 모서리를
@@ -32,6 +32,15 @@
 - 상단 메뉴 "설정 > 검출 설정...": HSV 튜닝 다이얼로그를 연다.
   다이얼로그가 열려 있는 동안에는 카메라 패널에 원본 대신
   마스크 미리보기(검출되는 영역이 흰색으로 보이는 화면)를 보여준다.
+- 상단 메뉴 "기록 > 기록 보기...": 저장된 측정 기록을 날짜순으로 보고
+  하나를 클릭하면 그 궤적과 통계를 다시 볼 수 있는 창을 연다
+  (src.ui.records_dialog.RecordsDialog 담당). 기록 삭제도 거기서 한다.
+- '저장' 버튼(FINISHED 상태에서만 활성화): 캘리브레이션이 안 됐거나
+  궤적이 너무 짧아 통계를 계산할 수 없으면 저장하지 않고 상태 배지에
+  안내만 잠깐 보여준다. 저장에 성공하면 시작점/정지점(mm)·요약 통계
+  (cm·cm/초)·전체 궤적(mm)·사용한 검출 프로필 이름을 SQLite DB
+  (src.storage.Storage, config/settings.json의 storage.db_path)에
+  기록하고, 상태 배지에 "저장 완료"를 잠깐 보여준다.
 
 '시작 위치 등록' 버튼을 누른 순간 검출된 공이 없으면 등록하지 않고,
 상태 배지에 "공이 감지되지 않습니다"를 잠깐 보여준 뒤 원래 상태
@@ -84,8 +93,10 @@ from src.detector import (
     build_mask,
 )
 from src.stats import compute_trajectory_stats
+from src.storage import Storage
 from src.tracker import Tracker, TrackerState, TrajectoryPoint
 from src.ui.camera_label import CameraLabel
+from src.ui.records_dialog import RecordsDialog
 from src.ui.settings_dialog import SettingsDialog
 from src.ui.styles import QSS
 from src.ui.tuning_dialog import TuningDialog
@@ -155,6 +166,11 @@ NOT_DETECTED_MESSAGE_DURATION_MS = 1500
 # 매트 영역 밖에서 검출됐지만 무시된 공 표시 색 (경고색)
 OUTSIDE_MAT_DETECTION_COLOR_BGR = (0, 100, 255)  # 주황빛 빨강
 
+# '저장' 버튼 관련 안내 문구
+SAVE_NEEDS_CALIBRATION_MESSAGE = "캘리브레이션이 필요합니다"
+SAVE_NO_TRAJECTORY_MESSAGE = "저장할 궤적이 없습니다"
+SAVE_SUCCESS_MESSAGE = "저장 완료"
+
 # 카메라를 몇 밀리초마다 확인할지.
 # 카메라 자체 FPS(설정상 최대 90)보다 충분히 짧게 잡아야, 우리가 폴링하는
 # 주기가 병목이 되지 않고 실제 카메라 FPS가 그대로 측정/표시된다.
@@ -164,7 +180,7 @@ CAMERA_NOT_CONNECTED_TEXT = "카메라를 연결해주세요"
 
 
 class MainWindow(QMainWindow):
-    """볼 트래커 메인 창 (10단계: 실제 좌표 변환 적용까지 구현)"""
+    """볼 트래커 메인 창 (12단계: 결과 저장·조회까지 구현)"""
 
     def __init__(self):
         super().__init__()
@@ -248,6 +264,10 @@ class MainWindow(QMainWindow):
         # 프로필/매트 설정 다이얼로그 (설정 메뉴에서 연다)
         self.settings_dialog: SettingsDialog | None = None
 
+        # 측정 결과 저장소 (12단계) + 기록 보기 다이얼로그 (기록 메뉴에서 연다)
+        self.storage = Storage()
+        self.records_dialog: RecordsDialog | None = None
+
         self._camera_timer = QTimer(self)
         self._camera_timer.setInterval(CAMERA_POLL_INTERVAL_MS)
         self._camera_timer.timeout.connect(self._update_camera_frame)
@@ -274,6 +294,10 @@ class MainWindow(QMainWindow):
 
         settings_dialog_action = settings_menu.addAction("프로필/매트 설정...")
         settings_dialog_action.triggered.connect(self._open_settings_dialog)
+
+        records_menu = self.menuBar().addMenu("기록")
+        records_action = records_menu.addAction("기록 보기...")
+        records_action.triggered.connect(self._open_records_dialog)
 
     def _build_left_panel(self) -> QVBoxLayout:
         """왼쪽 영역: 위(실시간 카메라) / 아래(궤적 결과 + 요약 통계)를 세로로 배치"""
@@ -340,13 +364,15 @@ class MainWindow(QMainWindow):
         """버튼 클릭 시 호출되는 공통 슬롯. 버튼에 맞는 상태 전환을 시도한다."""
         if button_name == "시작 위치 등록":
             self._register_start_position()
+        elif button_name == "저장":
+            # 저장은 상태를 바꾸지 않는 동작이라 _update_status_badge()를
+            # 뒤에서 또 부르면 안 된다 (그러면 "저장 완료" 임시 문구가
+            # 바로 원래 문구로 덮어써진다 - '시작 위치 등록'에서 이미
+            # 겪은 버그와 같은 패턴이라 여기도 독립된 분기로 뺐다).
+            self._save_result()
         else:
             action = BUTTON_ACTIONS.get(button_name)
-            if action == "save":
-                # 저장은 상태를 바꾸지 않는 동작이다.
-                # TODO: 12단계(결과 저장)에서 JSON/CSV·스크린샷 저장 로직을 연결한다.
-                pass
-            elif action == "calibrate":
+            if action == "calibrate":
                 # 캘리브레이션 버튼은 다시 눌러도(이미 CALIBRATING이어도) 항상
                 # 지금까지 찍은 모서리를 지우고 새로 찍기 시작한다. 이렇게 하면
                 # 잘못 찍었을 때 같은 버튼으로 '다시 지정'할 수 있다.
@@ -389,6 +415,64 @@ class MainWindow(QMainWindow):
 
         if self.tracker.register_start_position(self._last_detection.x, self._last_detection.y):
             self._update_status_badge()
+
+    def _save_result(self) -> None:
+        """'저장' 버튼: 이번 측정 결과를 SQLite DB에 기록한다.
+
+        캘리브레이션이 안 됐으면(실제 단위 mm를 모르면) 저장하지 않고
+        안내만 잠깐 보여준다. 궤적이 너무 짧아(점 2개 미만) 통계를 계산할
+        수 없을 때도 마찬가지다. 두 조건을 다 통과하면 시작점/정지점(mm),
+        요약 통계(cm·cm/초), 전체 궤적(mm), 현재 활성 검출 프로필 이름을
+        저장하고 "저장 완료"를 잠깐 보여준다.
+        """
+        if not self.calibration.is_calibrated():
+            self._show_temporary_status(SAVE_NEEDS_CALIBRATION_MESSAGE)
+            return
+
+        real_trajectory = self._trajectory_to_real()
+        real_start = (
+            self.calibration.pixel_to_real(*self.tracker.start_position)
+            if self.tracker.start_position is not None
+            else None
+        )
+        real_stop = (
+            self.calibration.pixel_to_real(*self.tracker.stop_position)
+            if self.tracker.stop_position is not None
+            else None
+        )
+
+        stats = compute_trajectory_stats(real_trajectory, real_start, real_stop)
+        if stats is None:
+            self._show_temporary_status(SAVE_NO_TRAJECTORY_MESSAGE)
+            return
+
+        self.storage.save_result(
+            profile_name=self._active_profile_name(),
+            start_point_mm=real_start,
+            stop_point_mm=real_stop,
+            total_distance_cm=stats.total_distance / 10,
+            duration_s=stats.duration,
+            average_speed_cm=stats.average_speed / 10,
+            max_speed_cm=stats.max_speed / 10,
+            straightness=stats.straightness,
+            mat_width_mm=self.calibration.mat_width_mm,
+            mat_height_mm=self.calibration.mat_height_mm,
+            trajectory_mm=[(p.x, p.y) for p in real_trajectory],
+        )
+        self._show_temporary_status(SAVE_SUCCESS_MESSAGE)
+
+    def _active_profile_name(self) -> str:
+        """지금 활성화된 검출 프로필의 표시 이름을 돌려준다."""
+        detection_settings = load_settings().get("detection", {})
+        profiles = {
+            **DEFAULT_DETECTION_SETTINGS["profiles"],
+            **detection_settings.get("profiles", {}),
+        }
+        active_key = detection_settings.get(
+            "active_profile", DEFAULT_DETECTION_SETTINGS["active_profile"]
+        )
+        profile = profiles.get(active_key, {})
+        return profile.get("name", active_key)
 
     def _show_temporary_status(self, message: str) -> None:
         """상태 배지에 message를 잠깐 보여준 뒤 원래 상태 문구로 되돌린다."""
@@ -508,6 +592,18 @@ class MainWindow(QMainWindow):
         self.calibration = Calibration()
         # 매트 크기가 바뀌었을 수 있으니(비율이 달라짐) 궤적 패널을 다시 그린다.
         self._render_trajectory_panel()
+
+    def _open_records_dialog(self) -> None:
+        """'기록 > 기록 보기...' 메뉴를 눌렀을 때 저장된 측정 기록 창을 연다."""
+        if self.records_dialog is None:
+            self.records_dialog = RecordsDialog(self.storage, self)
+        else:
+            # 그 사이 새로 저장되거나 삭제된 기록이 반영되도록 다시 불러온다.
+            self.records_dialog.refresh()
+
+        self.records_dialog.show()
+        self.records_dialog.raise_()
+        self.records_dialog.activateWindow()
 
     def _update_camera_frame(self) -> None:
         """타이머가 주기적으로 호출하는 함수. 카메라에서 한 프레임을 읽어 화면에 그린다.
@@ -912,4 +1008,6 @@ class MainWindow(QMainWindow):
             self.tuning_dialog.close()
         if self.settings_dialog is not None:
             self.settings_dialog.close()
+        if self.records_dialog is not None:
+            self.records_dialog.close()
         super().closeEvent(event)
