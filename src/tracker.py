@@ -1,0 +1,101 @@
+"""
+프로그램 상태 관리 모듈 (PROJECT_PLAN.md의 "4. 프로그램 상태 설계" 참고).
+
+다섯 가지 상태를 관리한다.
+IDLE(대기) -> CALIBRATING(캘리브레이션 중) -> READY(시작 위치 등록 완료)
+-> TRACKING(공 이동 중) -> FINISHED(추적 완료)
+
+버튼을 눌러 상태를 바꾸고 싶을 때는 각 동작 메서드(calibrate,
+register_start_position 등)를 호출한다. 현재 상태에서 그 동작이
+허용되지 않으면 아무 것도 바꾸지 않고 False만 반환한다
+(예외를 던지지 않는다). 어떤 동작이 지금 허용되는지는 can()으로
+미리 물어볼 수 있어서, UI 쪽에서 버튼을 활성/비활성화하는 데 쓴다.
+"""
+
+from enum import Enum
+
+
+class TrackerState(Enum):
+    """프로그램의 현재 단계. 값(value)은 상태 배지에 그대로 표시되는 문구다."""
+
+    IDLE = "대기 중"
+    CALIBRATING = "캘리브레이션 중"
+    READY = "시작 위치 등록 완료"
+    TRACKING = "공 이동 중"
+    FINISHED = "추적 완료"
+
+
+class Tracker:
+    """다섯 가지 상태를 관리하는 상태 기계(state machine)."""
+
+    # 동작 이름 -> 그 동작이 허용되는 현재 상태 집합.
+    # 버튼 활성화 여부(UI)와 실제 상태 전환 허용 여부가 항상 같은 기준을
+    # 쓰도록 이 dict 하나에서만 관리한다.
+    ALLOWED_STATES = {
+        "calibrate": {
+            TrackerState.IDLE,
+            TrackerState.CALIBRATING,
+            TrackerState.READY,
+            TrackerState.FINISHED,
+        },
+        "register_start_position": {
+            TrackerState.CALIBRATING,
+            TrackerState.READY,
+            TrackerState.FINISHED,
+        },
+        "start_tracking": {TrackerState.READY},
+        "stop_tracking": {TrackerState.TRACKING},
+        "finish_tracking": {TrackerState.TRACKING},
+        "reset_trajectory": {
+            TrackerState.READY,
+            TrackerState.TRACKING,
+            TrackerState.FINISHED,
+        },
+        "save": {TrackerState.FINISHED},
+    }
+
+    def __init__(self):
+        self.state = TrackerState.IDLE
+
+    def can(self, action: str) -> bool:
+        """지금 상태에서 이 동작을 해도 되는지 확인한다. (버튼 활성화 여부에 사용)"""
+        return self.state in self.ALLOWED_STATES.get(action, set())
+
+    def _transition(self, action: str, to: TrackerState) -> bool:
+        if not self.can(action):
+            return False
+        self.state = to
+        return True
+
+    def calibrate(self) -> bool:
+        """'캘리브레이션' 버튼: 매트 모서리 지정을 시작한다."""
+        return self._transition("calibrate", TrackerState.CALIBRATING)
+
+    def register_start_position(self) -> bool:
+        """'시작 위치 등록' 버튼: 현재 공 위치를 시작점으로 저장한다."""
+        return self._transition("register_start_position", TrackerState.READY)
+
+    def start_tracking(self) -> bool:
+        """'추적 준비' 버튼.
+
+        원래는 공 움직임을 자동으로 감지해서 TRACKING으로 넘어가야 하지만
+        (# TODO: 6~7단계에서 실제 움직임 감지로 교체), 이번 단계는 상태
+        전환 자체가 목적이라 버튼을 누르면 바로 TRACKING으로 전환한다.
+        """
+        return self._transition("start_tracking", TrackerState.TRACKING)
+
+    def stop_tracking(self) -> bool:
+        """'추적 중지' 버튼: 오검출 등 문제가 생겼을 때 수동으로 중지하고 READY로 되돌아간다."""
+        return self._transition("stop_tracking", TrackerState.READY)
+
+    def finish_tracking(self) -> bool:
+        """공이 멈추거나 화면을 벗어났을 때 호출해서 추적을 정상 종료한다.
+
+        # TODO: 7단계(정지·이탈 판정)에서 실제로 연결한다.
+        지금은 어떤 버튼과도 연결돼 있지 않다.
+        """
+        return self._transition("finish_tracking", TrackerState.FINISHED)
+
+    def reset_trajectory(self) -> bool:
+        """'궤적 초기화' 버튼: 캘리브레이션은 유지하고 이전 경로만 지운 뒤 READY로 돌아간다."""
+        return self._transition("reset_trajectory", TrackerState.READY)

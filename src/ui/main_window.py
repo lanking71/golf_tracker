@@ -1,10 +1,12 @@
 """
-볼 트래커 - 3단계: HSV 공 검출 연결 (메인 창)
+볼 트래커 - 4단계: 프로그램 상태 관리 (메인 창)
 
 - 왼쪽 위: 실시간 카메라 화면 (검출된 공에 원 + 중심점을 그려서 표시)
 - 왼쪽 아래: 궤적 결과 화면 자리 (다음 단계에서 연결)
-- 오른쪽: 세로로 배치된 버튼 6개
-- 위쪽: 현재 상태 배지 + 검출 좌표 배지 + 실제 측정 FPS 배지
+- 오른쪽: 세로로 배치된 버튼 6개. 각 버튼은 src.tracker.Tracker의 상태
+  전환을 호출하고, 지금 상태에서 허용되지 않는 버튼은 자동으로
+  비활성화된다.
+- 위쪽: 현재 상태 배지(Tracker.state) + 검출 좌표 배지 + 실제 측정 FPS 배지
 - 상단 메뉴 "설정 > 검출 설정...": HSV 튜닝 다이얼로그를 연다.
   다이얼로그가 열려 있는 동안에는 카메라 패널에 원본 대신
   마스크 미리보기(검출되는 영역이 흰색으로 보이는 화면)를 보여준다.
@@ -13,8 +15,6 @@
 "카메라를 연결해주세요" 안내 문구를 보여준다.
 공이 검출되지 않으면(조명, 공이 화면 밖으로 나감 등) 조용히 넘어가고
 좌표 배지만 "-"로 표시한다.
-버튼을 누르면 아직 실제 동작은 하지 않고,
-상단 상태 라벨의 문구만 바뀝니다. (추적 관련 기능은 다음 단계에서 연결합니다)
 """
 
 import time
@@ -40,8 +40,21 @@ from src.detector import (
     BallDetector,
     build_mask,
 )
+from src.tracker import Tracker
 from src.ui.styles import QSS
 from src.ui.tuning_dialog import TuningDialog
+
+# 버튼 이름 -> Tracker에 정의된 동작 이름.
+# "저장"은 상태를 바꾸지 않는 동작이라 Tracker에 전환 메서드가 없고,
+# Tracker.ALLOWED_STATES["save"]로 활성화 여부만 확인한다.
+BUTTON_ACTIONS = {
+    "캘리브레이션": "calibrate",
+    "시작 위치 등록": "register_start_position",
+    "추적 준비": "start_tracking",
+    "추적 중지": "stop_tracking",
+    "궤적 초기화": "reset_trajectory",
+    "저장": "save",
+}
 
 # 검출된 공 표시 색상 (OpenCV는 BGR 순서)
 BALL_CIRCLE_COLOR_BGR = (23, 160, 212)  # 골드 (#D4A017)
@@ -58,13 +71,17 @@ CAMERA_NOT_CONNECTED_TEXT = "카메라를 연결해주세요"
 
 
 class MainWindow(QMainWindow):
-    """볼 트래커 메인 창 (3단계: HSV 공 검출까지 구현)"""
+    """볼 트래커 메인 창 (4단계: 프로그램 상태 관리까지 구현)"""
 
     def __init__(self):
         super().__init__()
 
         self.setWindowTitle("볼 트래커")
         self.resize(1100, 650)
+
+        # 버튼 활성화 여부를 계산하려면 레이아웃을 만들기 전에 필요하다.
+        self.tracker = Tracker()
+        self._buttons: dict[str, QPushButton] = {}
 
         self._build_menu()
 
@@ -120,6 +137,10 @@ class MainWindow(QMainWindow):
         self._camera_timer.timeout.connect(self._update_camera_frame)
         self._camera_timer.start()
 
+        # 시작 상태(IDLE)에 맞게 배지 문구와 버튼 활성화 상태를 맞춘다.
+        self._update_status_badge()
+        self._update_button_states()
+
     def _build_menu(self) -> None:
         """상단 메뉴 바에 '설정 > 검출 설정...' 항목을 만든다."""
         settings_menu = self.menuBar().addMenu("설정")
@@ -162,23 +183,39 @@ class MainWindow(QMainWindow):
             button = QPushButton(name)
             if is_primary:
                 button.setObjectName("primary")
-            # 클릭 시 상태 라벨 갱신 (실제 기능은 TODO: 다음 단계에서 구현)
+            # 클릭 시 Tracker의 상태 전환을 시도한다 (BUTTON_ACTIONS 매핑 참고)
             button.clicked.connect(
                 lambda _checked=False, n=name: self._on_button_clicked(n)
             )
             layout.addWidget(button)
+            self._buttons[name] = button
 
         # 버튼들을 위쪽으로 붙이고 아래는 빈 공간으로 남김
         layout.addStretch(1)
         return layout
 
     def _on_button_clicked(self, button_name: str) -> None:
-        """버튼 클릭 시 호출되는 공통 슬롯.
+        """버튼 클릭 시 호출되는 공통 슬롯. 버튼에 맞는 상태 전환을 시도한다."""
+        action = BUTTON_ACTIONS.get(button_name)
+        if action == "save":
+            # 저장은 상태를 바꾸지 않는 동작이다.
+            # TODO: 12단계(결과 저장)에서 JSON/CSV·스크린샷 저장 로직을 연결한다.
+            pass
+        elif action is not None:
+            getattr(self.tracker, action)()
 
-        지금은 상태 라벨 문구만 갱신합니다.
-        # TODO: 다음 단계에서 각 버튼의 실제 기능(카메라 열기, 추적 시작/중지 등)을 연결합니다.
-        """
-        self.status_label.setText(f"상태: {button_name} 클릭됨")
+        self._update_status_badge()
+        self._update_button_states()
+
+    def _update_status_badge(self) -> None:
+        """상단 상태 배지를 현재 Tracker 상태 문구로 갱신한다."""
+        self.status_label.setText(f"상태: {self.tracker.state.value}")
+
+    def _update_button_states(self) -> None:
+        """현재 상태에서 허용되지 않는 버튼은 비활성화한다."""
+        for name, button in self._buttons.items():
+            action = BUTTON_ACTIONS[name]
+            button.setEnabled(self.tracker.can(action))
 
     def _open_tuning_dialog(self) -> None:
         """'설정 > 검출 설정...' 메뉴를 눌렀을 때 HSV 튜닝 창을 연다."""
@@ -223,8 +260,8 @@ class MainWindow(QMainWindow):
         save_settings(settings)
 
         # 저장한 설정을 바로 검출에 쓰도록 새로 불러온다.
+        # (상단 상태 배지는 Tracker 상태 전용이라 여기서는 건드리지 않는다)
         self.detector = BallDetector()
-        self.status_label.setText(f"상태: '{profile.get('name', key)}' 프로필 저장됨")
 
     def _update_camera_frame(self) -> None:
         """타이머가 주기적으로 호출하는 함수. 카메라에서 한 프레임을 읽어 화면에 그린다.

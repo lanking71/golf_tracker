@@ -10,27 +10,51 @@
         "profiles": {
             "practice": {
                 "name": "연습용 (흰 공)",
-                "hsv_lower": [0, 0, 180],
-                "hsv_upper": [180, 60, 255],
+                "hsv_lower": [
+                    0,
+                    0,
+                    180
+                ],
+                "hsv_upper": [
+                    180,
+                    60,
+                    255
+                ],
                 "min_area": 200,
                 "max_area": 8000,
                 "min_circularity": 0.7
             },
             "real": {
                 "name": "실전용 (분홍 공)",
-                "hsv_lower": [140, 80, 80],
-                "hsv_upper": [170, 255, 255],
+                "hsv_lower": [
+                    140,
+                    80,
+                    80
+                ],
+                "hsv_upper": [
+                    170,
+                    255,
+                    255
+                ],
                 "min_area": 200,
                 "max_area": 8000,
                 "min_circularity": 0.7
             },
             "practice_lime": {
-                "name": "연습용 (연두 공)",
-                "hsv_lower": [25, 40, 30],
-                "hsv_upper": [55, 255, 255],
-                "min_area": 200,
+                "hsv_lower": [
+                    0,
+                    105,
+                    171
+                ],
+                "hsv_upper": [
+                    179,
+                    178,
+                    255
+                ],
                 "max_area": 8000,
-                "min_circularity": 0.7
+                "min_area": 200,
+                "min_circularity": 0.7,
+                "name": "연습용 (연두 공)"
             }
         }
     }

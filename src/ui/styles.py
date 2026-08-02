@@ -59,6 +59,16 @@ QPushButton#primary:pressed {
     background-color: #B8890F;
 }
 
+/* 지금 상태에서 누를 수 없는 버튼 (Tracker.can()이 False일 때) */
+QPushButton:disabled {
+    background-color: #1F4A38;
+    color: #7FA898;
+}
+QPushButton#primary:disabled {
+    background-color: #7A5D14;
+    color: #C9B183;
+}
+
 /* 상단 메뉴 바 ('설정 > 검출 설정...') */
 QMenuBar {
     background-color: #1B4332;
