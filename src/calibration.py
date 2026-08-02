@@ -81,6 +81,19 @@ class Calibration:
         self.corners = []
         self.matrix = None
 
+    def set_mat_size(self, width_mm: float, height_mm: float) -> None:
+        """매트 실제 크기를 바꾼다.
+
+        이미 모서리 4점이 찍혀 있으면(캘리브레이션 완료 상태) 모서리를
+        다시 찍을 필요 없이 새 크기 기준으로 변환 행렬을 즉시 다시
+        계산한다 - 그렇게 하지 않으면 예전 크기로 계산된 행렬이 남아
+        좌표가 실제와 어긋나게 된다.
+        """
+        self.mat_width_mm = width_mm
+        self.mat_height_mm = height_mm
+        if len(self.corners) == 4:
+            self._compute_matrix()
+
     def _compute_matrix(self) -> None:
         """찍힌 네 모서리(좌상->우상->우하->좌하)로 원근 변환 행렬을 만든다."""
         src = np.array(self.corners, dtype=np.float32)

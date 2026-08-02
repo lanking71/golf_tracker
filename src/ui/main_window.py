@@ -86,6 +86,7 @@ from src.detector import (
 from src.stats import compute_trajectory_stats
 from src.tracker import Tracker, TrackerState, TrajectoryPoint
 from src.ui.camera_label import CameraLabel
+from src.ui.settings_dialog import SettingsDialog
 from src.ui.styles import QSS
 from src.ui.tuning_dialog import TuningDialog
 
@@ -236,6 +237,9 @@ class MainWindow(QMainWindow):
         self._mask_preview_active = False
         self._preview_hsv: tuple[list, list] | None = None
 
+        # 프로필/매트 설정 다이얼로그 (설정 메뉴에서 연다)
+        self.settings_dialog: SettingsDialog | None = None
+
         self._camera_timer = QTimer(self)
         self._camera_timer.setInterval(CAMERA_POLL_INTERVAL_MS)
         self._camera_timer.timeout.connect(self._update_camera_frame)
@@ -249,10 +253,19 @@ class MainWindow(QMainWindow):
         self._render_trajectory_panel()
 
     def _build_menu(self) -> None:
-        """상단 메뉴 바에 '설정 > 검출 설정...' 항목을 만든다."""
+        """상단 메뉴 바에 '설정' 메뉴를 만든다.
+
+        - 검출 설정...: HSV 슬라이더 + 마스크 미리보기로 실시간 튜닝
+        - 프로필/매트 설정...: 프로필 목록 관리(선택·추가·삭제·이름변경) +
+          매트 크기·매트 밖 필터 설정
+        """
         settings_menu = self.menuBar().addMenu("설정")
+
         tuning_action = settings_menu.addAction("검출 설정...")
         tuning_action.triggered.connect(self._open_tuning_dialog)
+
+        settings_dialog_action = settings_menu.addAction("프로필/매트 설정...")
+        settings_dialog_action.triggered.connect(self._open_settings_dialog)
 
     def _build_left_panel(self) -> QVBoxLayout:
         """왼쪽 영역: 위(실시간 카메라) / 아래(궤적 결과 + 요약 통계)를 세로로 배치"""
@@ -465,6 +478,26 @@ class MainWindow(QMainWindow):
         # 저장한 설정을 바로 검출에 쓰도록 새로 불러온다.
         # (상단 상태 배지는 Tracker 상태 전용이라 여기서는 건드리지 않는다)
         self.detector = BallDetector()
+
+    def _open_settings_dialog(self) -> None:
+        """'설정 > 프로필/매트 설정...' 메뉴를 눌렀을 때 설정 창을 연다."""
+        if self.settings_dialog is None:
+            self.settings_dialog = SettingsDialog(self)
+            self.settings_dialog.settings_changed.connect(self._on_settings_changed)
+        else:
+            # 그 사이 다른 곳(HSV 튜닝 등)에서 바뀐 내용도 반영되도록 다시 불러온다.
+            self.settings_dialog.reload_from_settings()
+
+        self.settings_dialog.show()
+        self.settings_dialog.raise_()
+        self.settings_dialog.activateWindow()
+
+    def _on_settings_changed(self) -> None:
+        """프로필/매트 설정 창에서 뭔가 저장되면 검출기·캘리브레이션을 새로 불러온다."""
+        self.detector = BallDetector()
+        self.calibration = Calibration()
+        # 매트 크기가 바뀌었을 수 있으니(비율이 달라짐) 궤적 패널을 다시 그린다.
+        self._render_trajectory_panel()
 
     def _update_camera_frame(self) -> None:
         """타이머가 주기적으로 호출하는 함수. 카메라에서 한 프레임을 읽어 화면에 그린다.
@@ -836,4 +869,6 @@ class MainWindow(QMainWindow):
         self.camera.release()
         if self.tuning_dialog is not None:
             self.tuning_dialog.close()
+        if self.settings_dialog is not None:
+            self.settings_dialog.close()
         super().closeEvent(event)

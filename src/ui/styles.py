@@ -130,4 +130,43 @@ QLabel#stats_card {
     padding: 14px;
     font-size: 15px;
 }
+
+/* 프로필/매트 설정 다이얼로그 */
+QListWidget {
+    background-color: #2D6A4F;
+    color: white;
+    border: none;
+    border-radius: 6px;
+    padding: 4px;
+}
+QListWidget::item {
+    padding: 8px 10px;
+    border-radius: 4px;
+}
+QListWidget::item:selected {
+    background-color: #D4A017;
+    color: #1B4332;
+}
+QSpinBox {
+    background-color: #2D6A4F;
+    color: white;
+    border: none;
+    border-radius: 6px;
+    padding: 6px 10px;
+}
+QCheckBox {
+    color: white;
+    spacing: 8px;
+}
+QCheckBox::indicator {
+    width: 16px;
+    height: 16px;
+    border-radius: 4px;
+    border: 2px solid #7FA898;
+    background-color: #2D6A4F;
+}
+QCheckBox::indicator:checked {
+    border: 2px solid #D4A017;
+    background-color: #D4A017;
+}
 """
