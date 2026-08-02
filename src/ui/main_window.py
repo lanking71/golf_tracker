@@ -673,10 +673,16 @@ class MainWindow(QMainWindow):
 
         def to_canvas(mm_point):
             mx, my = mm_point
-            return (
-                int(mx / self.calibration.mat_width_mm * width),
-                int(my / self.calibration.mat_height_mm * height),
-            )
+            # 매트 밖 픽셀은 원근 변환상 mat_width_mm/mat_height_mm을 넘는 값으로
+            # 계산될 수 있다 (원근 변환은 캘리브레이션 사각형 밖도 수학적으로
+            # 계속 외삽하기 때문). filter_outside_mat이 그런 점이 궤적에
+            # 기록되는 것 자체는 막아주지만, 혹시 몰라 캔버스 밖으로 그려지지
+            # 않도록 여기서도 0~캔버스 크기 범위로 한 번 더 잘라낸다.
+            canvas_x = int(mx / self.calibration.mat_width_mm * width)
+            canvas_y = int(my / self.calibration.mat_height_mm * height)
+            canvas_x = max(0, min(width - 1, canvas_x))
+            canvas_y = max(0, min(height - 1, canvas_y))
+            return (canvas_x, canvas_y)
 
         points = [to_canvas(self.calibration.pixel_to_real(p.x, p.y)) for p in self.tracker.trajectory]
         start = to_canvas(self.calibration.pixel_to_real(*self.tracker.start_position)) \
