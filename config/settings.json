@@ -57,5 +57,8 @@
                 "name": "연습용 (연두 공)"
             }
         }
+    },
+    "tracking": {
+        "min_move_distance": 6
     }
 }

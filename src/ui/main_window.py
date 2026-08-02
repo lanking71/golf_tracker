@@ -1,10 +1,12 @@
 """
-볼 트래커 - 5단계: 시작 위치 등록 (메인 창)
+볼 트래커 - 6단계: 이동 좌표 저장 + 궤적 표시 (메인 창)
 
 - 왼쪽 위: 실시간 카메라 화면
   - 지금 검출된 공: 흰 원 + 빨간 중심점
   - 등록된 시작점(있으면): 골드 십자가 + 링, 계속 표시됨
-- 왼쪽 아래: 궤적 결과 화면 자리 (다음 단계에서 연결)
+- 왼쪽 아래: 궤적 결과 화면. TRACKING 중 기록된 궤적을 실시간으로
+  그린다 - 시작점은 골드, 이동 경로는 라임(#95D5B2) 선, 현재 위치는
+  흰 점.
 - 오른쪽: 세로로 배치된 버튼 6개. 각 버튼은 src.tracker.Tracker의 상태
   전환을 호출하고, 지금 상태에서 허용되지 않는 버튼은 자동으로
   비활성화된다.
@@ -16,7 +18,10 @@
 '시작 위치 등록' 버튼을 누른 순간 검출된 공이 없으면 등록하지 않고,
 상태 배지에 "공이 감지되지 않습니다"를 잠깐 보여준 뒤 원래 상태
 문구로 되돌린다 (상태 전환 자체는 일어나지 않는다).
-'궤적 초기화'를 누르면 시작점도 함께 지워진다.
+TRACKING 중 공이 잠깐 검출되지 않는 프레임은 기록을 건너뛰고,
+다시 검출되면 이어서 기록한다 (프로그램이 멈추지 않는다).
+'궤적 초기화'를 누르면 시작점과 궤적이 카메라/궤적 패널 모두에서
+함께 지워진다.
 
 카메라가 연결되어 있지 않으면 에러 없이 카메라 패널에
 "카메라를 연결해주세요" 안내 문구를 보여준다.
@@ -27,6 +32,7 @@
 import time
 
 import cv2
+import numpy as np
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QImage, QPixmap
@@ -76,6 +82,14 @@ START_POINT_MARKER_SIZE = 16
 START_POINT_RING_RADIUS = 10
 START_POINT_THICKNESS = 2
 
+# 궤적 결과 패널 색상 (OpenCV는 BGR 순서)
+TRAJECTORY_BG_COLOR_BGR = (79, 106, 45)  # 패널 배경 (#2D6A4F)과 동일
+TRAJECTORY_START_RADIUS = 10  # 궤적 패널의 시작점(골드) 반지름
+TRAJECTORY_PATH_COLOR_BGR = (178, 213, 149)  # 라임 (#95D5B2)
+TRAJECTORY_PATH_THICKNESS = 2
+TRAJECTORY_CURRENT_COLOR_BGR = (255, 255, 255)  # 현재 위치는 흰 점
+TRAJECTORY_CURRENT_RADIUS = 6
+
 # 시작 위치 등록 시 공이 검출되지 않았을 때 잠깐 보여줄 안내 문구
 NOT_DETECTED_MESSAGE = "공이 감지되지 않습니다"
 NOT_DETECTED_MESSAGE_DURATION_MS = 1500
@@ -89,7 +103,7 @@ CAMERA_NOT_CONNECTED_TEXT = "카메라를 연결해주세요"
 
 
 class MainWindow(QMainWindow):
-    """볼 트래커 메인 창 (5단계: 시작 위치 등록까지 구현)"""
+    """볼 트래커 메인 창 (6단계: 이동 좌표 저장 + 궤적 표시까지 구현)"""
 
     def __init__(self):
         super().__init__()
@@ -150,6 +164,9 @@ class MainWindow(QMainWindow):
         # 가장 최근 프레임에서 검출된 공 (없으면 None). '시작 위치 등록'
         # 버튼을 눌렀을 때 이 값을 시작점으로 쓴다.
         self._last_detection: BallDetection | None = None
+        # 실제로 카메라에서 읽어온 프레임의 (너비, 높이). 궤적 결과 패널을
+        # 카메라와 같은 좌표계로 그리기 위해 첫 프레임을 받은 뒤 채워진다.
+        self._frame_size: tuple[int, int] | None = None
 
         # HSV 튜닝 다이얼로그 (검출 설정 메뉴에서 연다). 열려 있는 동안은
         # 마스크 미리보기를 카메라 패널에 대신 보여준다.
@@ -166,6 +183,7 @@ class MainWindow(QMainWindow):
         self._update_status_badge()
         self._update_button_states()
         self._update_start_point_label()
+        self._render_trajectory_panel()
 
     def _build_menu(self) -> None:
         """상단 메뉴 바에 '설정 > 검출 설정...' 항목을 만든다."""
@@ -236,6 +254,7 @@ class MainWindow(QMainWindow):
 
         self._update_button_states()
         self._update_start_point_label()
+        self._render_trajectory_panel()
 
     def _register_start_position(self) -> None:
         """검출된 공의 현재 좌표를 시작점으로 등록한다.
@@ -338,6 +357,13 @@ class MainWindow(QMainWindow):
             self._show_camera_not_connected()
             return
 
+        # 궤적 결과 패널을 카메라와 같은 좌표계로 그리기 위해 실제 프레임 크기를 기억해둔다.
+        # 크기가 처음 정해지거나 바뀔 때만 패널을 다시 그린다 (매 프레임 다시 그리면 낭비).
+        new_frame_size = (frame.shape[1], frame.shape[0])
+        if self._frame_size != new_frame_size:
+            self._frame_size = new_frame_size
+            self._render_trajectory_panel()
+
         if self._mask_preview_active and self._preview_hsv is not None:
             # 튜닝 중에는 원본 대신 마스크(검출 영역이 흰색)를 보여준다.
             lower, upper = self._preview_hsv
@@ -354,11 +380,14 @@ class MainWindow(QMainWindow):
         self._update_coord_label(detection)
         if detection is not None:
             self._draw_detection(frame, detection)
+            # TRACKING 상태일 때만 실제로 기록된다 (Tracker가 알아서 상태를 확인한다).
+            if self.tracker.add_trajectory_point(detection.x, detection.y, time.time()):
+                self._render_trajectory_panel()
         if self.tracker.start_position is not None:
             self._draw_start_point(frame, self.tracker.start_position)
 
         self._update_fps()
-        pixmap = self._frame_to_pixmap(frame)
+        pixmap = self._frame_to_pixmap(frame, self.camera_label.size())
         self.camera_label.setPixmap(pixmap)
 
     def _update_coord_label(self, detection: BallDetection | None) -> None:
@@ -412,8 +441,8 @@ class MainWindow(QMainWindow):
                 self.fps_label.setText(f"FPS: {self._fps:.1f}")
         self._last_frame_time = now
 
-    def _frame_to_pixmap(self, frame) -> QPixmap:
-        """OpenCV 프레임(BGR numpy 배열)을 카메라 패널에 그릴 QPixmap으로 바꾼다."""
+    def _frame_to_pixmap(self, frame, target_size) -> QPixmap:
+        """OpenCV 프레임(BGR numpy 배열)을 target_size에 맞는 QPixmap으로 바꾼다."""
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         height, width, channels = rgb_frame.shape
         bytes_per_line = channels * width
@@ -423,10 +452,41 @@ class MainWindow(QMainWindow):
         ).copy()
         pixmap = QPixmap.fromImage(image)
         return pixmap.scaled(
-            self.camera_label.size(),
+            target_size,
             Qt.KeepAspectRatio,
             Qt.SmoothTransformation,
         )
+
+    def _render_trajectory_panel(self) -> None:
+        """궤적 리스트를 바탕으로 아래쪽 궤적 결과 패널을 새로 그린다.
+
+        시작점은 골드, 이동 경로는 라임(#95D5B2) 선, 현재 위치는 흰 점.
+        아직 카메라에서 실제 프레임 크기를 모르면(연결 전) 아무것도 하지
+        않는다 - 그 경우 패널은 처음 안내 문구 그대로 남는다.
+        """
+        if self._frame_size is None:
+            return
+
+        width, height = self._frame_size
+        canvas = np.full((height, width, 3), TRAJECTORY_BG_COLOR_BGR, dtype=np.uint8)
+
+        if self.tracker.start_position is not None:
+            cv2.circle(canvas, self.tracker.start_position, TRAJECTORY_START_RADIUS, START_POINT_COLOR_BGR, -1)
+
+        points = [(p.x, p.y) for p in self.tracker.trajectory]
+        if len(points) >= 2:
+            cv2.polylines(
+                canvas,
+                [np.array(points, dtype=np.int32)],
+                isClosed=False,
+                color=TRAJECTORY_PATH_COLOR_BGR,
+                thickness=TRAJECTORY_PATH_THICKNESS,
+            )
+        if points:
+            cv2.circle(canvas, points[-1], TRAJECTORY_CURRENT_RADIUS, TRAJECTORY_CURRENT_COLOR_BGR, -1)
+
+        pixmap = self._frame_to_pixmap(canvas, self.trajectory_label.size())
+        self.trajectory_label.setPixmap(pixmap)
 
     def _mask_to_pixmap(self, mask) -> QPixmap:
         """흑백 마스크(numpy 2차원 배열)를 카메라 패널에 그릴 QPixmap으로 바꾼다."""
