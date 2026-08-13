@@ -7,7 +7,8 @@ cm·cm/초, 전체 궤적, 사용한 검출 프로필 이름)를 SQLite DB에 �
 이 판단은 MainWindow가 저장을 호출하기 전에 한다.
 
 DB 파일 경로는 config/settings.json의 storage.db_path에서 읽는다
-(기본값 data/results.db, 프로젝트 루트 기준 상대 경로).
+(기본값 data/results.db, exe 옆 폴더 기준 상대 경로 - src.paths.BASE_DIR
+참고. 개발 중에는 프로젝트 루트가 곧 그 기준이다).
 """
 
 import contextlib
@@ -18,11 +19,9 @@ from datetime import datetime
 from pathlib import Path
 
 from src.config import load_settings
+from src.paths import BASE_DIR
 
 DEFAULT_DB_PATH = "data/results.db"
-
-# 프로젝트 루트 (config/settings.json과 같은 기준)
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
 @dataclass
@@ -51,7 +50,7 @@ class Storage:
         if db_path is None:
             db_path = load_settings().get("storage", {}).get("db_path", DEFAULT_DB_PATH)
         path = Path(db_path)
-        self.db_path = path if path.is_absolute() else PROJECT_ROOT / path
+        self.db_path = path if path.is_absolute() else BASE_DIR / path
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
 

@@ -1,0 +1,5 @@
+# exe 빌드에만 필요한 패키지 (프로그램 실행 자체에는 필요 없음).
+# 설치: venv\Scripts\python.exe -m pip install -r requirements-build.txt
+pyinstaller==6.22.0
+# Pillow는 assets/make_icon.py로 아이콘을 다시 만들 때만 필요하다.
+Pillow==12.3.0

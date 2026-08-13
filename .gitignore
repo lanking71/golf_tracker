@@ -8,3 +8,7 @@ __pycache__/
 *.sqlite3
 .vscode/
 .idea/
+
+# PyInstaller 빌드 산출물(golf_tracker.spec으로 다시 만들 수 있어서 커밋하지 않는다)
+build/
+dist/
