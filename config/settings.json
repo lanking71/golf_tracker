@@ -119,7 +119,9 @@
     },
     "protocol": {
         "enabled": true,
-        "port": 9000
+        "port": 9000,
+        "addr_radius_mm": 100,
+        "status_hz": 30
     },
     "storage": {
         "db_path": "data/results.db"

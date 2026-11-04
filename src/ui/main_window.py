@@ -92,6 +92,7 @@ from src.detector import (
     BallDetector,
     build_mask,
 )
+from src.protocol_handler import ProtocolHandler
 from src.protocol_server import ProtocolServer
 from src.stats import compute_trajectory_stats
 from src.storage import Storage
@@ -194,12 +195,21 @@ class MainWindow(QMainWindow):
         # 버튼 활성화 여부를 계산하려면 레이아웃을 만들기 전에 필요하다.
         self.tracker = Tracker()
         self.calibration = Calibration()
-        # 앱(Flutter)과 JSON으로 통신하는 TCP 서버 (14단계: 아직은 받은 메시지를 그대로 돌려주는 에코만 한다.
-        # 실제 명령 처리는 15단계에서 protocol_handler로 연결한다).
-        self.protocol_server = ProtocolServer(parent=self)
-        self.protocol_server.command_received.connect(self._on_protocol_command)
-        self.protocol_server.start()
         self._buttons: dict[str, QPushButton] = {}
+        # 앱(Flutter)과 JSON으로 통신하는 TCP 서버 + 명령 처리기.
+        # 서버가 받은 명령을 핸들러가 해석하고, 핸들러는 버튼과 같은 Tracker 메서드를 쓴다.
+        self.protocol_server = ProtocolServer(parent=self)
+        self.protocol_handler = ProtocolHandler(
+            tracker=self.tracker,
+            calibration=self.calibration,
+            send=self.protocol_server.send,
+            get_detection=lambda: self._last_detection,
+            get_raw_frame=lambda: self._last_raw_frame,
+            on_change=self._refresh_after_protocol_command,
+            settings=load_settings().get("protocol", {}),
+        )
+        self.protocol_server.command_received.connect(self.protocol_handler.handle)
+        self.protocol_server.start()
 
         self._build_menu()
 
@@ -612,6 +622,8 @@ class MainWindow(QMainWindow):
         """프로필/매트 설정 창에서 뭔가 저장되면 검출기·캘리브레이션을 새로 불러온다."""
         self.detector = BallDetector()
         self.calibration = Calibration()
+        # 앱 명령 처리기도 새 캘리브레이션 객체를 보도록 맞춘다 (안 그러면 옛 객체를 계속 씀).
+        self.protocol_handler.calibration = self.calibration
         # 매트 크기가 바뀌었을 수 있으니(비율이 달라짐) 궤적 패널을 다시 그린다.
         self._render_trajectory_panel()
 
@@ -698,7 +710,11 @@ class MainWindow(QMainWindow):
                 self._draw_outside_mat_detection(frame, raw_detection)
             finish_reason = self.tracker.update_detection(None, None, now)
 
+        # 앱에 상태 변화·실시간 좌표를 보낸다 (종료 시에는 STATUS(FINISHED) 다음에 RESULT가 간다).
+        self.protocol_handler.on_frame(detection, now)
+
         if finish_reason is not None:
+            self.protocol_handler.on_finished(finish_reason)
             self._on_tracking_finished()
 
         if self.tracker.start_position is not None:
@@ -1025,9 +1041,13 @@ class MainWindow(QMainWindow):
         super().resizeEvent(event)
         self._render_trajectory_panel()
 
-    def _on_protocol_command(self, message: dict) -> None:
-        """앱에서 온 JSON 명령 수신. (14단계 임시 동작: 받은 내용을 그대로 되돌려준다)"""
-        self.protocol_server.send({"cmd": "ECHO", "received": message})
+    def _refresh_after_protocol_command(self) -> None:
+        """앱 명령으로 상태가 바뀌었을 때, 버튼을 눌렀을 때와 같게 화면을 갱신한다."""
+        self._update_status_badge()
+        self._update_button_states()
+        self._update_start_point_label()
+        self._update_stop_point_label()
+        self._render_trajectory_panel()
 
     def closeEvent(self, event) -> None:
         """창을 닫을 때 타이머를 멈추고 카메라 장치를 반납한다."""
