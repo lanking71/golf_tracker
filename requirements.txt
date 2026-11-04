@@ -1,4 +1,7 @@
-opencv-contrib-python
-numpy
-PySide6
-PyYAML
+# Golf ball tracker - runtime packages (versions verified on the dev PC)
+# Install: python -m pip install -r requirements.txt
+# Python 3.11 (64-bit) recommended. Keep this file ASCII-only:
+# pip on Korean Windows reads it as cp949 and fails on UTF-8 Korean text.
+numpy==2.4.6
+opencv-contrib-python==5.0.0.93
+PySide6==6.11.1
