@@ -16,10 +16,14 @@ UI 쪽에서 안내 문구를 보여줄 수 있게 한다.
 기준의 좌표를 그대로 쓰면 된다.
 """
 
+import logging
+
 import cv2
 import numpy as np
 
 from src.config import load_settings
+
+logger = logging.getLogger("camera")
 
 # config/settings.json에 "camera" 항목이 없거나 일부 값이 빠져 있을 때 쓸 기본값
 DEFAULT_CAMERA_SETTINGS = {
@@ -107,9 +111,13 @@ class Camera:
         fourcc_code = int(capture.get(cv2.CAP_PROP_FOURCC))
         fourcc_text = "".join(chr((fourcc_code >> (8 * i)) & 0xFF) for i in range(4))
         rotate_degrees = self._settings.get("rotate", 0)
-        print(
-            f"[카메라] 적용된 설정 -> 해상도: {actual_width}x{actual_height}, "
-            f"FOURCC: {fourcc_text}, FPS: {fps_text}, 회전: {rotate_degrees}도"
+        logger.info(
+            "카메라 연결됨 - 적용된 설정 -> 해상도: %sx%s, FOURCC: %s, FPS: %s, 회전: %s도",
+            actual_width,
+            actual_height,
+            fourcc_text,
+            fps_text,
+            rotate_degrees,
         )
 
     def is_opened(self) -> bool:

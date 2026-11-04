@@ -7,6 +7,7 @@ EngineTestCase는 테스트마다
 - 엔진이 보내는 시그널을 모아 둔다.
 """
 
+import logging
 import shutil
 import tempfile
 import unittest
@@ -18,6 +19,11 @@ from tests.fake_camera import FakeCamera, make_test_settings
 
 # Qt 객체(시그널·타이머·TCP 서버)를 만들려면 Qt 애플리케이션이 하나 있어야 한다.
 qt_app = QCoreApplication.instance() or QCoreApplication([])
+
+# 테스트 중에는 로그를 어디에도 출력하지 않는다. (핸들러가 하나도 없으면 파이썬이 경고 이상의
+# 로그를 콘솔에 마구 찍기 때문에, 아무것도 안 하는 핸들러를 붙여 둔다. 로그 내용을 확인하는
+# 테스트는 assertLogs를 쓰면 된다.)
+logging.getLogger().addHandler(logging.NullHandler())
 
 
 class EngineTestCase(unittest.TestCase):
@@ -33,6 +39,9 @@ class EngineTestCase(unittest.TestCase):
 
         self.camera = FakeCamera()
         self.engine = VisionEngine(camera=self.camera)
+        # 테스트의 가짜 시계는 0.05초씩만 흐르므로, 실제 1초 재연결 간격을 쓰면 재시도가
+        # 안 일어난다. 기본은 매번 시도하게 하고, 간격을 시험하는 테스트만 값을 바꾼다.
+        self.engine.camera_retry_interval = 0
 
         # 엔진이 보내는 시그널을 모아 둔다
         self.frames = []

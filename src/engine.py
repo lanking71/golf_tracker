@@ -20,6 +20,7 @@
     -> 앱(메인 컨트롤)에 상태 전송 -> (끝났으면) 결과 전송 -> 화면에 알림
 """
 
+import logging
 import time
 from dataclasses import dataclass
 
@@ -36,8 +37,17 @@ from src.stats import compute_trajectory_stats
 from src.storage import Storage
 from src.tracker import Tracker, TrackerState, TrajectoryPoint
 
+logger = logging.getLogger("engine")
+
 # 카메라를 확인하는 주기(ms). 실제 처리 속도는 카메라 프레임 도착 속도가 정한다.
 CAMERA_POLL_INTERVAL_MS = 8
+# 카메라가 안 열려 있을 때 다시 연결을 시도하는 간격(초). 장치가 없을 때 열기를 시도하면
+# 오래 걸려서, 8ms마다 시도하면 엔진이 거의 멈춰 버린다.
+CAMERA_RETRY_INTERVAL_S = 1.0
+# 같은 오류가 프레임마다 반복될 때 로그에 남기는 최소 간격(초)
+ERROR_LOG_INTERVAL_S = 5.0
+# 상태 요약(FPS·처리 시간)을 로그에 남기는 기본 간격(초). 0이면 남기지 않는다.
+DEFAULT_STATS_INTERVAL_S = 10
 
 # register_start()가 돌려주는 결과 코드
 START_OK = "OK"
@@ -71,6 +81,8 @@ class VisionEngine(QObject):
     frame_processed = Signal(object)
     # 카메라가 없거나 연결이 끊겨서 프레임을 못 읽었을 때
     camera_unavailable = Signal()
+    # 카메라 영상 수신 상태가 바뀌었을 때 (True: 영상을 받기 시작/복구, False: 끊김)
+    camera_status_changed = Signal(bool)
     # 앱 명령 등으로 상태가 바뀌었을 때 (화면이 버튼·배지를 다시 맞춘다)
     changed = Signal()
     # 궤적에 점이 새로 기록됐을 때
@@ -110,6 +122,20 @@ class VisionEngine(QObject):
         self.camera_ok = False
         # 지금까지 처리한 프레임 수 (앱이 프레임 누락·지연을 알 수 있게 STATUS에 실어 보낸다)
         self.frame_count = 0
+        # 카메라 재연결 시도 간격(초)과 마지막 시도 시각. 테스트에서는 0으로 줄여 쓴다.
+        self.camera_retry_interval = CAMERA_RETRY_INTERVAL_S
+        self._last_open_attempt = float("-inf")
+        # 마지막으로 알린 카메라 상태 (바뀔 때만 로그·이벤트를 내보내려고 기억한다. None = 아직 모름)
+        self._camera_reported: bool | None = None
+        # 프레임 처리 중 난 오류 횟수와, 마지막으로 오류를 로그에 남긴 시각
+        self.error_count = 0
+        self._last_error_log = float("-inf")
+        # 상태 요약 로그용 집계 (log_stats가 읽고 비운다)
+        self._stats_since = time.perf_counter()
+        self._stats_frames = 0
+        self._stats_proc_total = 0.0
+        self._stats_proc_max = 0.0
+        self._proc_started = 0.0
 
         # 가장 최근 프레임의 정보 (앱 명령 처리와 화면이 읽어 간다)
         self.last_raw_frame: np.ndarray | None = None
@@ -121,9 +147,20 @@ class VisionEngine(QObject):
         # True면 검출·추적을 건너뛰고 프레임만 화면에 넘긴다 (HSV 튜닝 미리보기용)
         self.detection_paused = False
 
+        # timeout이 보내는 값에 영향받지 않도록 lambda로 감싼다 (process_frame의 now와 혼동 방지)
         self._timer = QTimer(self)
         self._timer.setInterval(CAMERA_POLL_INTERVAL_MS)
-        self._timer.timeout.connect(self.process_frame)
+        self._timer.timeout.connect(lambda: self.process_frame())
+
+        # 상태 요약을 주기적으로 로그에 남기는 타이머 (간격 0이면 만들지 않는다)
+        stats_interval = load_settings().get("logging", {}).get(
+            "stats_interval_s", DEFAULT_STATS_INTERVAL_S
+        )
+        self._stats_timer: QTimer | None = None
+        if stats_interval and stats_interval > 0:
+            self._stats_timer = QTimer(self)
+            self._stats_timer.setInterval(int(stats_interval * 1000))
+            self._stats_timer.timeout.connect(self.log_stats)
 
     # ------------------------------------------------------------------
     # 시작 / 종료
@@ -135,14 +172,31 @@ class VisionEngine(QObject):
         열어야 하는데 포트를 못 열었으면(이미 사용 중 등) False.
         """
         self.protocol_server.start()
+        server = self.protocol_server
+        if not server.enabled:
+            logger.info("엔진 시작 - 통신 꺼짐 (config/settings.json의 protocol.enabled)")
+        elif server.is_listening():
+            logger.info("엔진 시작 - 통신 대기 중 (TCP 포트 %d)", server.port)
+        else:
+            logger.error(
+                "엔진 시작 실패 - 통신 포트 %d을(를) 열 수 없습니다. 같은 프로그램이 이미 실행 중이거나 "
+                "다른 프로그램이 포트를 쓰고 있을 수 있습니다.",
+                server.port,
+            )
+        self._stats_since = time.perf_counter()
         self._timer.start()
-        return (not self.protocol_server.enabled) or self.protocol_server.is_listening()
+        if self._stats_timer is not None:
+            self._stats_timer.start()
+        return (not server.enabled) or server.is_listening()
 
     def shutdown(self) -> None:
         """프로그램을 끝낼 때 타이머를 멈추고 서버·카메라를 정리한다."""
         self._timer.stop()
+        if self._stats_timer is not None:
+            self._stats_timer.stop()
         self.protocol_server.stop()
         self.camera.release()
+        logger.info("엔진 종료")
 
     # ------------------------------------------------------------------
     # 프레임 처리 (프로그램의 심장박동)
@@ -152,25 +206,43 @@ class VisionEngine(QObject):
 
         타이머가 주기적으로 부른다. now는 테스트에서 시각을 직접 정해
         넣을 때만 쓰고, 평소에는 현재 시각을 쓴다.
-        카메라가 없거나 끊겨도 예외를 던지지 않고 camera_unavailable
-        시그널만 보낸 뒤, 다음 호출 때 다시 연결을 시도한다.
+
+        어떤 일이 있어도 예외를 밖으로 던지지 않는다:
+        - 카메라가 없거나 끊기면 camera_unavailable 시그널만 보내고, 1초(camera_retry_interval)
+          간격으로 다시 연결을 시도한다.
+        - 처리 중 예상 못 한 오류가 나면 로그에 남기고 이 프레임만 건너뛴다. 엔진이 멈추면
+          메인 컨트롤이 응답을 못 받게 되므로 한 프레임의 오류로 전체가 죽으면 안 된다.
         """
-        if not self.camera.is_opened():
-            if not self.camera.open():
-                self._on_camera_unavailable()
-                return
-
-        frame = self.camera.read_frame()
-        if frame is None:
-            # 읽기에 실패했다면 연결이 끊긴 것으로 보고 장치를 반납한다.
-            self.camera.release()
-            self._on_camera_unavailable()
-            return
-
         if now is None:
             now = time.time()
+        processed = False
+        try:
+            processed = self._process_frame(now)
+        except Exception:
+            self.error_count += 1
+            # 같은 오류가 프레임마다 반복돼도 로그가 넘치지 않게 일정 간격으로만 남긴다.
+            if now - self._last_error_log >= ERROR_LOG_INTERVAL_S:
+                self._last_error_log = now
+                logger.exception("프레임 처리 중 오류 (누적 %d번) - 엔진은 계속 동작합니다", self.error_count)
+
+        if processed:
+            # 처리 시간은 '프레임을 받은 뒤부터' 잰다. 카메라를 열거나 다음 프레임을 기다리는
+            # 시간은 엔진이 어쩔 수 없는 시간이라 섞으면 엔진이 느려졌는지 알 수 없다.
+            elapsed = time.perf_counter() - self._proc_started
+            self._stats_frames += 1
+            self._stats_proc_total += elapsed
+            self._stats_proc_max = max(self._stats_proc_max, elapsed)
+
+    def _process_frame(self, now: float) -> bool:
+        """프레임 한 장 처리 본체. 프레임을 실제로 처리했으면 True, 카메라에서 못 읽었으면 False."""
+        frame = self._read_frame(now)
+        if frame is None:
+            self._on_no_frame(now)
+            return False
+
+        self._proc_started = time.perf_counter()  # 여기부터가 엔진의 처리 시간 (log_stats용)
         self.last_raw_frame = frame
-        self.camera_ok = True
+        self._set_camera_ok(True)
         self.frame_count += 1
 
         if self.detection_paused:
@@ -178,7 +250,7 @@ class VisionEngine(QObject):
             self.last_detection = None
             self.last_detection_outside_mat = False
             self.frame_processed.emit(FrameResult(frame, None, None, False, now, paused=True))
-            return
+            return True
 
         # 공 검출 (못 찾아도 예외 없이 None만 돌아온다)
         raw_detection = self.detector.detect(frame)
@@ -210,6 +282,7 @@ class VisionEngine(QObject):
         if was_armed and self.tracker.state == TrackerState.TRACKING:
             # 이번 프레임에서 공이 움직여 추적이 시작됐다 (ARMED -> TRACKING).
             # 앱에는 STATUS(TRACKING)보다 먼저 TRACK START 이벤트를 보낸다.
+            logger.info("추적 시작 (시작 위치에서 공이 움직임)")
             self.protocol_handler.on_tracking_started(self.tracker.tracking_started_at)
             self.tracking_started.emit()
             self.trajectory_updated.emit()
@@ -218,19 +291,106 @@ class VisionEngine(QObject):
         self.protocol_handler.on_frame(detection, now)
 
         if finish_reason is not None:
-            self.protocol_handler.on_finished(finish_reason)
-            self.tracking_finished.emit(finish_reason)
+            self._finish_tracking(finish_reason)
 
         self.frame_processed.emit(FrameResult(frame, detection, raw_detection, outside_mat, now))
+        return True
 
-    def _on_camera_unavailable(self) -> None:
-        """카메라 프레임을 못 얻었을 때: 검출 상태를 비우고 화면에 알린다."""
+    def _finish_tracking(self, reason: str) -> None:
+        """정지·이탈로 추적이 끝났을 때: 결과를 앱에 보내고 화면에 알린다."""
+        logger.info("추적 종료 (%s) - 기록된 점 %d개", reason, len(self.tracker.trajectory))
+        self.protocol_handler.on_finished(reason)
+        self.tracking_finished.emit(reason)
+
+    def _read_frame(self, now: float):
+        """카메라에서 프레임을 읽는다. 못 읽으면 None.
+
+        카메라가 안 열려 있으면 다시 연결을 시도하는데, 장치가 없을 때 열기를 시도하는 것은
+        오래 걸리는 동작이라 camera_retry_interval(기본 1초)마다 한 번만 시도한다
+        (예전에는 8ms마다 시도해서 CPU를 낭비했다).
+        """
+        if not self.camera.is_opened():
+            if now - self._last_open_attempt < self.camera_retry_interval:
+                return None  # 아직 다시 시도할 때가 아니다
+            self._last_open_attempt = now
+            if not self.camera.open():
+                logger.debug("카메라를 열지 못함")
+                self.camera_unavailable.emit()
+                return None
+
+        frame = self.camera.read_frame()
+        if frame is None:
+            # 읽기에 실패했다면 연결이 끊긴 것으로 보고 장치를 반납한 뒤 재연결을 기다린다.
+            self.camera.release()
+            self._last_open_attempt = now
+            self.camera_unavailable.emit()
+            return None
+        return frame
+
+    def _on_no_frame(self, now: float) -> None:
+        """카메라 프레임을 못 얻었을 때: 검출 상태를 비우고 알린다."""
         # 오래된 프레임으로 캘리브레이션·시작점 등록을 하지 않도록 함께 비운다.
         self.last_raw_frame = None
         self.last_detection = None
         self.last_detection_outside_mat = False
-        self.camera_ok = False
-        self.camera_unavailable.emit()
+        self._set_camera_ok(False)
+
+        # 추적 중에 카메라가 끊겨도 '공이 안 보이는 시간'은 계속 센다. 그래야 끊김이 길어지면
+        # lost_duration 뒤에 "화면 이탈"로 끝나서 결과(RESULT)가 나간다 (안 그러면 영원히
+        # TRACKING에 머물러서 컨트롤이 결과를 못 받는다).
+        if self.tracker.state == TrackerState.TRACKING:
+            finish_reason = self.tracker.update_detection(None, None, now)
+            if finish_reason is not None:
+                self.protocol_handler.on_frame(None, now)  # STATUS(FINISHED)가 RESULT보다 먼저 간다
+                self._finish_tracking(finish_reason)
+
+    def _set_camera_ok(self, ok: bool) -> None:
+        """카메라 수신 상태를 갱신하고, 바뀌었을 때만 로그·앱 이벤트(CAMERA)·시그널로 알린다."""
+        self.camera_ok = ok
+        if self._camera_reported == ok:
+            return
+        self._camera_reported = ok
+        if ok:
+            logger.info("카메라 영상 수신 시작")
+        else:
+            logger.warning(
+                "카메라 영상을 받을 수 없음 - %.0f초 간격으로 다시 연결을 시도합니다",
+                self.camera_retry_interval,
+            )
+        self.protocol_handler.on_camera_changed(ok)
+        self.camera_status_changed.emit(ok)
+
+    def log_stats(self) -> dict:
+        """지난 구간의 FPS·프레임 처리 시간 요약을 로그에 남긴다 (stats_interval_s마다 자동 호출).
+
+        엔진이 느려지는지(처리 시간이 프레임 간격보다 길어지는지) 현장에서 확인하는 데
+        쓴다. 처리 시간에는 카메라를 열거나 다음 프레임을 기다리는 시간은 포함하지 않는다.
+        요약 내용을 dict로도 돌려준다.
+        """
+        elapsed = time.perf_counter() - self._stats_since
+        frames = self._stats_frames
+        summary = {
+            "frames": frames,
+            "fps": frames / elapsed if elapsed > 0 else 0.0,
+            "avg_ms": (self._stats_proc_total / frames * 1000) if frames else 0.0,
+            "max_ms": self._stats_proc_max * 1000,
+            "errors": self.error_count,
+        }
+        logger.info(
+            "상태 요약 - FPS %.1f, 처리 시간(프레임을 받은 뒤 검출~전송) 평균 %.1fms 최대 %.1fms, 카메라 %s, 접속 %d대, 상태 %s, 오류 %d번",
+            summary["fps"],
+            summary["avg_ms"],
+            summary["max_ms"],
+            "OK" if self.camera_ok else "LOST",
+            self.protocol_server.client_count(),
+            self.tracker.state.name,
+            self.error_count,
+        )
+        self._stats_since = time.perf_counter()
+        self._stats_frames = 0
+        self._stats_proc_total = 0.0
+        self._stats_proc_max = 0.0
+        return summary
 
     # ------------------------------------------------------------------
     # 화면 버튼과 앱 명령이 함께 쓰는 동작

@@ -1,4 +1,4 @@
-# 메인 컨트롤 ↔ 비전 엔진 통신 규격 (v2.1)
+# 메인 컨트롤 ↔ 비전 엔진 통신 규격 (v2.2)
 
 **메인 컨트롤(Flutter 등) 개발자에게 전달하는 문서입니다. 이 문서만 보면 연동할 수 있습니다.**
 
@@ -40,7 +40,7 @@
 
 ### 응답과 이벤트 구분하기
 - 메시지에 **`id`가 있으면 내가 보낸 명령의 응답**, **없으면 엔진이 먼저 보낸 이벤트**입니다.
-- 이벤트: `HELLO`, `STATUS`(실시간), `TRACK`, `ADDR`(`event` 필드가 있는 것), `RESULT`(`result` 필드가 없는 것)
+- 이벤트: `HELLO`, `STATUS`(실시간), `TRACK`, `CAMERA`, `ADDR`(`event` 필드가 있는 것), `RESULT`(`result` 필드가 없는 것)
 - 응답은 `result`가 `"OK"`/`"NG"`입니다 (`PING`→`PONG`, 오류→`ERROR` 제외).
 
 ## 연동 예제 (Dart)
@@ -315,10 +315,10 @@ RESET: READY / ARMED / TRACKING / FINISHED → READY (시작점과 궤적을 지
 
 ### HELLO: 접속 인사
 ```json
-{"cmd":"HELLO","version":"2.1","state":"IDLE","calibrated":true,"camera":"OK","profile":"practice_lime"}
+{"cmd":"HELLO","version":"2.2","state":"IDLE","calibrated":true,"camera":"OK","profile":"practice_lime"}
 ```
 - 접속 직후 그 컨트롤에게 1번 보내고, 바로 뒤에 현재 `STATUS`도 보냅니다.
-- `version`: 프로토콜 버전. 새 명령·필드가 호환되게 추가되면 끝자리(2.1 → 2.2), 호환되지 않게 바뀌면 앞자리가 올라갑니다.
+- `version`: 프로토콜 버전. 새 명령·필드가 호환되게 추가되면 끝자리(2.2 → 2.3), 호환되지 않게 바뀌면 앞자리가 올라갑니다.
 - `calibrated`: 엔진에 저장된 캘리브레이션이 있는지. `true`이면 `ALIGN`을 `use_saved`로 보내 바로 쓸 수 있습니다.
 - `profile`: 지금 활성화된 공 검출 프로필의 `key` (`PROFILE` 명령 참고).
 
@@ -328,7 +328,7 @@ RESET: READY / ARMED / TRACKING / FINISHED → READY (시작점과 궤적을 지
  "t":1.24,"speed":850.3,"ts":1730728512345,"frame":4821}
 ```
 - `state`: 위의 상태 표 참고
-- `camera`: `"OK"`(카메라 영상을 읽는 중) / `"LOST"`(끊김)
+- `camera`: `"OK"`(카메라 영상을 읽는 중) / `"LOST"`(끊김). 바뀌는 순간에는 `CAMERA` 이벤트도 옵니다.
 - `x`, `y`: 공의 현재 위치(mm). 공이 안 보이거나 매트 밖이면 `null`
 - `t`: 추적 시작 후 경과 시간(초). 0은 `TRACK START`의 시각(공이 마지막으로 가만히 있던 순간)입니다. `TRACKING`일 때만 값이 있고 아니면 `null`
 - `speed`: 속도(mm/초). `TRACKING`일 때만 포함됩니다.
@@ -341,6 +341,16 @@ RESET: READY / ARMED / TRACKING / FINISHED → READY (시작점과 궤적을 지
 ```
 - `ARMED`에서 공이 움직여 `TRACKING`이 된 순간 1번 옵니다. `STATUS(TRACKING)`보다 먼저 옵니다.
 - `ts`: 추적 시작 시각 (epoch 밀리초). 공이 **마지막으로 가만히 있던 프레임**의 시각이라, 스윙 직후의 출발 시각을 정확히 알 수 있습니다.
+
+### CAMERA: 카메라 영상 수신 상태 변화
+```json
+{"cmd":"CAMERA","event":"LOST"}
+{"cmd":"CAMERA","event":"OK"}
+```
+- 카메라 영상 수신 상태가 **바뀐 순간에만** 1번씩 옵니다 (끊기면 `LOST`, 영상을 받기 시작하거나 복구되면 `OK`). 끊겨 있는 동안 `STATUS`의 `camera`도 `"LOST"`입니다.
+- 엔진은 카메라가 끊기면 **1초마다 자동으로 다시 연결을 시도**합니다. 컨트롤이 할 일은 없습니다. 복구되면 `OK`가 옵니다.
+- **추적 중에 카메라가 끊긴 경우**: 공이 안 보이는 것으로 보고 시간을 세다가, 2초(`tracking.lost_duration`)가 지나면 추적을 `LOST`로 끝내고 `STATUS(FINISHED)` → `RESULT`(`reason":"LOST"`)를 보냅니다. 그 전에 복구되면 추적이 이어집니다. (`ARMED` 중에 끊기면 상태는 그대로 유지됩니다.)
+- 카메라가 끊긴 동안 `ALIGN`(자동 검출)과 `INIT`은 실패합니다 (`no_frame`, `no_ball`).
 
 ### ADDR: 어드레스 위치 진입/이탈
 ```json
@@ -372,6 +382,7 @@ RESET: READY / ARMED / TRACKING / FINISHED → READY (시작점과 궤적을 지
 ## 오류 응답
 - JSON이 아닌 줄: `{"cmd":"ERROR","reason":"bad_json"}` (보낸 컨트롤에게만)
 - 모르는 명령: `{"cmd":"ERROR","reason":"unknown_cmd","received":"FOO"}`
+- 엔진 내부 오류: `{"cmd":"ERROR","reason":"internal_error","received":"ALIGN"}` — 명령을 처리하다 예상 못 한 오류가 났다는 뜻입니다. 엔진은 계속 동작하며 오류 내용은 엔진의 로그 파일(`logs/engine.log`)에 남습니다. 같은 명령에서 반복되면 엔진 담당자에게 로그를 전달해 주세요.
 
 ## 초기 손그림 규격과의 대응표
 처음에 정리된 손그림 규격(APP ↔ Ball)을 JSON으로 옮긴 것입니다. 기존에 알고 계신 이름과 맞춰 보세요.

@@ -23,6 +23,7 @@ UI 없이도 테스트할 수 있다. 상세 규격은 docs/PROTOCOL.md 참고.
 엔진 -> 컨트롤 (먼저 보내는 것, 접속한 모든 앱에 전송):
     HELLO       접속 직후 1회 (그 앱에만): 프로토콜 버전과 현재 상태
     STATUS      상태 변화 시 + 추적 중에는 초당 최대 status_hz번(기본 30)
+    CAMERA      event=OK/LOST: 카메라 영상 수신이 시작·복구되거나 끊긴 순간 1회
     TRACK       event=START: 공이 움직여 추적이 시작된 순간 1회
     ADDR        event=IN/OUT: 공이 어드레스 위치 안으로 들어오거나 나갈 때 1회
     RESULT      추적이 끝났을 때(정지/이탈) 결과 1회
@@ -31,15 +32,19 @@ UI 없이도 테스트할 수 있다. 상세 규격은 docs/PROTOCOL.md 참고.
 원점은 좌상단이다.
 """
 
+import logging
 import math
 import time
 
 from src.stats import compute_point_series, compute_trajectory_stats
 from src.tracker import LOST_REASON, STOP_REASON, TrackerState
 
+logger = logging.getLogger("protocol")
+
 # 프로토콜 버전 (HELLO로 컨트롤에 알려 준다). 호환되는 추가(새 명령·필드)는 끝자리를,
 # 호환되지 않는 변경은 앞자리를 올린다. 2.1: ALIGN corners/use_saved, SAVE, PROFILE 추가.
-PROTOCOL_VERSION = "2.1"
+# 2.2: CAMERA 이벤트, 명령 처리 오류 응답(internal_error) 추가.
+PROTOCOL_VERSION = "2.2"
 
 # config/settings.json의 "protocol" 항목에 없을 때 쓸 기본값
 DEFAULT_ADDR_RADIUS_MM = 100
@@ -139,10 +144,23 @@ class ProtocolHandler:
                 "PING": self._cmd_ping,
             }
             handler = handlers.get(cmd) if isinstance(cmd, str) else None
+
+            # 상태 조회·연결 확인은 자주 오므로 DEBUG로만 남기고, 나머지 명령은 INFO로 남긴다.
+            level = logging.DEBUG if cmd in ("STATUS", "PING") else logging.INFO
+            request_id = "" if self._request_id is _NO_ID else f" (id={self._request_id!r})"
+            logger.log(level, "명령 수신: %s%s", cmd, request_id)
+
             if handler is None:
+                logger.warning("알 수 없는 명령: %r", cmd)
                 self._respond({"cmd": "ERROR", "reason": "unknown_cmd", "received": cmd})
                 return
-            handler(message)
+            try:
+                handler(message)
+            except Exception:
+                # 명령 처리 중 예상 못 한 오류가 나도 컨트롤이 응답을 기다리며 멈추지 않게,
+                # 오류 응답을 보내고 엔진은 계속 동작한다.
+                logger.exception("명령 처리 중 오류: %s", cmd)
+                self._respond({"cmd": "ERROR", "reason": "internal_error", "received": cmd})
         finally:
             self._reply = self._send
             self._request_id = _NO_ID
@@ -160,6 +178,7 @@ class ProtocolHandler:
         self._reply(message)
 
     def _ng(self, cmd: str, reason: str) -> None:
+        logger.info("명령 거절: %s -> NG (%s)", cmd, reason)
         self._respond({"cmd": cmd, "result": "NG", "reason": reason})
 
     def on_client_connected(self, client) -> None:
@@ -356,6 +375,14 @@ class ProtocolHandler:
         if state_changed or due:
             self._last_push_time = now
             self._send(self._build_status(now, detection))
+
+    def on_camera_changed(self, ok: bool) -> None:
+        """카메라 영상 수신 상태가 바뀌었을 때 CAMERA 이벤트를 모든 앱에 1회 보낸다.
+
+        OK: 영상을 받기 시작했거나 끊겼다가 복구됨, LOST: 카메라가 끊김.
+        끊겨 있는 동안 STATUS의 camera도 "LOST"로 나간다.
+        """
+        self._send({"cmd": "CAMERA", "event": "OK" if ok else "LOST"})
 
     def on_tracking_started(self, started_at: float | None) -> None:
         """공이 움직여 추적이 시작됐을 때 TRACK START 이벤트를 1회 보낸다.

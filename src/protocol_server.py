@@ -15,6 +15,7 @@ command_received 시그널을 받는 쪽(protocol_handler)이 정한다.
 """
 
 import json
+import logging
 
 from PySide6.QtCore import QObject, Signal
 from PySide6.QtNetwork import QAbstractSocket, QHostAddress, QTcpServer, QTcpSocket
@@ -24,6 +25,8 @@ from src.config import load_settings
 # config/settings.json에 "protocol" 항목이 없을 때 쓸 기본값
 DEFAULT_ENABLED = True
 DEFAULT_PORT = 9000
+
+logger = logging.getLogger("protocol")
 
 
 class ProtocolServer(QObject):
@@ -47,6 +50,8 @@ class ProtocolServer(QObject):
         self._server.newConnection.connect(self._on_new_connection)
         # 소켓별로 아직 줄바꿈이 오지 않은 '반쪽짜리' 데이터를 모아두는 버퍼
         self._buffers: dict[QTcpSocket, bytes] = {}
+        # 소켓별 상대 주소 문구 (로그용)
+        self._peers: dict[QTcpSocket, str] = {}
 
     def start(self) -> bool:
         """서버를 시작한다. 사용 안 함 설정이거나 포트가 이미 사용 중이면 False."""
@@ -104,14 +109,19 @@ class ProtocolServer(QObject):
             # 실시간 좌표를 보낼 때 지연이 생기지 않도록 하기 위해서다.
             sock.setSocketOption(QAbstractSocket.LowDelayOption, 1)
             self._buffers[sock] = b""
+            # 접속이 끊긴 뒤에는 상대 주소를 알 수 없으니, 로그에 남길 주소를 미리 적어 둔다.
+            self._peers[sock] = f"{sock.peerAddress().toString()}:{sock.peerPort()}"
             sock.readyRead.connect(lambda s=sock: self._on_ready_read(s))
             sock.disconnected.connect(lambda s=sock: self._on_disconnected(s))
+            logger.info("컨트롤 접속: %s (현재 %d대)", self._peers[sock], len(self._buffers))
             self.client_count_changed.emit(len(self._buffers))
             self.client_connected.emit(sock)
 
     def _on_disconnected(self, sock: QTcpSocket) -> None:
         self._buffers.pop(sock, None)
+        peer = self._peers.pop(sock, "?")
         sock.deleteLater()
+        logger.info("컨트롤 접속 끊김: %s (현재 %d대)", peer, len(self._buffers))
         self.client_count_changed.emit(len(self._buffers))
 
     def _on_ready_read(self, sock: QTcpSocket) -> None:
@@ -130,6 +140,7 @@ class ProtocolServer(QObject):
                 if not isinstance(message, dict):
                     raise ValueError("JSON 객체가 아님")
             except (ValueError, UnicodeDecodeError):
+                logger.warning("JSON이 아닌 입력을 받음: %s (%r)", self._peers.get(sock, "?"), line[:80])
                 self.send_to(sock, {"cmd": "ERROR", "reason": "bad_json"})
                 continue
             self.command_received.emit(message, sock)

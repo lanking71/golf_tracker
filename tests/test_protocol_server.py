@@ -92,7 +92,7 @@ class ConnectionTests(ServerTestCase):
         pump()
         messages = client.messages()
         self.assertEqual([m["cmd"] for m in messages], ["HELLO", "STATUS"])
-        self.assertEqual(messages[0]["version"], "2.1")
+        self.assertEqual(messages[0]["version"], "2.2")
 
     def test_hello_goes_only_to_new_client(self):
         first = self.connect()

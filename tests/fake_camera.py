@@ -35,9 +35,11 @@ class FakeCamera:
         self.ball = ball  # (x, y) 픽셀 좌표, None이면 공이 없는 화면
         self.show_mat = show_mat  # False면 매트가 안 보이는 화면
         self.available = True  # False로 바꾸면 카메라가 끊긴 것처럼 동작한다
+        self.open_calls = 0  # open()이 불린 횟수 (재연결 시도 간격을 확인하는 데 쓴다)
         self._opened = False
 
     def open(self) -> bool:
+        self.open_calls += 1
         self._opened = self.available
         return self._opened
 
