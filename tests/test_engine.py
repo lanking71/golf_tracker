@@ -301,7 +301,10 @@ class ProtocolIntegrationTests(EngineTestCase):
     def test_command_sequence(self):
         self.step()
         self.handler.handle({"cmd": "ALIGN", "type": "REQ", "width_mm": 4500, "height_mm": 2000})
-        self.assertEqual(self.last(), {"cmd": "ALIGN", "result": "OK", "width_mm": 4500, "height_mm": 2000})
+        align = self.last()
+        self.assertEqual((align["cmd"], align["result"], align["method"]), ("ALIGN", "OK", "auto"))
+        self.assertEqual((align["width_mm"], align["height_mm"]), (4500, 2000))
+        self.assertEqual(len(align["corners"]), 4)  # 실제로 쓰인 모서리(픽셀)
 
         self.handler.handle({"cmd": "INIT", "type": "BALL"})
         self.assertEqual(self.last()["result"], "OK")

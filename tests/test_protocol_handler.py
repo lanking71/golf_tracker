@@ -9,10 +9,12 @@
 
 import unittest
 
+from src.config import load_settings
 from src.engine import START_OK
 from src.protocol_handler import PROTOCOL_VERSION
 from src.tracker import TrackerState
 from tests.base import EngineTestCase
+from tests.fake_camera import MAT_CORNERS
 
 
 class HandlerTestCase(EngineTestCase):
@@ -251,6 +253,214 @@ class ResultTests(HandlerTestCase):
         ]
         self.assertTrue(finished_status)
         self.assertLess(finished_status[0], commands.index("RESULT"))
+
+
+class AlignOptionsTests(HandlerTestCase):
+    """ALIGN의 세 가지 방식: 자동 검출 / corners 직접 전달 / use_saved 저장값 재사용."""
+
+    def corners_message(self, **extra):
+        return {"cmd": "ALIGN", "corners": [list(c) for c in MAT_CORNERS], **extra}
+
+    def test_auto_reply_reports_method_and_corners(self):
+        self.step()
+        reply = self.ask({"cmd": "ALIGN"})
+        self.assertEqual((reply["result"], reply["method"]), ("OK", "auto"))
+        self.assertEqual(len(reply["corners"]), 4)
+        for found, expected in zip(reply["corners"], MAT_CORNERS):  # 자동 검출은 1~2픽셀 오차
+            self.assertAlmostEqual(found[0], expected[0], delta=3)
+            self.assertAlmostEqual(found[1], expected[1], delta=3)
+
+    def test_corners_applied_exactly(self):
+        self.step()
+        reply = self.ask(self.corners_message(width_mm=4500, height_mm=2000))
+        self.assertEqual((reply["result"], reply["method"]), ("OK", "corners"))
+        self.assertEqual(reply["corners"], [list(c) for c in MAT_CORNERS])
+        self.assertEqual(self.engine.tracker.state, TrackerState.CALIBRATING)
+        # 우하단 모서리는 정확히 (4500, 2000)mm
+        x_mm, y_mm = self.engine.calibration.pixel_to_real(*MAT_CORNERS[2])
+        self.assertAlmostEqual(x_mm, 4500, delta=0.5)
+        self.assertAlmostEqual(y_mm, 2000, delta=0.5)
+
+    def test_corners_work_without_camera_frame(self):
+        # 카메라 영상이 없어도(자동 검출은 no_frame) 직접 전달한 모서리는 쓸 수 있다
+        self.assertEqual(self.ask({"cmd": "ALIGN"})["reason"], "no_frame")
+        self.assertEqual(self.ask(self.corners_message())["result"], "OK")
+
+    def test_corners_make_auto_detection_failure_recoverable(self):
+        self.camera.show_mat = False  # 매트가 안 보이는 상황 (조명 등)
+        self.step()
+        self.assertEqual(self.ask({"cmd": "ALIGN"})["reason"], "mat_not_found")
+        self.assertEqual(self.ask(self.corners_message())["result"], "OK")
+        self.assertTrue(self.engine.calibration.is_calibrated())
+
+    def test_bad_corners_keep_previous_calibration(self):
+        self.step()
+        self.assertEqual(self.ask({"cmd": "ALIGN", "width_mm": 4500, "height_mm": 2000})["result"], "OK")
+        before = list(self.engine.calibration.corners)
+
+        rotated = [list(c) for c in MAT_CORNERS[1:] + MAT_CORNERS[:1]]  # 순서가 틀림
+        reply = self.ask({"cmd": "ALIGN", "corners": rotated, "width_mm": 3000, "height_mm": 1500})
+        self.assertEqual((reply["result"], reply["reason"]), ("NG", "bad_corners"))
+        self.assertEqual(self.engine.calibration.corners, before)
+        self.assertEqual(self.engine.calibration.mat_width_mm, 4500)  # 크기도 그대로
+
+    def test_corners_out_of_frame(self):
+        self.step()
+        outside = [[100, 150], [5000, 100], [1020, 620], [90, 600]]
+        reply = self.ask({"cmd": "ALIGN", "corners": outside})
+        self.assertEqual(reply["reason"], "corners_out_of_frame")
+        self.assertFalse(self.engine.calibration.is_calibrated())
+
+    def test_corners_with_bad_size(self):
+        reply = self.ask(self.corners_message(width_mm=-1))
+        self.assertEqual(reply["reason"], "bad_size")
+
+    def test_use_saved_reuses_existing_calibration(self):
+        self.step()
+        first = self.ask(self.corners_message(width_mm=4500, height_mm=2000))
+        reply = self.ask({"cmd": "ALIGN", "use_saved": True})
+        self.assertEqual((reply["result"], reply["method"]), ("OK", "saved"))
+        self.assertEqual(reply["corners"], first["corners"])
+
+    def test_use_saved_with_new_size_recomputes(self):
+        self.ask(self.corners_message(width_mm=4500, height_mm=2000))
+        reply = self.ask({"cmd": "ALIGN", "use_saved": True, "width_mm": 3000, "height_mm": 1500})
+        self.assertEqual((reply["width_mm"], reply["height_mm"]), (3000, 1500))
+        x_mm, y_mm = self.engine.calibration.pixel_to_real(*MAT_CORNERS[2])
+        self.assertAlmostEqual(x_mm, 3000, delta=0.5)
+        self.assertAlmostEqual(y_mm, 1500, delta=0.5)
+
+    def test_use_saved_without_saved_calibration(self):
+        reply = self.ask({"cmd": "ALIGN", "use_saved": True})
+        self.assertEqual((reply["result"], reply["reason"]), ("NG", "not_calibrated"))
+
+    def test_saved_calibration_survives_engine_restart(self):
+        self.ask(self.corners_message(width_mm=4500, height_mm=2000))  # 설정 파일에 저장된다
+
+        from src.engine import VisionEngine
+        from tests.fake_camera import FakeCamera
+
+        restarted = VisionEngine(camera=FakeCamera())  # 새로 시작한 엔진 (카메라 영상은 아직 없음)
+        try:
+            self.assertTrue(restarted.calibration.is_calibrated())
+            hello = []
+            restarted.protocol_handler._send_to = lambda client, message: hello.append(message)
+            restarted.protocol_handler.on_client_connected("NEW")
+            self.assertTrue(hello[0]["calibrated"])  # 접속하자마자 캘리브레이션 여부를 알 수 있다
+            self.assertEqual(restarted.align_saved(), "OK")  # 영상 없이도 ALIGN use_saved 가능
+        finally:
+            restarted.shutdown()
+
+    def test_corners_and_use_saved_together_rejected(self):
+        reply = self.ask(self.corners_message(use_saved=True))
+        self.assertEqual(reply["reason"], "bad_option")
+
+    def test_use_saved_must_be_boolean(self):
+        self.assertEqual(self.ask({"cmd": "ALIGN", "use_saved": "yes"})["reason"], "bad_option")
+        self.assertEqual(self.ask({"cmd": "ALIGN", "use_saved": 1})["reason"], "bad_option")
+
+    def test_null_corners_means_not_given(self):
+        self.step()
+        reply = self.ask({"cmd": "ALIGN", "corners": None})
+        self.assertEqual(reply["method"], "auto")
+
+    def test_all_methods_refused_while_armed(self):
+        self.prepare_ready()
+        self.ask({"cmd": "ADD", "type": "BALL"})
+        for extra in ({}, {"use_saved": True}, {"corners": [list(c) for c in MAT_CORNERS]}):
+            reply = self.ask({"cmd": "ALIGN", **extra})
+            self.assertEqual(reply["reason"], "bad_state", extra)
+
+
+class SaveTests(HandlerTestCase):
+    def test_save_after_finished(self):
+        self.prepare_ready()
+        self.run_putt()
+        reply = self.ask({"cmd": "SAVE", "id": "s1"})
+        self.assertEqual((reply["cmd"], reply["result"]), ("SAVE", "OK"))
+        self.assertEqual(reply["id"], "s1")  # 요청 id 되돌림
+        self.assertIsInstance(reply["record_id"], int)  # DB 행 번호는 별도 필드
+        saved = self.engine.storage.get_result(reply["record_id"])
+        self.assertIsNotNone(saved)
+        self.assertGreater(saved.total_distance_cm, 0)
+
+    def test_each_save_gets_new_record_id(self):
+        self.prepare_ready()
+        self.run_putt()
+        first = self.ask({"cmd": "SAVE"})["record_id"]
+        second = self.ask({"cmd": "SAVE"})["record_id"]
+        self.assertNotEqual(first, second)
+
+    def test_save_only_when_finished(self):
+        reply = self.ask({"cmd": "SAVE"})  # IDLE
+        self.assertEqual((reply["result"], reply["reason"]), ("NG", "bad_state"))
+        self.prepare_ready()
+        self.assertEqual(self.ask({"cmd": "SAVE"})["reason"], "bad_state")  # READY
+        self.ask({"cmd": "ADD", "type": "BALL"})
+        self.assertEqual(self.ask({"cmd": "SAVE"})["reason"], "bad_state")  # ARMED
+
+    def test_save_needs_calibration(self):
+        # 캘리브레이션 없이 화면 버튼 방식으로 추적을 끝낸 상황 (앱의 INIT은 캘리브레이션이 필요하다)
+        self.step()
+        self.assertEqual(self.engine.register_start(), START_OK)
+        self.assertTrue(self.engine.start_tracking())
+        for i in range(1, 11):
+            self.step(ball=(500 + i * 20, 400))
+        for _ in range(20):
+            self.step()
+        self.assertEqual(self.engine.tracker.state, TrackerState.FINISHED)
+        reply = self.ask({"cmd": "SAVE"})
+        self.assertEqual((reply["result"], reply["reason"]), ("NG", "not_calibrated"))
+
+
+class ProfileTests(HandlerTestCase):
+    def test_list_profiles(self):
+        reply = self.ask({"cmd": "PROFILE", "id": 1})
+        self.assertEqual((reply["cmd"], reply["result"], reply["id"]), ("PROFILE", "OK", 1))
+        self.assertEqual(reply["active"], "test")
+        keys = [p["key"] for p in reply["profiles"]]
+        for expected in ("test", "practice", "real", "practice_lime"):
+            self.assertIn(expected, keys)
+        self.assertTrue(all(p["name"] for p in reply["profiles"]))
+
+    def test_switch_profile_changes_detection_and_persists(self):
+        self.step()
+        self.assertIsNotNone(self.engine.last_detection)  # 'test' 프로필: 자홍색 공이 검출된다
+
+        reply = self.ask({"cmd": "PROFILE", "name": "practice"})  # 흰 공 프로필
+        self.assertEqual((reply["result"], reply["active"]), ("OK", "practice"))
+        self.assertEqual(load_settings()["detection"]["active_profile"], "practice")  # 파일에 저장됨
+        self.step()
+        self.assertIsNone(self.engine.last_detection)  # 검출기가 새로 만들어져 자홍색 공은 안 보인다
+
+        self.assertEqual(self.ask({"cmd": "PROFILE", "name": "test"})["active"], "test")
+        self.step()
+        self.assertIsNotNone(self.engine.last_detection)
+
+    def test_unknown_profile(self):
+        reply = self.ask({"cmd": "PROFILE", "name": "nope"})
+        self.assertEqual((reply["result"], reply["reason"]), ("NG", "unknown_profile"))
+        self.assertEqual(self.ask({"cmd": "PROFILE"})["active"], "test")  # 그대로
+
+    def test_name_must_be_string(self):
+        self.assertEqual(self.ask({"cmd": "PROFILE", "name": 5})["reason"], "bad_value")
+
+    def test_null_name_only_lists(self):
+        self.assertEqual(self.ask({"cmd": "PROFILE", "name": None})["active"], "test")
+
+    def test_cannot_switch_while_armed_or_tracking(self):
+        self.prepare_ready()
+        self.ask({"cmd": "ADD", "type": "BALL"})
+        self.assertEqual(self.ask({"cmd": "PROFILE", "name": "practice"})["reason"], "bad_state")
+        self.step(ball=(560, 400))  # 움직여서 TRACKING
+        self.assertEqual(self.engine.tracker.state, TrackerState.TRACKING)
+        self.assertEqual(self.ask({"cmd": "PROFILE", "name": "practice"})["reason"], "bad_state")
+        # 목록 조회는 언제든 가능하다
+        self.assertEqual(self.ask({"cmd": "PROFILE"})["result"], "OK")
+
+    def test_hello_reports_active_profile(self):
+        self.handler.on_client_connected("NEW")
+        self.assertEqual(self.direct[0][1]["profile"], "test")
 
 
 if __name__ == "__main__":

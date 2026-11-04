@@ -1,4 +1,4 @@
-# 메인 컨트롤 ↔ 비전 엔진 통신 규격 (v2.0)
+# 메인 컨트롤 ↔ 비전 엔진 통신 규격 (v2.1)
 
 **메인 컨트롤(Flutter 등) 개발자에게 전달하는 문서입니다. 이 문서만 보면 연동할 수 있습니다.**
 
@@ -202,8 +202,31 @@ RESET: READY / ARMED / TRACKING / FINISHED → READY (시작점과 궤적을 지
 {"cmd":"ALIGN","type":"REQ","width_mm":4500,"height_mm":2000}
 ```
 - `type`은 `"REQ"` (생략 가능), `width_mm`/`height_mm`은 선택입니다 (없으면 현재 설정값 유지).
-- 녹색 매트 모서리를 자동 검출합니다. 응답: `{"cmd":"ALIGN","result":"OK","width_mm":4500,"height_mm":2000}`
-- NG 이유: `bad_state`(추적 대기·추적 중), `bad_size`, `no_frame`(카메라 영상 없음), `mat_not_found`(매트를 못 찾음), `bad_type`
+- 매트 모서리를 얻는 방법이 **세 가지**입니다.
+
+| 방법 | 보내는 값 | 언제 쓰나 |
+|---|---|---|
+| 자동 검출 (기본) | 아무것도 안 붙임 | 카메라가 매트를 잘 보고 있을 때. 녹색 매트를 영상에서 찾는다 |
+| 모서리 직접 전달 | `"corners":[[x,y],[x,y],[x,y],[x,y]]` | 자동 검출이 안 될 때(조명, 일부 가림), 또는 컨트롤이 모서리를 알고 있을 때 |
+| 저장값 재사용 | `"use_saved":true` | 카메라·매트를 옮기지 않았을 때. 영상 없이도 되고 가장 빠르다 |
+
+  ```json
+  {"cmd":"ALIGN","corners":[[100,150],[1000,100],[1020,620],[90,600]],"width_mm":4500,"height_mm":2000}
+  {"cmd":"ALIGN","use_saved":true}
+  ```
+- **`corners`**: **카메라 화면의 픽셀 좌표** 4점이며, 순서는 **좌상 → 우상 → 우하 → 좌하**(화면에서 시계 방향, 첫 점이 왼쪽 위)입니다. 엔진은 점이 4개인지, 사각형이 맞는지(볼록하고 꼬이지 않음), 순서가 맞는지, 화면 안에 있는지 확인하고 이상하면 NG로 거절합니다. (순서가 틀린 채로 적용되면 좌표가 뒤집혀 나오기 때문입니다.)
+- **`use_saved`**: 엔진에 이미 저장돼 있는 캘리브레이션(이전에 성공한 `ALIGN`의 결과)을 그대로 씁니다. `width_mm`/`height_mm`을 함께 보내면 저장된 모서리로 새 크기 기준 좌표를 다시 계산합니다. `corners`와 `use_saved`를 함께 보낼 수는 없습니다.
+- 응답: 성공하면 `CALIBRATING` 상태가 됩니다.
+  ```json
+  {"cmd":"ALIGN","result":"OK","method":"auto","width_mm":4500,"height_mm":2000,
+   "corners":[[101,151],[999,101],[1019,619],[91,599]]}
+  ```
+  - `method`: 실제로 쓰인 방법 (`"auto"` / `"corners"` / `"saved"`)
+  - `corners`: 실제로 적용된 모서리(픽셀). 자동 검출이 성공했을 때 이 값을 컨트롤이 보관해 두면, 다음에 자동 검출이 안 될 때 `corners`로 다시 보낼 수 있습니다.
+- NG 이유: `bad_state`(추적 대기·추적 중), `bad_size`, `bad_type`, `bad_option`(`use_saved`가 true/false가 아님, 또는 `corners`와 `use_saved`를 함께 보냄)
+  - 자동 검출: `no_frame`(카메라 영상 없음), `mat_not_found`(매트를 못 찾음)
+  - `corners`: `bad_corners`(점이 4개가 아님/숫자가 아님/사각형이 아님/순서가 틀림), `corners_out_of_frame`(점이 화면 밖)
+  - `use_saved`: `not_calibrated`(저장된 캘리브레이션이 없음)
 - NG이면 기존 캘리브레이션과 크기는 **그대로** 유지됩니다.
 
 ### SET_ADDR: 어드레스 위치 지정
@@ -246,6 +269,29 @@ RESET: READY / ARMED / TRACKING / FINISHED → READY (시작점과 궤적을 지
 - 시작점·궤적·마지막 결과(`GET_RESULT`)를 지우고 `READY`로 돌아갑니다. 캘리브레이션은 유지됩니다.
 - 응답: `{"cmd":"RESET","result":"OK"}`. NG 이유: `bad_state`(`IDLE`/`CALIBRATING`일 때)
 
+### SAVE: 결과를 엔진 DB에 저장
+```json
+{"cmd":"SAVE"}
+```
+- 추적이 끝난(`FINISHED`) 결과를 엔진 PC의 DB(SQLite)에 저장합니다. 컨트롤이 결과를 직접 저장한다면 쓰지 않아도 됩니다.
+- 응답: `{"cmd":"SAVE","result":"OK","record_id":12}` (`record_id`는 DB에 저장된 번호. 요청 `id`를 되돌려 주는 `id` 필드와는 별개입니다.)
+- NG 이유: `bad_state`(`FINISHED`가 아님), `not_calibrated`, `no_trajectory`(궤적 점이 2개 미만)
+
+### PROFILE: 공 검출 프로필(공 색) 조회·변경
+```json
+{"cmd":"PROFILE"}
+{"cmd":"PROFILE","name":"real"}
+```
+- 엔진에는 공 색 설정(프로필)이 여러 개 있습니다 (예: 연습용 흰 공/연두 공, 실전용 분홍 공). `name`이 없으면 목록을 조회하고, `name`(프로필 `key`)을 주면 그 프로필로 바꿉니다. 바꾼 설정은 엔진에 저장돼 다음 실행에도 유지됩니다.
+- 응답: 바꾼 뒤(또는 조회 시) 현재 상태를 돌려줍니다.
+  ```json
+  {"cmd":"PROFILE","result":"OK","active":"real",
+   "profiles":[{"key":"practice","name":"연습용 (흰 공)"},
+               {"key":"real","name":"실전용 (분홍 공)"},
+               {"key":"practice_lime","name":"연습용 (연두 공)"}]}
+  ```
+- NG 이유: `unknown_profile`(그런 `key`가 없음), `bad_value`(`name`이 문자열이 아님), `bad_state`(`ARMED`/`TRACKING` 중에는 바꿀 수 없음. 목록 조회는 언제든 가능)
+
 ### STATUS: 상태 조회
 ```json
 {"cmd":"STATUS"}
@@ -269,10 +315,12 @@ RESET: READY / ARMED / TRACKING / FINISHED → READY (시작점과 궤적을 지
 
 ### HELLO: 접속 인사
 ```json
-{"cmd":"HELLO","version":"2.0","state":"IDLE","calibrated":true,"camera":"OK"}
+{"cmd":"HELLO","version":"2.1","state":"IDLE","calibrated":true,"camera":"OK","profile":"practice_lime"}
 ```
 - 접속 직후 그 컨트롤에게 1번 보내고, 바로 뒤에 현재 `STATUS`도 보냅니다.
-- `version`: 프로토콜 버전. 호환되지 않게 바뀌면 올라갑니다.
+- `version`: 프로토콜 버전. 새 명령·필드가 호환되게 추가되면 끝자리(2.1 → 2.2), 호환되지 않게 바뀌면 앞자리가 올라갑니다.
+- `calibrated`: 엔진에 저장된 캘리브레이션이 있는지. `true`이면 `ALIGN`을 `use_saved`로 보내 바로 쓸 수 있습니다.
+- `profile`: 지금 활성화된 공 검출 프로필의 `key` (`PROFILE` 명령 참고).
 
 ### STATUS: 상태·좌표
 ```json

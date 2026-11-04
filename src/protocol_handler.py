@@ -7,7 +7,8 @@ UI 없이도 테스트할 수 있다. 상세 규격은 docs/PROTOCOL.md 참고.
 
 컨트롤 -> 엔진 명령 (cmd 필드). 모든 명령에 선택 필드 "id"를 붙이면
 응답에 그대로 되돌려 준다 (요청과 응답을 짝지을 때 쓴다):
-    ALIGN       매트 자동 정렬(캘리브레이션). 선택: width_mm, height_mm
+    ALIGN       매트 정렬(캘리브레이션). 기본은 자동 검출. 선택: width_mm, height_mm,
+                corners(모서리 4점을 직접 전달), use_saved(저장된 캘리브레이션 재사용)
     SET_ADDR    어드레스(공을 놓을) 위치를 매트 mm 좌표로 지정. 선택: radius_mm
     INIT        type=BALL: 지금 보이는 공을 시작점으로 등록
     ADD         type=BALL: 추적 대기(READY -> ARMED). 공이 움직이면 자동으로 TRACKING
@@ -15,7 +16,9 @@ UI 없이도 테스트할 수 있다. 상세 규격은 docs/PROTOCOL.md 참고.
     RESET       시작점과 궤적을 지우고 READY로 되돌아감
     STATUS      현재 상태를 1회 조회
     GET_RESULT  마지막 추적 결과를 다시 받음
-    PING        연결 확인 (PONG으로 응답)
+    SAVE        이번 결과를 엔진의 DB(SQLite)에 저장 (FINISHED 상태에서만)
+    PROFILE     공 검출 프로필(공 색 설정) 조회·변경. 선택: name
+    PING       연결 확인 (PONG으로 응답)
 
 엔진 -> 컨트롤 (먼저 보내는 것, 접속한 모든 앱에 전송):
     HELLO       접속 직후 1회 (그 앱에만): 프로토콜 버전과 현재 상태
@@ -34,8 +37,9 @@ import time
 from src.stats import compute_point_series, compute_trajectory_stats
 from src.tracker import LOST_REASON, STOP_REASON, TrackerState
 
-# 프로토콜 버전. 규격이 호환되지 않게 바뀔 때 올린다 (HELLO로 컨트롤에 알려 준다).
-PROTOCOL_VERSION = "2.0"
+# 프로토콜 버전 (HELLO로 컨트롤에 알려 준다). 호환되는 추가(새 명령·필드)는 끝자리를,
+# 호환되지 않는 변경은 앞자리를 올린다. 2.1: ALIGN corners/use_saved, SAVE, PROFILE 추가.
+PROTOCOL_VERSION = "2.1"
 
 # config/settings.json의 "protocol" 항목에 없을 때 쓸 기본값
 DEFAULT_ADDR_RADIUS_MM = 100
@@ -129,6 +133,8 @@ class ProtocolHandler:
                 "ABORT": self._cmd_abort,
                 "RESET": self._cmd_reset,
                 "STATUS": self._cmd_status,
+                "SAVE": self._cmd_save,
+                "PROFILE": self._cmd_profile,
                 "GET_RESULT": self._cmd_get_result,
                 "PING": self._cmd_ping,
             }
@@ -169,6 +175,7 @@ class ProtocolHandler:
             "state": self.tracker.state.name,
             "calibrated": self.calibration.is_calibrated(),
             "camera": self._camera_text(),
+            "profile": self._engine.profiles()[0],
         })
         reply(self._build_status(time.time()))
 
@@ -177,8 +184,23 @@ class ProtocolHandler:
         if message.get("type", "REQ") != "REQ":
             return self._ng("ALIGN", "bad_type")
 
-        # 실제 검출·저장은 엔진이 한다 (화면의 '캘리브레이션' 버튼과 같은 부품을 쓴다).
-        result = self._engine.align_auto(message.get("width_mm"), message.get("height_mm"))
+        # 모서리를 얻는 방법: corners(직접 전달) > use_saved(저장값) > 자동 검출(기본).
+        # corners와 use_saved를 함께 보내면 어느 쪽인지 알 수 없어서 거절한다.
+        corners = message.get("corners")
+        use_saved = message.get("use_saved", False)
+        if not isinstance(use_saved, bool):
+            return self._ng("ALIGN", "bad_option")
+        if corners is not None and use_saved:
+            return self._ng("ALIGN", "bad_option")
+
+        # 실제 검출·검증·저장은 엔진이 한다 (화면의 '캘리브레이션' 버튼과 같은 부품을 쓴다).
+        width, height = message.get("width_mm"), message.get("height_mm")
+        if corners is not None:
+            method, result = "corners", self._engine.align_corners(corners, width, height)
+        elif use_saved:
+            method, result = "saved", self._engine.align_saved(width, height)
+        else:
+            method, result = "auto", self._engine.align_auto(width, height)
         if result != "OK":
             return self._ng("ALIGN", result)
 
@@ -186,8 +208,12 @@ class ProtocolHandler:
         self._respond({
             "cmd": "ALIGN",
             "result": "OK",
+            "method": method,
             "width_mm": self.calibration.mat_width_mm,
             "height_mm": self.calibration.mat_height_mm,
+            # 실제로 쓰인 모서리(픽셀). 자동 검출 결과를 컨트롤이 보관했다가
+            # 나중에 corners로 다시 보낼 수 있다.
+            "corners": [list(corner) for corner in self.calibration.corners],
         })
         self._engine.changed.emit()
 
@@ -253,6 +279,43 @@ class ProtocolHandler:
         self._last_result = None
         self._respond({"cmd": "RESET", "result": "OK"})
         self._engine.changed.emit()
+
+    def _cmd_save(self, message: dict) -> None:
+        """이번 추적 결과를 엔진의 SQLite DB에 저장한다 (추적이 끝난 FINISHED 상태에서만).
+
+        응답의 record_id는 DB에 저장된 행 번호이다. (요청의 id를 되돌려 주는
+        "id" 필드와 이름이 겹치지 않게 record_id라고 부른다.)
+        """
+        if not self.tracker.can("save"):
+            return self._ng("SAVE", "bad_state")
+        status, record_id = self._engine.save_result()
+        if status != "OK":
+            return self._ng("SAVE", status)
+        self._respond({"cmd": "SAVE", "result": "OK", "record_id": record_id})
+
+    def _cmd_profile(self, message: dict) -> None:
+        """공 검출 프로필(공 색 설정)을 조회하거나 바꾼다.
+
+        name이 없으면 목록을 돌려주고, name(프로필 키)이 있으면 그 프로필로 바꾼다.
+        """
+        if "name" in message and message["name"] is not None:
+            name = message["name"]
+            if not isinstance(name, str):
+                return self._ng("PROFILE", "bad_value")
+            result = self._engine.select_profile(name)
+            if result != "OK":
+                return self._ng("PROFILE", result)
+            self._engine.changed.emit()
+
+        active, profiles = self._engine.profiles()
+        self._respond({
+            "cmd": "PROFILE",
+            "result": "OK",
+            "active": active,
+            "profiles": [
+                {"key": key, "name": profile.get("name", key)} for key, profile in profiles.items()
+            ],
+        })
 
     def _cmd_status(self, message: dict) -> None:
         self._respond(self._build_status(time.time()))

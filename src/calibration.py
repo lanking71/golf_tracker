@@ -17,6 +17,8 @@ is_inside()로 어떤 픽셀 좌표가 캘리브레이션된 매트 네 모서�
 true(기본값)면, 매트 밖에서 검출된 공은 오검출로 보고 무시한다.
 """
 
+import math
+
 import numpy as np
 import cv2
 
@@ -38,6 +40,74 @@ MIN_MAT_AREA_RATIO = 0.2
 
 # 모서리를 찍는 순서 (상태 배지에 다음에 찍을 위치를 안내하는 데 쓴다)
 CORNER_NAMES = ["좌상단", "우상단", "우하단", "좌하단"]
+
+
+# 모서리 네 점이 이루는 사각형의 넓이가 이보다 작으면(px²) 사각형으로 보지 않는다.
+MIN_CORNERS_AREA_PX = 100
+
+
+def check_corners(corners, frame_size: tuple[int, int] | None = None) -> str | None:
+    """직접 전달받은 매트 모서리 4점(픽셀 좌표)이 쓸 수 있는 값인지 검사한다.
+
+    메인 컨트롤이 ALIGN에 corners를 실어 보낼 때 잘못된 값이 캘리브레이션을
+    망가뜨리지 않도록, 적용하기 전에 확인한다. 문제가 없으면 None, 있으면 이유 코드:
+    - "bad_corners": 형식이 틀림 (점이 4개가 아님, 숫자가 아님), 사각형이 아님
+      (넓이가 너무 작음, 볼록하지 않음, 꼬임), 순서가 틀림
+    - "corners_out_of_frame": 점이 카메라 화면 밖에 있음 (frame_size를 알 때만 검사)
+
+    순서는 좌상 -> 우상 -> 우하 -> 좌하이다. 화면 좌표는 y가 아래쪽이라 이 순서는
+    화면에서 시계 방향이며, 네 꼭짓점의 외적이 모두 양수일 때만 통과시킨다
+    (순서가 반대거나 뒤섞이면 실제 mm 좌표가 좌우·상하 뒤집혀 나오기 때문이다).
+    """
+    if not isinstance(corners, (list, tuple)) or len(corners) != 4:
+        return "bad_corners"
+
+    points = []
+    for corner in corners:
+        if not isinstance(corner, (list, tuple)) or len(corner) != 2:
+            return "bad_corners"
+        for value in corner:
+            # True/False는 파이썬에서 int지만 좌표로 인정하지 않는다
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return "bad_corners"
+            if not math.isfinite(value):
+                return "bad_corners"
+        points.append((float(corner[0]), float(corner[1])))
+
+    # 모든 꼭짓점에서 같은 방향(시계)으로 꺾여야 한다 -> 볼록 + 순서 올바름 + 꼬임 없음
+    for i in range(4):
+        ax, ay = points[i]
+        bx, by = points[(i + 1) % 4]
+        cx, cy = points[(i + 2) % 4]
+        if (bx - ax) * (cy - by) - (by - ay) * (cx - bx) <= 0:
+            return "bad_corners"
+
+    # 순서를 한 칸 돌린 목록(우상, 우하, 좌하, 좌상)도 시계 방향이라 위 검사를 통과하지만
+    # 그러면 mm 좌표가 90도 돌아서 나온다. 시계 방향으로 돌 때 윗변(좌상 -> 우상)은 화면에서
+    # 가장 오른쪽을 향하는 변이므로, 첫 변이 네 변 중 가장 오른쪽을 향하는지 확인한다.
+    # (점들의 x+y 합 같은 값으로 순서를 추정하면 매트가 많이 기울어 보일 때 올바른 순서도
+    # 틀렸다고 판단할 수 있어서, 변의 방향으로 판단한다.)
+    def rightward(i: int) -> float:
+        (ax, ay), (bx, by) = points[i], points[(i + 1) % 4]
+        return (bx - ax) / math.hypot(bx - ax, by - ay)
+
+    if any(rightward(i) > rightward(0) for i in range(1, 4)):
+        return "bad_corners"
+
+    # 신발끈 공식으로 넓이를 구해 너무 작은 사각형을 걸러낸다
+    area = 0.0
+    for i in range(4):
+        x1, y1 = points[i]
+        x2, y2 = points[(i + 1) % 4]
+        area += x1 * y2 - x2 * y1
+    if abs(area) / 2 < MIN_CORNERS_AREA_PX:
+        return "bad_corners"
+
+    if frame_size is not None:
+        width, height = frame_size
+        if any(not (0 <= x <= width and 0 <= y <= height) for x, y in points):
+            return "corners_out_of_frame"
+    return None
 
 
 def _order_corners(points) -> list[tuple[int, int]]:

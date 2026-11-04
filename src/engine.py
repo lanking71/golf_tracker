@@ -26,9 +26,9 @@ from dataclasses import dataclass
 import numpy as np
 from PySide6.QtCore import QObject, QTimer, Signal
 
-from src.calibration import Calibration, detect_mat_corners
+from src.calibration import Calibration, check_corners, detect_mat_corners
 from src.camera import Camera
-from src.config import load_settings
+from src.config import load_settings, save_settings
 from src.detector import DEFAULT_DETECTION_SETTINGS, BallDetection, BallDetector
 from src.protocol_handler import ProtocolHandler
 from src.protocol_server import ProtocolServer
@@ -266,20 +266,20 @@ class VisionEngine(QObject):
             self.calibration.save()
         return True
 
+    # 앱의 ALIGN 명령은 매트 모서리를 얻는 방법이 세 가지다. 셋 모두 같은 규칙을 따른다:
+    #   1) 상태·크기를 먼저 확인하고  2) 모서리를 얻고(여기서 실패하면 아무것도 바꾸지 않음)
+    #   3) 모두 성공한 뒤에만 크기·모서리를 적용·저장하고 CALIBRATING으로 들어간다.
+    # (실패했는데 크기만 바뀌거나 기존 캘리브레이션이 지워지는 일이 없도록)
+    # 성공하면 "OK", 실패하면 이유 코드를 돌려준다.
+
     def align_auto(self, width_mm=None, height_mm=None) -> str:
-        """앱의 ALIGN 명령: 녹색 매트를 자동 검출해 캘리브레이션한다.
+        """녹색 매트를 카메라 영상에서 자동 검출해 캘리브레이션한다.
 
-        크기(width_mm/height_mm)가 오면 함께 적용한다. 성공하면 "OK", 실패하면
-        이유 코드("bad_state", "bad_size", "no_frame", "mat_not_found")를 돌려준다.
-        모두 성공한 뒤에만 상태를 바꾼다 (실패했는데 크기만 바뀌는 일이 없도록).
+        이유 코드: "bad_state", "bad_size", "no_frame"(카메라 영상 없음), "mat_not_found"
         """
-        if not self.tracker.can("calibrate"):
-            return "bad_state"
-
-        width = self.calibration.mat_width_mm if width_mm is None else width_mm
-        height = self.calibration.mat_height_mm if height_mm is None else height_mm
-        if not (_is_positive_number(width) and _is_positive_number(height)):
-            return "bad_size"
+        size = self._align_precheck(width_mm, height_mm)
+        if isinstance(size, str):
+            return size
 
         if self.last_raw_frame is None:
             return "no_frame"
@@ -288,12 +288,65 @@ class VisionEngine(QObject):
         )
         if corners is None:
             return "mat_not_found"
+        self._apply_alignment(size, corners)
+        return "OK"
 
-        self.calibration.set_mat_size(width, height)
-        self.calibration.set_corners(corners)
+    def align_corners(self, corners, width_mm=None, height_mm=None) -> str:
+        """컨트롤이 직접 알려 준 모서리 4점(픽셀 좌표)으로 캘리브레이션한다.
+
+        자동 검출이 실패할 때(조명, 매트 일부 가림) 쓴다. 점은 좌상 -> 우상 -> 우하 -> 좌하
+        순서의 카메라 화면 픽셀 좌표여야 하고, 값이 이상하면 적용하지 않는다.
+        이유 코드: "bad_state", "bad_size", "bad_corners", "corners_out_of_frame"
+        """
+        size = self._align_precheck(width_mm, height_mm)
+        if isinstance(size, str):
+            return size
+
+        frame_size = None
+        if self.last_raw_frame is not None:
+            frame_size = (self.last_raw_frame.shape[1], self.last_raw_frame.shape[0])
+        problem = check_corners(corners, frame_size)
+        if problem is not None:
+            return problem
+        self._apply_alignment(size, corners)
+        return "OK"
+
+    def align_saved(self, width_mm=None, height_mm=None) -> str:
+        """이미 저장돼 있는 캘리브레이션을 그대로 쓴다 (카메라 영상 없이도 가능).
+
+        카메라와 매트를 옮기지 않았다면 매번 다시 검출할 필요가 없다. 크기가 오면
+        저장된 모서리로 새 크기 기준 변환 행렬을 다시 계산한다.
+        이유 코드: "bad_state", "bad_size", "not_calibrated"(저장된 캘리브레이션 없음)
+        """
+        size = self._align_precheck(width_mm, height_mm)
+        if isinstance(size, str):
+            return size
+        if not self.calibration.is_calibrated():
+            return "not_calibrated"
+        self._apply_alignment(size, None)
+        return "OK"
+
+    def _align_precheck(self, width_mm, height_mm):
+        """ALIGN 공통 확인: 지금 상태에서 가능한지, 크기가 올바른지.
+
+        통과하면 적용할 (가로, 세로) mm를, 실패하면 이유 코드(문자열)를 돌려준다.
+        크기가 안 오면 현재 설정값을 그대로 쓴다.
+        """
+        if not self.tracker.can("calibrate"):
+            return "bad_state"
+        width = self.calibration.mat_width_mm if width_mm is None else width_mm
+        height = self.calibration.mat_height_mm if height_mm is None else height_mm
+        if not (_is_positive_number(width) and _is_positive_number(height)):
+            return "bad_size"
+        return (width, height)
+
+    def _apply_alignment(self, size: tuple, corners) -> None:
+        """검사를 모두 통과한 뒤 크기·모서리를 적용하고 저장한다 (corners가 None이면 기존 모서리 유지)."""
+        self.calibration.set_mat_size(*size)
+        if corners is not None:
+            self.calibration.set_corners(corners)
         self.calibration.save()
         self.tracker.calibrate()
-        return "OK"
 
     def register_start(self) -> str:
         """'시작 위치 등록': 지금 검출된 공을 시작점으로 등록한다.
@@ -397,8 +450,11 @@ class VisionEngine(QObject):
         )
         return SAVE_OK, result_id
 
-    def active_profile_name(self) -> str:
-        """지금 활성화된 검출 프로필의 표시 이름을 돌려준다."""
+    def profiles(self) -> tuple[str, dict]:
+        """검출 프로필 목록을 돌려준다: (지금 활성화된 프로필의 키, {키: 프로필 설정}).
+
+        설정 파일에 없는 기본 프로필(흰 공, 분홍 공, 연두 공)도 함께 들어 있다.
+        """
         detection_settings = load_settings().get("detection", {})
         profiles = {
             **DEFAULT_DETECTION_SETTINGS["profiles"],
@@ -407,8 +463,31 @@ class VisionEngine(QObject):
         active_key = detection_settings.get(
             "active_profile", DEFAULT_DETECTION_SETTINGS["active_profile"]
         )
-        profile = profiles.get(active_key, {})
-        return profile.get("name", active_key)
+        return active_key, profiles
+
+    def active_profile_name(self) -> str:
+        """지금 활성화된 검출 프로필의 표시 이름을 돌려준다."""
+        active_key, profiles = self.profiles()
+        return profiles.get(active_key, {}).get("name", active_key)
+
+    def select_profile(self, key: str) -> str:
+        """앱의 PROFILE 명령: 공 검출 프로필(공 색 설정)을 바꾼다 (예: 연습용 연두 공 -> 실전용 분홍 공).
+
+        설정 파일에 저장해서 다음 실행에도 유지하고, 검출기를 바로 새로 만든다.
+        반환: "OK" / "unknown_profile"(그런 프로필 없음) / "bad_state"(추적 대기·추적 중에는
+        검출 조건이 바뀌면 안 되므로 바꿀 수 없다).
+        """
+        if self.tracker.state in (TrackerState.ARMED, TrackerState.TRACKING):
+            return "bad_state"
+        _active, profiles = self.profiles()
+        if key not in profiles:
+            return "unknown_profile"
+
+        settings = load_settings()
+        settings.setdefault("detection", {})["active_profile"] = key
+        save_settings(settings)
+        self.reload_detector()
+        return "OK"
 
     # ------------------------------------------------------------------
     # 설정 다시 불러오기
