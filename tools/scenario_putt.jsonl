@@ -1,0 +1,16 @@
+# 퍼팅 1회 시나리오 (tools/test_client.py --script 로 실행)
+# 비전 엔진이 켜져 있고, 카메라에 녹색 매트와 공이 보여야 합니다.
+# 각 명령의 "id"는 응답에 그대로 돌아와서 요청과 응답을 짝지을 수 있습니다.
+
+{"cmd":"PING","id":1}
+{"cmd":"ALIGN","type":"REQ","width_mm":4500,"height_mm":2000,"id":2}
+{"cmd":"SET_ADDR","x":1000,"y":1000,"id":3}
+{"cmd":"INIT","type":"BALL","id":4}
+{"cmd":"ADD","type":"BALL","id":5}
+
+# 여기서 공을 굴리세요. 공이 움직이면 TRACK START → STATUS(TRACKING)이 오고,
+# 멈추면 STATUS(FINISHED) 다음에 RESULT가 옵니다.
+sleep 20
+
+{"cmd":"GET_RESULT","id":6}
+{"cmd":"RESET","id":7}

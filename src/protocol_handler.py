@@ -1,39 +1,57 @@
 """
-앱(Flutter)에서 온 JSON 명령을 처리하고, 엔진 상태를 앱에 보내는 모듈.
+메인 컨트롤 프로그램에서 온 JSON 명령을 처리하고, 엔진 상태를 보내는 모듈 (프로토콜 v2).
 
 protocol_server.py가 '통신'(JSON 주고받기)을 맡고, 이 모듈은 그 위에서
 '무슨 뜻인지'(명령 처리)를 맡는다. Qt에 의존하지 않는 순수 파이썬이라
 UI 없이도 테스트할 수 있다. 상세 규격은 docs/PROTOCOL.md 참고.
 
-앱 -> 엔진 명령 (cmd 필드):
-    ALIGN     매트 자동 정렬(캘리브레이션). 선택: width_mm, height_mm
-    SET_ADDR  어드레스(공을 놓을) 위치를 매트 mm 좌표로 지정. 선택: radius_mm
-    INIT      type=BALL: 지금 보이는 공을 시작점으로 등록
-    ADD       type=BALL: 추적 대기(READY -> ARMED). 공이 움직이면 자동으로 TRACKING
-    STATUS    현재 상태를 1회 조회
+컨트롤 -> 엔진 명령 (cmd 필드). 모든 명령에 선택 필드 "id"를 붙이면
+응답에 그대로 되돌려 준다 (요청과 응답을 짝지을 때 쓴다):
+    ALIGN       매트 자동 정렬(캘리브레이션). 선택: width_mm, height_mm
+    SET_ADDR    어드레스(공을 놓을) 위치를 매트 mm 좌표로 지정. 선택: radius_mm
+    INIT        type=BALL: 지금 보이는 공을 시작점으로 등록
+    ADD         type=BALL: 추적 대기(READY -> ARMED). 공이 움직이면 자동으로 TRACKING
+    ABORT       추적 대기/추적을 멈추고 READY로 되돌아감
+    RESET       시작점과 궤적을 지우고 READY로 되돌아감
+    STATUS      현재 상태를 1회 조회
+    GET_RESULT  마지막 추적 결과를 다시 받음
+    PING        연결 확인 (PONG으로 응답)
 
-엔진 -> 앱 (먼저 보내는 것):
-    STATUS    상태 변화 시 + 추적 중에는 초당 최대 status_hz번(기본 30)
-    ADDR      event=IN/OUT: 공이 어드레스 위치 안으로 들어오거나 나갈 때 1회
-    RESULT    추적이 끝났을 때(정지/이탈) 결과 1회
+엔진 -> 컨트롤 (먼저 보내는 것, 접속한 모든 앱에 전송):
+    HELLO       접속 직후 1회 (그 앱에만): 프로토콜 버전과 현재 상태
+    STATUS      상태 변화 시 + 추적 중에는 초당 최대 status_hz번(기본 30)
+    TRACK       event=START: 공이 움직여 추적이 시작된 순간 1회
+    ADDR        event=IN/OUT: 공이 어드레스 위치 안으로 들어오거나 나갈 때 1회
+    RESULT      추적이 끝났을 때(정지/이탈) 결과 1회
 
-좌표는 모두 매트 mm 좌표이고 원점은 좌상단이다.
+명령에 대한 응답은 그 명령을 보낸 앱에게만 간다. 좌표는 모두 매트 mm 좌표이고
+원점은 좌상단이다.
 """
 
 import math
 import time
 
-from src.stats import compute_trajectory_stats
+from src.stats import compute_point_series, compute_trajectory_stats
 from src.tracker import LOST_REASON, STOP_REASON, TrackerState
+
+# 프로토콜 버전. 규격이 호환되지 않게 바뀔 때 올린다 (HELLO로 컨트롤에 알려 준다).
+PROTOCOL_VERSION = "2.0"
 
 # config/settings.json의 "protocol" 항목에 없을 때 쓸 기본값
 DEFAULT_ADDR_RADIUS_MM = 100
 DEFAULT_STATUS_HZ = 30
+DEFAULT_RESULT_POINTS = True
 # 어드레스 영역을 벗어났다고 볼 때의 여유 배수 (경계에서 IN/OUT이 깜빡이는 것을 막는다)
 ADDR_OUT_MARGIN = 1.2
 
 # 종료 사유를 앱에 보낼 때 쓰는 영문 코드
 FINISH_REASON_CODES = {STOP_REASON: "STOP", LOST_REASON: "LOST"}
+
+# RESULT.points 한 점의 각 값이 무엇인지 (컨트롤이 읽기 쉽도록 RESULT에 함께 실어 보낸다)
+POINT_FIELDS = ["x", "y", "t", "dist", "speed"]
+
+# 요청에 "id"가 없었다는 표시 (id가 null/0/빈 문자열이어도 그대로 되돌려 주려고 None과 구분한다)
+_NO_ID = object()
 
 
 def _is_number(value) -> bool:
@@ -42,22 +60,27 @@ def _is_number(value) -> bool:
 
 
 class ProtocolHandler:
-    """앱 명령 처리 + 엔진 상태 실시간 전송."""
+    """컨트롤 명령 처리 + 엔진 상태 실시간 전송."""
 
-    def __init__(self, engine, send, settings: dict | None = None):
+    def __init__(self, engine, send, settings: dict | None = None, send_to=None):
         """
         engine: VisionEngine. 화면 버튼과 앱 명령이 같은 엔진·Tracker 메서드를 쓰므로
                 상태 규칙이 항상 같다. 상태를 바꾸는 명령이 끝나면 engine.changed 시그널로
                 화면(있다면)이 다시 그리도록 알린다.
-        send(dict): 앱으로 메시지를 보내는 함수 (ProtocolServer.send)
+        send(dict): 접속한 모든 앱에 보내는 함수 (ProtocolServer.send)
+        send_to(client, dict): 특정 앱 한 대에게만 보내는 함수 (ProtocolServer.send_to).
+                명령에 대한 응답에 쓴다. 없으면 응답도 모두에게 보낸다.
         """
         self._engine = engine
         self._send = send
+        self._send_to = send_to
 
         loaded = settings or {}
         self.addr_radius_mm: float = loaded.get("addr_radius_mm", DEFAULT_ADDR_RADIUS_MM)
         status_hz = loaded.get("status_hz", DEFAULT_STATUS_HZ)
         self._push_interval = 1.0 / status_hz if status_hz > 0 else 0.0
+        # RESULT에 궤적 점 전체를 실을지 (False면 요약값만 보낸다)
+        self.result_points: bool = loaded.get("result_points", DEFAULT_RESULT_POINTS)
 
         # 어드레스 위치(mm)와 공이 지금 그 안에 있는지
         self._addr_mm: tuple[float, float] | None = None
@@ -67,6 +90,12 @@ class ProtocolHandler:
         self._last_push_time = 0.0
         self._track_t0: float | None = None  # 추적 시작 시각
         self._prev_sample: tuple[float, float, float] | None = None  # (x, y, 시각)
+        # 마지막 추적 결과 (GET_RESULT로 다시 받을 수 있다)
+        self._last_result: dict | None = None
+
+        # 지금 처리 중인 명령의 응답 방법 (handle()이 명령마다 정하고 끝나면 되돌린다)
+        self._reply = self._send
+        self._request_id = _NO_ID
 
     @property
     def tracker(self):
@@ -79,26 +108,69 @@ class ProtocolHandler:
         return self._engine.calibration
 
     # ------------------------------------------------------------------
-    # 앱 -> 엔진 명령 처리
+    # 컨트롤 -> 엔진 명령 처리
     # ------------------------------------------------------------------
-    def handle(self, message: dict) -> None:
-        """앱에서 온 명령 하나를 처리하고 응답을 보낸다."""
-        cmd = message.get("cmd")
-        handlers = {
-            "ALIGN": self._cmd_align,
-            "SET_ADDR": self._cmd_set_addr,
-            "INIT": self._cmd_init,
-            "ADD": self._cmd_add,
-            "STATUS": self._cmd_status,
-        }
-        handler = handlers.get(cmd) if isinstance(cmd, str) else None
-        if handler is None:
-            self._send({"cmd": "ERROR", "reason": "unknown_cmd", "received": cmd})
-            return
-        handler(message)
+    def handle(self, message: dict, client=None) -> None:
+        """컨트롤에서 온 명령 하나를 처리하고 응답을 보낸다.
+
+        client는 그 명령을 보낸 앱(ProtocolServer가 넘겨 준 소켓)이다. 주어지면
+        응답을 그 앱에만 보내고, 없으면 모두에게 보낸다. 명령에 "id"가 있으면
+        응답에 그대로 붙여서 돌려준다.
+        """
+        self._reply = self._reply_function(client)
+        self._request_id = message.get("id", _NO_ID)
+        try:
+            cmd = message.get("cmd")
+            handlers = {
+                "ALIGN": self._cmd_align,
+                "SET_ADDR": self._cmd_set_addr,
+                "INIT": self._cmd_init,
+                "ADD": self._cmd_add,
+                "ABORT": self._cmd_abort,
+                "RESET": self._cmd_reset,
+                "STATUS": self._cmd_status,
+                "GET_RESULT": self._cmd_get_result,
+                "PING": self._cmd_ping,
+            }
+            handler = handlers.get(cmd) if isinstance(cmd, str) else None
+            if handler is None:
+                self._respond({"cmd": "ERROR", "reason": "unknown_cmd", "received": cmd})
+                return
+            handler(message)
+        finally:
+            self._reply = self._send
+            self._request_id = _NO_ID
+
+    def _reply_function(self, client):
+        """응답을 보낼 함수: 보낸 앱을 알면 그 앱에만, 모르면 모두에게."""
+        if client is not None and self._send_to is not None:
+            return lambda msg: self._send_to(client, msg)
+        return self._send
+
+    def _respond(self, message: dict) -> None:
+        """명령에 대한 응답을 보낸다 (요청의 id가 있으면 붙이고, 요청한 앱에게만)."""
+        if self._request_id is not _NO_ID:
+            message = {**message, "id": self._request_id}
+        self._reply(message)
 
     def _ng(self, cmd: str, reason: str) -> None:
-        self._send({"cmd": cmd, "result": "NG", "reason": reason})
+        self._respond({"cmd": cmd, "result": "NG", "reason": reason})
+
+    def on_client_connected(self, client) -> None:
+        """새 앱이 접속했을 때: 인사(HELLO)와 현재 상태(STATUS)를 그 앱에만 보낸다.
+
+        앱은 접속 직후 상태를 따로 물어보지 않아도 엔진이 준비됐는지,
+        캘리브레이션이 돼 있는지 바로 알 수 있다.
+        """
+        reply = self._reply_function(client)
+        reply({
+            "cmd": "HELLO",
+            "version": PROTOCOL_VERSION,
+            "state": self.tracker.state.name,
+            "calibrated": self.calibration.is_calibrated(),
+            "camera": self._camera_text(),
+        })
+        reply(self._build_status(time.time()))
 
     def _cmd_align(self, message: dict) -> None:
         """매트를 자동 검출해 캘리브레이션한다. 크기(width_mm/height_mm)가 오면 함께 적용한다."""
@@ -111,7 +183,7 @@ class ProtocolHandler:
             return self._ng("ALIGN", result)
 
         self._addr_inside = False
-        self._send({
+        self._respond({
             "cmd": "ALIGN",
             "result": "OK",
             "width_mm": self.calibration.mat_width_mm,
@@ -133,7 +205,7 @@ class ProtocolHandler:
         self._addr_mm = (float(x), float(y))
         self.addr_radius_mm = radius
         self._addr_inside = False  # 새 위치 기준으로 IN/OUT을 다시 판정한다
-        self._send({"cmd": "ADDR", "result": "OK"})
+        self._respond({"cmd": "ADDR", "result": "OK"})
 
     def _cmd_init(self, message: dict) -> None:
         """지금 보이는 공을 시작점으로 등록한다."""
@@ -151,7 +223,7 @@ class ProtocolHandler:
             return self._ng("INIT", "no_ball")
 
         x, y = self._to_mm(self.tracker.start_position)
-        self._send({"cmd": "INIT", "result": "OK", "x": x, "y": y})
+        self._respond({"cmd": "INIT", "result": "OK", "x": x, "y": y})
         self._engine.changed.emit()
 
     def _cmd_add(self, message: dict) -> None:
@@ -164,14 +236,39 @@ class ProtocolHandler:
             return self._ng("ADD", "bad_type")
         if not self._engine.start_tracking():
             return self._ng("ADD", "bad_state")
-        self._send({"cmd": "ADD", "result": "OK"})
+        self._respond({"cmd": "ADD", "result": "OK"})
+        self._engine.changed.emit()
+
+    def _cmd_abort(self, message: dict) -> None:
+        """추적 대기(ARMED)나 추적(TRACKING)을 멈추고 READY로 돌아간다 (시작점은 남는다)."""
+        if not self._engine.abort():
+            return self._ng("ABORT", "bad_state")
+        self._respond({"cmd": "ABORT", "result": "OK"})
+        self._engine.changed.emit()
+
+    def _cmd_reset(self, message: dict) -> None:
+        """시작점·궤적·마지막 결과를 지우고 READY로 돌아간다 (캘리브레이션은 남는다)."""
+        if not self._engine.reset():
+            return self._ng("RESET", "bad_state")
+        self._last_result = None
+        self._respond({"cmd": "RESET", "result": "OK"})
         self._engine.changed.emit()
 
     def _cmd_status(self, message: dict) -> None:
-        self._send(self._build_status(time.time()))
+        self._respond(self._build_status(time.time()))
+
+    def _cmd_get_result(self, message: dict) -> None:
+        """마지막 추적 결과를 다시 보낸다 (결과 메시지를 놓쳤을 때 쓴다)."""
+        if self._last_result is None:
+            return self._ng("RESULT", "no_result")
+        self._respond({**self._last_result, "result": "OK"})
+
+    def _cmd_ping(self, message: dict) -> None:
+        """연결이 살아 있는지 확인한다. ts는 엔진의 현재 시각(epoch 밀리초)이다."""
+        self._respond({"cmd": "PONG", "ts": int(time.time() * 1000)})
 
     # ------------------------------------------------------------------
-    # 엔진 -> 앱 실시간 전송
+    # 엔진 -> 컨트롤 실시간 전송 (접속한 모든 앱에게)
     # ------------------------------------------------------------------
     def on_frame(self, detection, now: float) -> None:
         """매 프레임 호출. 상태 변화/추적 중 좌표/어드레스 IN·OUT을 앱에 보낸다.
@@ -211,7 +308,7 @@ class ProtocolHandler:
         self._send({"cmd": "TRACK", "event": "START", "ts": int(started_at * 1000)})
 
     def on_finished(self, reason: str) -> None:
-        """추적이 정지/이탈로 끝났을 때 호출. 결과(RESULT)를 1회 보낸다."""
+        """추적이 정지/이탈로 끝났을 때 호출. 결과(RESULT)를 만들어 1회 보내고 보관해 둔다."""
         trajectory = self._engine.trajectory_to_real() if self.calibration.is_calibrated() else []
 
         start = self._to_mm(self.tracker.start_position)
@@ -222,9 +319,10 @@ class ProtocolHandler:
         stop = self._to_mm(stop_pixel)
 
         stats = compute_trajectory_stats(trajectory, start, stop)
-        self._send({
+        result = {
             "cmd": "RESULT",
             "reason": FINISH_REASON_CODES.get(reason, "STOP"),
+            "ts": int(time.time() * 1000),
             "start": start,
             "stop": stop,
             "distance_mm": round(stats.total_distance, 1) if stats else None,
@@ -232,7 +330,16 @@ class ProtocolHandler:
             "avg_speed": round(stats.average_speed, 1) if stats else None,
             "max_speed": round(stats.max_speed, 1) if stats else None,
             "straightness": round(stats.straightness, 3) if stats else None,
-        })
+        }
+        if self.result_points:
+            # 점마다 [x_mm, y_mm, 경과시간_초, 누적거리_mm, 속도_mm/초]
+            result["fields"] = POINT_FIELDS
+            result["points"] = [
+                [round(x, 1), round(y, 1), round(t, 3), round(dist, 1), round(speed, 1)]
+                for x, y, t, dist, speed in compute_point_series(trajectory)
+            ]
+        self._last_result = result
+        self._send(result)
 
     def _to_mm(self, pixel) -> list[float] | None:
         """픽셀 좌표를 [x_mm, y_mm]로 바꾼다 (좌표가 없거나 캘리브레이션 전이면 None)."""
@@ -243,8 +350,16 @@ class ProtocolHandler:
             return None
         return [round(real[0], 1), round(real[1], 1)]
 
+    def _camera_text(self) -> str:
+        """카메라 상태 문구: 프레임을 정상적으로 읽고 있으면 OK, 아니면 LOST."""
+        return "OK" if self._engine.camera_ok else "LOST"
+
     def _build_status(self, now: float, detection=None) -> dict:
-        """STATUS 메시지를 만든다. detection이 없으면 가장 최근 검출 결과를 쓴다."""
+        """STATUS 메시지를 만든다. detection이 없으면 가장 최근 검출 결과를 쓴다.
+
+        ts는 이 메시지를 만든 시각(epoch 밀리초), frame은 엔진이 지금까지 처리한
+        프레임 수라서, 컨트롤이 지연이나 누락을 알아챌 수 있다.
+        """
         if detection is None:
             detection = self._engine.last_detection
         position = self._to_mm((detection.x, detection.y)) if detection is not None else None
@@ -253,6 +368,7 @@ class ProtocolHandler:
             "cmd": "STATUS",
             "state": self.tracker.state.name,
             "calibrated": self.calibration.is_calibrated(),
+            "camera": self._camera_text(),
             "x": position[0] if position else None,
             "y": position[1] if position else None,
             "t": None,
@@ -261,6 +377,8 @@ class ProtocolHandler:
             t0 = self._track_t0 if self._track_t0 is not None else now
             status["t"] = round(now - t0, 3)
             status["speed"] = self._speed_mm_per_s(position, now)
+        status["ts"] = int(now * 1000)
+        status["frame"] = self._engine.frame_count
         return status
 
     def _speed_mm_per_s(self, position, now: float) -> float | None:

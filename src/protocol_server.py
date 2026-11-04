@@ -11,13 +11,13 @@ Qt의 QTcpServer를 쓰기 때문에 별도 스레드가 필요 없다 (Qt 이�
 루프가 소켓 입출력을 알아서 처리해 준다).
 
 이 모듈은 '통신'만 담당한다. 받은 명령을 어떻게 처리할지는
-command_received 시그널을 받는 쪽(15단계에서 만들 protocol_handler)이 정한다.
+command_received 시그널을 받는 쪽(protocol_handler)이 정한다.
 """
 
 import json
 
 from PySide6.QtCore import QObject, Signal
-from PySide6.QtNetwork import QHostAddress, QTcpServer, QTcpSocket
+from PySide6.QtNetwork import QAbstractSocket, QHostAddress, QTcpServer, QTcpSocket
 
 from src.config import load_settings
 
@@ -29,8 +29,11 @@ DEFAULT_PORT = 9000
 class ProtocolServer(QObject):
     """TCP로 앱과 JSON 메시지를 주고받는 서버."""
 
-    # 앱에서 JSON 명령이 한 개 도착할 때마다 발생 (dict로 해석된 상태)
-    command_received = Signal(dict)
+    # 앱에서 JSON 명령이 한 개 도착할 때마다 발생.
+    # (dict로 해석된 명령, 그 명령을 보낸 앱의 소켓) - 소켓은 send_to()로 그 앱에만 응답할 때 쓴다.
+    command_received = Signal(dict, object)
+    # 새 앱이 접속했을 때 발생 (그 앱의 소켓). 인사(HELLO)를 보내는 데 쓴다.
+    client_connected = Signal(object)
     # 앱이 접속하거나 끊겨서 접속자 수가 바뀔 때 발생 (현재 접속자 수)
     client_count_changed = Signal(int)
 
@@ -85,17 +88,26 @@ class ProtocolServer(QObject):
         for sock in list(self._buffers):
             sock.write(data)
 
-    def _send_to(self, sock: QTcpSocket, message: dict) -> None:
-        """특정 앱 한 대에게만 보낸다 (그 앱이 보낸 명령에 대한 응답용)."""
+    def send_to(self, sock: QTcpSocket, message: dict) -> None:
+        """특정 앱 한 대에게만 보낸다 (그 앱이 보낸 명령에 대한 응답용).
+
+        이미 접속이 끊긴 소켓이면 조용히 무시한다 (명령을 처리하는 사이 끊길 수 있다).
+        """
+        if sock not in self._buffers:
+            return
         sock.write((json.dumps(message, ensure_ascii=False) + "\n").encode("utf-8"))
 
     def _on_new_connection(self) -> None:
         while self._server.hasPendingConnections():
             sock = self._server.nextPendingConnection()
+            # 작은 메시지를 모아서 늦게 보내지 않고 바로 보내게 한다 (TCP_NODELAY).
+            # 실시간 좌표를 보낼 때 지연이 생기지 않도록 하기 위해서다.
+            sock.setSocketOption(QAbstractSocket.LowDelayOption, 1)
             self._buffers[sock] = b""
             sock.readyRead.connect(lambda s=sock: self._on_ready_read(s))
             sock.disconnected.connect(lambda s=sock: self._on_disconnected(s))
             self.client_count_changed.emit(len(self._buffers))
+            self.client_connected.emit(sock)
 
     def _on_disconnected(self, sock: QTcpSocket) -> None:
         self._buffers.pop(sock, None)
@@ -118,6 +130,6 @@ class ProtocolServer(QObject):
                 if not isinstance(message, dict):
                     raise ValueError("JSON 객체가 아님")
             except (ValueError, UnicodeDecodeError):
-                self._send_to(sock, {"cmd": "ERROR", "reason": "bad_json"})
+                self.send_to(sock, {"cmd": "ERROR", "reason": "bad_json"})
                 continue
-            self.command_received.emit(message)
+            self.command_received.emit(message, sock)

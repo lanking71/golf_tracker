@@ -97,9 +97,19 @@ class VisionEngine(QObject):
         self.protocol_handler = ProtocolHandler(
             engine=self,
             send=self.protocol_server.send,
+            send_to=self.protocol_server.send_to,
             settings=load_settings().get("protocol", {}),
         )
+        # 명령은 보낸 앱의 소켓과 함께 핸들러로 가서, 응답이 그 앱에만 돌아간다.
         self.protocol_server.command_received.connect(self.protocol_handler.handle)
+        # 새 앱이 접속하면 인사(HELLO)와 현재 상태를 보낸다.
+        self.protocol_server.client_connected.connect(self.protocol_handler.on_client_connected)
+
+        # 카메라에서 프레임을 정상적으로 읽고 있는지 (앱의 STATUS.camera로 알려 준다).
+        # 아직 첫 프레임을 읽기 전이거나 끊겨 있으면 False.
+        self.camera_ok = False
+        # 지금까지 처리한 프레임 수 (앱이 프레임 누락·지연을 알 수 있게 STATUS에 실어 보낸다)
+        self.frame_count = 0
 
         # 가장 최근 프레임의 정보 (앱 명령 처리와 화면이 읽어 간다)
         self.last_raw_frame: np.ndarray | None = None
@@ -160,6 +170,8 @@ class VisionEngine(QObject):
         if now is None:
             now = time.time()
         self.last_raw_frame = frame
+        self.camera_ok = True
+        self.frame_count += 1
 
         if self.detection_paused:
             # HSV 튜닝 중에는 검출·추적을 하지 않는다 (화면이 마스크 미리보기를 그린다).
@@ -217,6 +229,7 @@ class VisionEngine(QObject):
         self.last_raw_frame = None
         self.last_detection = None
         self.last_detection_outside_mat = False
+        self.camera_ok = False
         self.camera_unavailable.emit()
 
     # ------------------------------------------------------------------
@@ -302,6 +315,14 @@ class VisionEngine(QObject):
         시작한다. 허용되는 상태(시작점 등록 후)가 아니면 False.
         """
         return self.tracker.start_tracking()
+
+    def abort(self) -> bool:
+        """'추적 중지' / 앱의 ABORT: 추적 대기(ARMED)나 추적(TRACKING)을 멈추고 READY로 돌아간다."""
+        return self.tracker.stop_tracking()
+
+    def reset(self) -> bool:
+        """'궤적 초기화' / 앱의 RESET: 시작점과 궤적을 지우고 READY로 돌아간다 (캘리브레이션은 유지)."""
+        return self.tracker.reset_trajectory()
 
     # ------------------------------------------------------------------
     # 좌표 변환 · 통계 · 저장

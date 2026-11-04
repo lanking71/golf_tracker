@@ -24,6 +24,35 @@ class TrajectoryStats:
     straightness: float  # 0~1, 1에 가까울수록 직선에 가깝게 굴러간 것
 
 
+def compute_point_series(trajectory: list[TrajectoryPoint]) -> list[tuple]:
+    """궤적의 점마다 (x, y, 경과 시간, 누적 거리, 순간 속도)를 계산한다.
+
+    - 경과 시간: 첫 점을 0으로 센 시간(초)
+    - 누적 거리: 첫 점부터 그 점까지 이동한 거리 (compute_trajectory_stats의
+      총 거리와 같은 방식이라, 마지막 점의 누적 거리 = 총 거리)
+    - 순간 속도: 직전 점에서 그 점까지의 거리 / 걸린 시간 (첫 점은 0)
+    좌표 단위는 입력 그대로이고(mm를 넣으면 mm, mm/초), 점이 없으면 빈 목록이다.
+    """
+    if not trajectory:
+        return []
+
+    start_time = trajectory[0].timestamp
+    series = []
+    total = 0.0
+    previous = None
+    for point in trajectory:
+        speed = 0.0
+        if previous is not None:
+            segment = ((point.x - previous.x) ** 2 + (point.y - previous.y) ** 2) ** 0.5
+            elapsed = point.timestamp - previous.timestamp
+            total += segment
+            if elapsed > 0:
+                speed = segment / elapsed
+        series.append((point.x, point.y, point.timestamp - start_time, total, speed))
+        previous = point
+    return series
+
+
 def compute_trajectory_stats(
     trajectory: list[TrajectoryPoint],
     start_position: tuple[float, float] | None,

@@ -5,11 +5,7 @@ VisionEngine 테스트 (진짜 카메라 없이 가짜 카메라로 실행).
     python -m unittest discover -s tests -v
 """
 
-import shutil
-import tempfile
 import unittest
-
-from PySide6.QtCore import QCoreApplication
 
 from src.engine import (
     SAVE_NO_TRAJECTORY,
@@ -18,53 +14,11 @@ from src.engine import (
     START_NO_BALL,
     START_OK,
     START_OUTSIDE_MAT,
-    VisionEngine,
 )
 from src.protocol_handler import ProtocolHandler
 from src.tracker import STOP_REASON, TrackerState
-from tests.fake_camera import MAT_CORNERS, FakeCamera, make_test_settings
-
-# Qt 객체(시그널·타이머·TCP 서버)를 만들려면 Qt 애플리케이션이 하나 있어야 한다.
-_app = QCoreApplication.instance() or QCoreApplication([])
-
-
-class EngineTestCase(unittest.TestCase):
-    """엔진 테스트의 공통 준비: 임시 설정 + 가짜 카메라 + 시그널 기록."""
-
-    def setUp(self):
-        self.tmp_dir = tempfile.mkdtemp()
-        self.settings_patch = make_test_settings(self.tmp_dir)
-        self.settings_patch.start()
-
-        self.camera = FakeCamera()
-        self.engine = VisionEngine(camera=self.camera)
-
-        # 엔진이 보내는 시그널을 모아 둔다
-        self.frames = []
-        self.finished = []
-        self.trajectory_updates = []
-        self.camera_lost = []
-        self.engine.frame_processed.connect(self.frames.append)
-        self.engine.tracking_finished.connect(self.finished.append)
-        self.engine.trajectory_updated.connect(lambda: self.trajectory_updates.append(1))
-        self.engine.camera_unavailable.connect(lambda: self.camera_lost.append(1))
-
-        self.clock = 100.0  # 테스트용 가짜 시계 (초)
-
-    def tearDown(self):
-        self.engine.shutdown()
-        self.settings_patch.stop()
-        shutil.rmtree(self.tmp_dir, ignore_errors=True)
-
-    def step(self, ball=None, dt=0.05):
-        """공 위치를 정하고(ball 생략 시 그대로) 시계를 dt초 흘린 뒤 프레임 1장을 처리한다.
-
-        공을 화면에서 없애려면 step() 전에 self.camera.ball = None 으로 직접 지정한다.
-        """
-        if ball is not None:
-            self.camera.ball = ball
-        self.clock += dt
-        self.engine.process_frame(now=self.clock)
+from tests.base import EngineTestCase
+from tests.fake_camera import MAT_CORNERS
 
 
 class FrameProcessingTests(EngineTestCase):
