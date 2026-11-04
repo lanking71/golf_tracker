@@ -23,9 +23,8 @@ UI 없이도 테스트할 수 있다. 상세 규격은 docs/PROTOCOL.md 참고.
 import math
 import time
 
-from src.calibration import detect_mat_corners
 from src.stats import compute_trajectory_stats
-from src.tracker import LOST_REASON, STOP_REASON, TrackerState, TrajectoryPoint
+from src.tracker import LOST_REASON, STOP_REASON, TrackerState
 
 # config/settings.json의 "protocol" 항목에 없을 때 쓸 기본값
 DEFAULT_ADDR_RADIUS_MM = 100
@@ -45,29 +44,15 @@ def _is_number(value) -> bool:
 class ProtocolHandler:
     """앱 명령 처리 + 엔진 상태 실시간 전송."""
 
-    def __init__(
-        self,
-        tracker,
-        calibration,
-        send,
-        get_detection,
-        get_raw_frame,
-        on_change=None,
-        settings: dict | None = None,
-    ):
+    def __init__(self, engine, send, settings: dict | None = None):
         """
-        tracker, calibration: 메인 창과 같은 객체 (버튼과 앱 명령이 같은 상태 규칙을 쓴다)
+        engine: VisionEngine. 화면 버튼과 앱 명령이 같은 엔진·Tracker 메서드를 쓰므로
+                상태 규칙이 항상 같다. 상태를 바꾸는 명령이 끝나면 engine.changed 시그널로
+                화면(있다면)이 다시 그리도록 알린다.
         send(dict): 앱으로 메시지를 보내는 함수 (ProtocolServer.send)
-        get_detection(): 가장 최근 프레임의 (매트 안) 공 검출 결과, 없으면 None
-        get_raw_frame(): 그리기 전의 가장 최근 카메라 프레임, 없으면 None
-        on_change(): 앱 명령으로 상태가 바뀌었을 때 UI를 갱신하라고 알리는 함수
         """
-        self.tracker = tracker
-        self.calibration = calibration
+        self._engine = engine
         self._send = send
-        self._get_detection = get_detection
-        self._get_raw_frame = get_raw_frame
-        self._on_change = on_change or (lambda: None)
 
         loaded = settings or {}
         self.addr_radius_mm: float = loaded.get("addr_radius_mm", DEFAULT_ADDR_RADIUS_MM)
@@ -82,6 +67,16 @@ class ProtocolHandler:
         self._last_push_time = 0.0
         self._track_t0: float | None = None  # 추적 시작 시각
         self._prev_sample: tuple[float, float, float] | None = None  # (x, y, 시각)
+
+    @property
+    def tracker(self):
+        return self._engine.tracker
+
+    @property
+    def calibration(self):
+        # 설정을 다시 불러오면 엔진의 calibration 객체가 새로 바뀌므로,
+        # 객체를 저장해 두지 않고 매번 엔진에서 꺼내 쓴다.
+        return self._engine.calibration
 
     # ------------------------------------------------------------------
     # 앱 -> 엔진 명령 처리
@@ -109,28 +104,12 @@ class ProtocolHandler:
         """매트를 자동 검출해 캘리브레이션한다. 크기(width_mm/height_mm)가 오면 함께 적용한다."""
         if message.get("type", "REQ") != "REQ":
             return self._ng("ALIGN", "bad_type")
-        if not self.tracker.can("calibrate"):
-            return self._ng("ALIGN", "bad_state")
 
-        width = message.get("width_mm", self.calibration.mat_width_mm)
-        height = message.get("height_mm", self.calibration.mat_height_mm)
-        if not (_is_number(width) and _is_number(height) and width > 0 and height > 0):
-            return self._ng("ALIGN", "bad_size")
+        # 실제 검출·저장은 엔진이 한다 (화면의 '캘리브레이션' 버튼과 같은 부품을 쓴다).
+        result = self._engine.align_auto(message.get("width_mm"), message.get("height_mm"))
+        if result != "OK":
+            return self._ng("ALIGN", result)
 
-        frame = self._get_raw_frame()
-        if frame is None:
-            return self._ng("ALIGN", "no_frame")
-        corners = detect_mat_corners(
-            frame, self.calibration.mat_hsv_lower, self.calibration.mat_hsv_upper
-        )
-        if corners is None:
-            return self._ng("ALIGN", "mat_not_found")
-
-        # 모두 성공한 뒤에만 상태를 바꾼다 (실패했는데 크기만 바뀌는 일이 없도록).
-        self.calibration.set_mat_size(width, height)
-        self.calibration.set_corners(corners)
-        self.calibration.save()
-        self.tracker.calibrate()
         self._addr_inside = False
         self._send({
             "cmd": "ALIGN",
@@ -138,7 +117,7 @@ class ProtocolHandler:
             "width_mm": self.calibration.mat_width_mm,
             "height_mm": self.calibration.mat_height_mm,
         })
-        self._on_change()
+        self._engine.changed.emit()
 
     def _cmd_set_addr(self, message: dict) -> None:
         """어드레스(공을 놓을) 위치를 mm 좌표로 저장한다."""
@@ -162,24 +141,27 @@ class ProtocolHandler:
             return self._ng("INIT", "bad_type")
         if not self.calibration.is_calibrated():
             return self._ng("INIT", "not_calibrated")
-        detection = self._get_detection()
-        if detection is None:
-            return self._ng("INIT", "no_ball")
-        if not self.tracker.register_start_position(detection.x, detection.y):
+        # 결과 코드는 engine.START_* 와 같은 문자열이다 (engine이 이 파일을 import하므로
+        # 여기서 engine 상수를 가져오면 순환 import가 되어 문자열을 직접 비교한다).
+        result = self._engine.register_start()
+        if result == "bad_state":
             return self._ng("INIT", "bad_state")
+        if result != "OK":
+            # 공이 안 보이거나 매트 밖이라 무시된 경우 (앱에는 둘 다 '공 없음'으로 알린다)
+            return self._ng("INIT", "no_ball")
 
-        real = self.calibration.pixel_to_real(detection.x, detection.y)
-        self._send({"cmd": "INIT", "result": "OK", "x": round(real[0], 1), "y": round(real[1], 1)})
-        self._on_change()
+        x, y = self._to_mm(self.tracker.start_position)
+        self._send({"cmd": "INIT", "result": "OK", "x": x, "y": y})
+        self._engine.changed.emit()
 
     def _cmd_add(self, message: dict) -> None:
         """추적을 시작한다 (시작 위치가 등록된 READY 상태에서만)."""
         if message.get("type", "BALL") != "BALL":
             return self._ng("ADD", "bad_type")
-        if not self.tracker.start_tracking():
+        if not self._engine.start_tracking():
             return self._ng("ADD", "bad_state")
         self._send({"cmd": "ADD", "result": "OK"})
-        self._on_change()
+        self._engine.changed.emit()
 
     def _cmd_status(self, message: dict) -> None:
         self._send(self._build_status(time.time()))
@@ -213,11 +195,7 @@ class ProtocolHandler:
 
     def on_finished(self, reason: str) -> None:
         """추적이 정지/이탈로 끝났을 때 호출. 결과(RESULT)를 1회 보낸다."""
-        trajectory = []
-        for p in self.tracker.trajectory:
-            real = self.calibration.pixel_to_real(p.x, p.y)
-            if real is not None:
-                trajectory.append(TrajectoryPoint(x=real[0], y=real[1], timestamp=p.timestamp))
+        trajectory = self._engine.trajectory_to_real() if self.calibration.is_calibrated() else []
 
         start = self._to_mm(self.tracker.start_position)
         stop_pixel = self.tracker.stop_position
@@ -251,7 +229,7 @@ class ProtocolHandler:
     def _build_status(self, now: float, detection=None) -> dict:
         """STATUS 메시지를 만든다. detection이 없으면 가장 최근 검출 결과를 쓴다."""
         if detection is None:
-            detection = self._get_detection()
+            detection = self._engine.last_detection
         position = self._to_mm((detection.x, detection.y)) if detection is not None else None
 
         status = {

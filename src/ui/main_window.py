@@ -1,5 +1,11 @@
 """
-볼 트래커 - 12단계: 결과 저장·조회 (메인 창)
+볼 트래커 - 설정·확인용 메인 창
+
+17단계부터 이 창은 "엔진(src/engine.py)을 들여다보는 화면"일 뿐이다.
+카메라 읽기·공 검출·추적·저장·앱 통신은 모두 VisionEngine이 하고, 이 창은
+엔진이 보내는 시그널(frame_processed 등)을 받아 그리기만 하며, 버튼은 엔진
+메서드를 호출한다. 화면 없이 엔진만 돌릴 때(python main.py)는 이 창이 필요 없다.
+화면과 함께 실행하려면 python main.py --ui 로 시작한다.
 
 - 왼쪽 위: 실시간 카메라 화면
   - CALIBRATING 상태에서는 화면을 클릭해 매트 네 모서리를
@@ -84,22 +90,26 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from src.calibration import CORNER_NAMES, Calibration
-from src.camera import Camera
+from src.calibration import CORNER_NAMES
 from src.config import load_settings, save_settings
 from src.detector import (
     DEFAULT_DETECTION_SETTINGS,
     BallDetection,
-    BallDetector,
     build_mask,
 )
-from src.protocol_handler import ProtocolHandler
+from src.engine import (
+    SAVE_NO_TRAJECTORY,
+    SAVE_NOT_CALIBRATED,
+    SAVE_OK,
+    START_NO_BALL,
+    START_OK,
+    START_OUTSIDE_MAT,
+    FrameResult,
+    VisionEngine,
+)
 from src.protocol_server import DEFAULT_ENABLED as DEFAULT_PROTOCOL_ENABLED
 from src.protocol_server import DEFAULT_PORT as DEFAULT_PROTOCOL_PORT
-from src.protocol_server import ProtocolServer
-from src.stats import compute_trajectory_stats
-from src.storage import Storage
-from src.tracker import Tracker, TrackerState, TrajectoryPoint
+from src.tracker import TrackerState
 from src.ui.camera_label import CameraLabel
 from src.ui.records_dialog import RecordsDialog
 from src.ui.settings_dialog import SettingsDialog
@@ -178,42 +188,23 @@ SAVE_NEEDS_CALIBRATION_MESSAGE = "캘리브레이션이 필요합니다"
 SAVE_NO_TRAJECTORY_MESSAGE = "저장할 궤적이 없습니다"
 SAVE_SUCCESS_MESSAGE = "저장 완료"
 
-# 카메라를 몇 밀리초마다 확인할지.
-# 카메라 자체 FPS(설정상 최대 90)보다 충분히 짧게 잡아야, 우리가 폴링하는
-# 주기가 병목이 되지 않고 실제 카메라 FPS가 그대로 측정/표시된다.
-CAMERA_POLL_INTERVAL_MS = 8
 # 카메라가 없을 때, 다시 연결됐는지 확인하는 문구
 CAMERA_NOT_CONNECTED_TEXT = "카메라를 연결해주세요"
 
 
 class MainWindow(QMainWindow):
-    """볼 트래커 메인 창 (12단계: 결과 저장·조회까지 구현)"""
+    """볼 트래커 설정·확인용 메인 창. 엔진(VisionEngine)을 들여다보고 조작한다."""
 
-    def __init__(self):
+    def __init__(self, engine: VisionEngine):
         super().__init__()
 
         self.setWindowTitle("볼 트래커")
         self.resize(1100, 650)
 
-        # 버튼 활성화 여부를 계산하려면 레이아웃을 만들기 전에 필요하다.
-        self.tracker = Tracker()
-        self.calibration = Calibration()
+        # 실제 일(카메라·검출·추적·통신·저장)은 전부 엔진이 한다. 이 창은 엔진이
+        # 보내는 시그널을 받아 그리고, 버튼을 누르면 엔진 메서드를 호출할 뿐이다.
+        self.engine = engine
         self._buttons: dict[str, QPushButton] = {}
-        # 앱(Flutter)과 JSON으로 통신하는 TCP 서버 + 명령 처리기.
-        # 서버가 받은 명령을 핸들러가 해석하고, 핸들러는 버튼과 같은 Tracker 메서드를 쓴다.
-        self.protocol_server = ProtocolServer(parent=self)
-        self.protocol_handler = ProtocolHandler(
-            tracker=self.tracker,
-            calibration=self.calibration,
-            send=self.protocol_server.send,
-            get_detection=lambda: self._last_detection,
-            get_raw_frame=lambda: self._last_raw_frame,
-            on_change=self._refresh_after_protocol_command,
-            settings=load_settings().get("protocol", {}),
-        )
-        self.protocol_server.command_received.connect(self.protocol_handler.handle)
-        self.protocol_server.client_count_changed.connect(self._update_app_label)
-        self.protocol_server.start()
 
         self._build_menu()
 
@@ -268,41 +259,32 @@ class MainWindow(QMainWindow):
         # 전체 창에 QSS 스타일 적용
         self.setStyleSheet(QSS)
 
-        # 3) 카메라 연결 + 실시간 영상 표시 준비
-        self.camera = Camera()
-        self.detector = BallDetector()
+        # 3) 실시간 영상 표시 준비 (FPS 계산은 화면에 보여주려고 이 창이 한다)
         self._last_frame_time: float | None = None
         self._fps: float = 0.0
-        # 그리기(윤곽선·점 표시)가 들어가기 전의 가장 최근 원본 프레임.
-        # '캘리브레이션' 버튼을 눌렀을 때 녹색 매트를 자동 검출하는 데 쓴다.
-        self._last_raw_frame = None
-        # 가장 최근 프레임에서 검출된 공 (없으면 None). '시작 위치 등록'
-        # 버튼을 눌렀을 때 이 값을 시작점으로 쓴다.
-        self._last_detection: BallDetection | None = None
-        # 방금 프레임에서 공을 찾긴 했지만 매트 영역 밖이라 무시했는지.
-        # '공을 아예 못 찾음'과 구분해서 안내 문구를 다르게 보여주는 데 쓴다.
-        self._last_detection_outside_mat = False
         # 실제로 카메라에서 읽어온 프레임의 (너비, 높이). 궤적 결과 패널을
         # 카메라와 같은 좌표계로 그리기 위해 첫 프레임을 받은 뒤 채워진다.
         self._frame_size: tuple[int, int] | None = None
 
-        # HSV 튜닝 다이얼로그 (검출 설정 메뉴에서 연다). 열려 있는 동안은
-        # 마스크 미리보기를 카메라 패널에 대신 보여준다.
+        # HSV 튜닝 다이얼로그 (검출 설정 메뉴에서 연다). 슬라이더 값이 정해져
+        # 있는 동안(_preview_hsv)은 엔진의 검출을 멈추고 마스크 미리보기를
+        # 카메라 패널에 대신 보여준다.
         self.tuning_dialog: TuningDialog | None = None
-        self._mask_preview_active = False
         self._preview_hsv: tuple[list, list] | None = None
 
         # 프로필/매트 설정 다이얼로그 (설정 메뉴에서 연다)
         self.settings_dialog: SettingsDialog | None = None
 
-        # 측정 결과 저장소 (12단계) + 기록 보기 다이얼로그 (기록 메뉴에서 연다)
-        self.storage = Storage()
+        # 측정 결과 기록 보기 다이얼로그 (기록 메뉴에서 연다)
         self.records_dialog: RecordsDialog | None = None
 
-        self._camera_timer = QTimer(self)
-        self._camera_timer.setInterval(CAMERA_POLL_INTERVAL_MS)
-        self._camera_timer.timeout.connect(self._update_camera_frame)
-        self._camera_timer.start()
+        # 엔진 시그널 연결: 엔진이 알려 주면 이 창은 그리기만 한다.
+        engine.frame_processed.connect(self._on_frame_processed)
+        engine.camera_unavailable.connect(self._show_camera_not_connected)
+        engine.changed.connect(self._refresh_after_engine_change)
+        engine.trajectory_updated.connect(self._render_trajectory_panel)
+        engine.tracking_finished.connect(self._on_tracking_finished)
+        engine.protocol_server.client_count_changed.connect(self._update_app_label)
 
         # 시작 상태(IDLE)에 맞게 배지 문구와 버튼 활성화 상태를 맞춘다.
         self._update_status_badge()
@@ -310,6 +292,25 @@ class MainWindow(QMainWindow):
         self._update_start_point_label()
         self._update_stop_point_label()
         self._render_trajectory_panel()
+
+    # 엔진의 부품에 self.tracker처럼 짧게 접근하기 위한 통로.
+    # (엔진이 설정을 다시 불러오면 calibration 객체가 새로 바뀌므로, 객체를 이 창에
+    # 저장해 두지 않고 매번 엔진에서 꺼내 쓴다.)
+    @property
+    def tracker(self):
+        return self.engine.tracker
+
+    @property
+    def calibration(self):
+        return self.engine.calibration
+
+    @property
+    def storage(self):
+        return self.engine.storage
+
+    @property
+    def protocol_server(self):
+        return self.engine.protocol_server
 
     def _build_menu(self) -> None:
         """상단 메뉴 바에 '설정' 메뉴를 만든다.
@@ -404,19 +405,12 @@ class MainWindow(QMainWindow):
         else:
             action = BUTTON_ACTIONS.get(button_name)
             if action == "calibrate":
-                # 캘리브레이션 버튼은 다시 눌러도(이미 CALIBRATING이어도) 항상
-                # 지금까지 찍은 모서리를 지우고 새로 찍기 시작한다. 이렇게 하면
-                # 잘못 찍었을 때 같은 버튼으로 '다시 지정'할 수 있다.
-                self.calibration.reset_corners()
-                self.tracker.calibrate()
-                # 먼저 녹색 매트 모서리 자동 검출을 시도한다. 성공하면 바로 저장하고,
-                # 실패하면(매트가 안 보이거나 조명 문제) 기존처럼 4점 클릭 모드로 남는다.
-                auto_ok = (
-                    self._last_raw_frame is not None
-                    and self.calibration.auto_calibrate(self._last_raw_frame)
-                )
-                if auto_ok:
-                    self.calibration.save()
+                # 엔진이 모서리를 지우고 녹색 매트 자동 검출을 시도한다. 성공하면
+                # 바로 저장하고, 실패하면(매트가 안 보이거나 조명 문제) 기존처럼
+                # 4점 클릭 모드로 남는다. 다시 눌러도 항상 새로 시작한다.
+                auto_ok = self.engine.start_calibration()
+            elif action == "start_tracking":
+                self.engine.start_tracking()
             elif action is not None:
                 getattr(self.tracker, action)()
             self._update_status_badge()
@@ -435,86 +429,40 @@ class MainWindow(QMainWindow):
         4번째 점을 찍으면 원근 변환 행렬이 자동으로 만들어지고
         config/settings.json에 저장된다 (재실행 시 자동으로 다시 불러온다).
         """
-        if self.tracker.state != TrackerState.CALIBRATING:
-            return
-        if self.calibration.add_corner(x, y):
-            if self.calibration.is_calibrated():
-                self.calibration.save()
+        if self.engine.add_calibration_corner(x, y):
             self._update_status_badge()
 
     def _register_start_position(self) -> None:
-        """검출된 공의 현재 좌표를 시작점으로 등록한다.
+        """엔진에게 검출된 공의 현재 좌표를 시작점으로 등록하게 한다.
 
         등록 순간 공이 검출되지 않았다면 등록하지 않고, 상태 배지에
         안내 문구만 잠깐 보여준 뒤 원래 상태 문구로 되돌린다
         (상태 전환은 일어나지 않는다). 공은 보이지만 매트 영역 밖이라
         무시된 경우에는 그 사실을 알 수 있는 문구를 따로 보여준다.
         """
-        if self._last_detection is None:
-            message = OUTSIDE_MAT_MESSAGE if self._last_detection_outside_mat else NOT_DETECTED_MESSAGE
-            self._show_temporary_status(message)
-            return
-
-        if self.tracker.register_start_position(self._last_detection.x, self._last_detection.y):
+        result = self.engine.register_start()
+        if result == START_OK:
             self._update_status_badge()
+        elif result == START_OUTSIDE_MAT:
+            self._show_temporary_status(OUTSIDE_MAT_MESSAGE)
+        elif result == START_NO_BALL:
+            self._show_temporary_status(NOT_DETECTED_MESSAGE)
+        # START_BAD_STATE: 버튼이 이미 비활성화돼 있어 여기까지 오지 않는다
 
     def _save_result(self) -> None:
-        """'저장' 버튼: 이번 측정 결과를 SQLite DB에 기록한다.
+        """'저장' 버튼: 엔진에게 이번 측정 결과를 SQLite DB에 기록하게 한다.
 
-        캘리브레이션이 안 됐으면(실제 단위 mm를 모르면) 저장하지 않고
-        안내만 잠깐 보여준다. 궤적이 너무 짧아(점 2개 미만) 통계를 계산할
-        수 없을 때도 마찬가지다. 두 조건을 다 통과하면 시작점/정지점(mm),
-        요약 통계(cm·cm/초), 전체 궤적(mm), 현재 활성 검출 프로필 이름을
-        저장하고 "저장 완료"를 잠깐 보여준다.
+        캘리브레이션이 안 됐거나 궤적이 너무 짧아(점 2개 미만) 통계를 계산할
+        수 없으면 저장하지 않고 안내만 잠깐 보여준다. 저장에 성공하면
+        "저장 완료"를 잠깐 보여준다.
         """
-        if not self.calibration.is_calibrated():
+        status, _result_id = self.engine.save_result()
+        if status == SAVE_OK:
+            self._show_temporary_status(SAVE_SUCCESS_MESSAGE)
+        elif status == SAVE_NOT_CALIBRATED:
             self._show_temporary_status(SAVE_NEEDS_CALIBRATION_MESSAGE)
-            return
-
-        real_trajectory = self._trajectory_to_real()
-        real_start = (
-            self.calibration.pixel_to_real(*self.tracker.start_position)
-            if self.tracker.start_position is not None
-            else None
-        )
-        real_stop = (
-            self.calibration.pixel_to_real(*self.tracker.stop_position)
-            if self.tracker.stop_position is not None
-            else None
-        )
-
-        stats = compute_trajectory_stats(real_trajectory, real_start, real_stop)
-        if stats is None:
+        elif status == SAVE_NO_TRAJECTORY:
             self._show_temporary_status(SAVE_NO_TRAJECTORY_MESSAGE)
-            return
-
-        self.storage.save_result(
-            profile_name=self._active_profile_name(),
-            start_point_mm=real_start,
-            stop_point_mm=real_stop,
-            total_distance_cm=stats.total_distance / 10,
-            duration_s=stats.duration,
-            average_speed_cm=stats.average_speed / 10,
-            max_speed_cm=stats.max_speed / 10,
-            straightness=stats.straightness,
-            mat_width_mm=self.calibration.mat_width_mm,
-            mat_height_mm=self.calibration.mat_height_mm,
-            trajectory_mm=[(p.x, p.y) for p in real_trajectory],
-        )
-        self._show_temporary_status(SAVE_SUCCESS_MESSAGE)
-
-    def _active_profile_name(self) -> str:
-        """지금 활성화된 검출 프로필의 표시 이름을 돌려준다."""
-        detection_settings = load_settings().get("detection", {})
-        profiles = {
-            **DEFAULT_DETECTION_SETTINGS["profiles"],
-            **detection_settings.get("profiles", {}),
-        }
-        active_key = detection_settings.get(
-            "active_profile", DEFAULT_DETECTION_SETTINGS["active_profile"]
-        )
-        profile = profiles.get(active_key, {})
-        return profile.get("name", active_key)
 
     def _show_temporary_status(self, message: str) -> None:
         """상태 배지에 message를 잠깐 보여준 뒤 원래 상태 문구로 되돌린다."""
@@ -588,19 +536,22 @@ class MainWindow(QMainWindow):
         else:
             self.tuning_dialog.refresh_profiles(profiles, active_profile)
 
-        self._mask_preview_active = True
         self.tuning_dialog.show()
         self.tuning_dialog.raise_()
         self.tuning_dialog.activateWindow()
 
     def _on_tuning_values_changed(self, lower: list, upper: list) -> None:
-        """튜닝 창 슬라이더가 움직일 때마다 마스크 미리보기에 쓸 범위를 갱신한다."""
+        """튜닝 창 슬라이더가 움직일 때마다 마스크 미리보기에 쓸 범위를 갱신한다.
+
+        미리보기 중에는 엔진이 검출·추적을 멈추고 프레임만 넘겨 준다.
+        """
         self._preview_hsv = (lower, upper)
+        self.engine.detection_paused = True
 
     def _on_tuning_dialog_closed(self) -> None:
-        """튜닝 창이 닫히면 마스크 미리보기를 끄고 원래 카메라 화면으로 돌아간다."""
-        self._mask_preview_active = False
+        """튜닝 창이 닫히면 마스크 미리보기를 끄고 엔진의 검출을 다시 켠다."""
         self._preview_hsv = None
+        self.engine.detection_paused = False
 
     def _on_tuning_profile_saved(self, key: str, profile: dict) -> None:
         """'저장'을 누르면 config/settings.json에 반영하고 검출기를 새로 만든다."""
@@ -611,9 +562,9 @@ class MainWindow(QMainWindow):
         detection_settings["active_profile"] = key
         save_settings(settings)
 
-        # 저장한 설정을 바로 검출에 쓰도록 새로 불러온다.
+        # 저장한 설정을 바로 검출에 쓰도록 엔진이 검출기를 새로 불러온다.
         # (상단 상태 배지는 Tracker 상태 전용이라 여기서는 건드리지 않는다)
-        self.detector = BallDetector()
+        self.engine.reload_detector()
 
     def _open_settings_dialog(self) -> None:
         """'설정 > 프로필/매트 설정...' 메뉴를 눌렀을 때 설정 창을 연다."""
@@ -632,11 +583,8 @@ class MainWindow(QMainWindow):
         self.settings_dialog.activateWindow()
 
     def _on_settings_changed(self) -> None:
-        """프로필/매트 설정 창에서 뭔가 저장되면 검출기·캘리브레이션을 새로 불러온다."""
-        self.detector = BallDetector()
-        self.calibration = Calibration()
-        # 앱 명령 처리기도 새 캘리브레이션 객체를 보도록 맞춘다 (안 그러면 옛 객체를 계속 씀).
-        self.protocol_handler.calibration = self.calibration
+        """프로필/매트 설정 창에서 뭔가 저장되면 엔진이 검출기·캘리브레이션을 새로 불러온다."""
+        self.engine.reload_settings()
         # 매트 크기가 바뀌었을 수 있으니(비율이 달라짐) 궤적 패널을 다시 그린다.
         self._render_trajectory_panel()
 
@@ -652,83 +600,40 @@ class MainWindow(QMainWindow):
         self.records_dialog.raise_()
         self.records_dialog.activateWindow()
 
-    def _update_camera_frame(self) -> None:
-        """타이머가 주기적으로 호출하는 함수. 카메라에서 한 프레임을 읽어 화면에 그린다.
+    def _on_frame_processed(self, result: FrameResult) -> None:
+        """엔진이 한 프레임 처리를 마칠 때마다 불리는 함수. 결과를 화면에 그린다.
 
-        카메라가 아직 없거나 연결이 끊긴 경우에는 예외를 던지지 않고
-        패널에 안내 문구만 표시하고, 다음 호출 때 다시 연결을 시도한다.
+        카메라 읽기·검출·추적·앱 전송은 이미 엔진이 끝냈다. 여기서는 엔진이 넘겨 준
+        원본 프레임 위에 공 윤곽·시작점·매트 테두리를 그려서 보여주기만 한다.
         """
-        if not self.camera.is_opened():
-            if not self.camera.open():
-                self._show_camera_not_connected()
-                return
-
-        frame = self.camera.read_frame()
-        if frame is None:
-            # 읽기에 실패했다면 연결이 끊긴 것으로 보고 장치를 반납한다.
-            self.camera.release()
-            self._show_camera_not_connected()
-            return
-
-        # 이후 프레임에 그림을 그리므로, 자동 캘리브레이션용 깨끗한 원본을 복사해 둔다.
-        self._last_raw_frame = frame.copy()
+        raw_frame = result.frame
 
         # 궤적 결과 패널을 카메라와 같은 좌표계로 그리기 위해 실제 프레임 크기를 기억해둔다.
         # 크기가 처음 정해지거나 바뀔 때만 패널을 다시 그린다 (매 프레임 다시 그리면 낭비).
-        new_frame_size = (frame.shape[1], frame.shape[0])
+        new_frame_size = (raw_frame.shape[1], raw_frame.shape[0])
         if self._frame_size != new_frame_size:
             self._frame_size = new_frame_size
             self.camera_label.set_frame_size(self._frame_size)
             self._render_trajectory_panel()
 
-        if self._mask_preview_active and self._preview_hsv is not None:
+        if result.paused and self._preview_hsv is not None:
             # 튜닝 중에는 원본 대신 마스크(검출 영역이 흰색)를 보여준다.
             lower, upper = self._preview_hsv
-            mask = build_mask(frame, lower, upper)
-            self._last_detection = None
-            self._last_detection_outside_mat = False
+            mask = build_mask(raw_frame, lower, upper)
             self.coord_label.setText("좌표: -")
             self._update_fps()
             self.camera_label.setPixmap(self._mask_to_pixmap(mask))
             return
 
-        # 공 검출 (못 찾아도 예외 없이 None만 돌아온다)
-        raw_detection = self.detector.detect(frame)
-        detection = raw_detection
-        outside_mat = False
-        if (
-            raw_detection is not None
-            and self.calibration.filter_outside_mat
-            and not self.calibration.is_inside(raw_detection.x, raw_detection.y)
-        ):
-            # 매트 영역 밖에서 검출된 건 오검출로 보고 추적/기록에서는 무시한다
-            # (검출 안 된 것과 동일하게 처리). 다만 화면에는 "찾았지만 무시했다"는
-            # 걸 알 수 있게 경고색으로 표시한다 - 그냥 "-"로만 보이면 공을 아예
-            # 못 찾은 것과 구분이 안 돼서, 왜 궤적이 안 그려지는지 알기 어렵다.
-            outside_mat = True
-            detection = None
-        self._last_detection = detection
-        self._last_detection_outside_mat = outside_mat
-        self._update_coord_label(detection, outside_mat)
+        # 엔진이 넘긴 원본은 다른 곳(캘리브레이션 등)에서도 쓰므로, 그림은 복사본에 그린다.
+        frame = raw_frame.copy()
 
-        now = time.time()
-        if detection is not None:
-            self._draw_detection(frame, detection)
-            # TRACKING 상태일 때만 실제로 기록된다 (Tracker가 알아서 상태를 확인한다).
-            if self.tracker.add_trajectory_point(detection.x, detection.y, now):
-                self._render_trajectory_panel()
-            finish_reason = self.tracker.update_detection(detection.x, detection.y, now)
-        else:
-            if outside_mat:
-                self._draw_outside_mat_detection(frame, raw_detection)
-            finish_reason = self.tracker.update_detection(None, None, now)
-
-        # 앱에 상태 변화·실시간 좌표를 보낸다 (종료 시에는 STATUS(FINISHED) 다음에 RESULT가 간다).
-        self.protocol_handler.on_frame(detection, now)
-
-        if finish_reason is not None:
-            self.protocol_handler.on_finished(finish_reason)
-            self._on_tracking_finished()
+        self._update_coord_label(result.detection, result.outside_mat)
+        if result.detection is not None:
+            self._draw_detection(frame, result.detection)
+        elif result.outside_mat:
+            # 공은 보이지만 매트 밖이라 무시된 검출은 경고색으로 표시한다.
+            self._draw_outside_mat_detection(frame, result.raw_detection)
 
         if self.tracker.start_position is not None:
             self._draw_start_point(frame, self.tracker.start_position)
@@ -744,7 +649,7 @@ class MainWindow(QMainWindow):
         pixmap = self._frame_to_pixmap(frame, self.camera_label.size())
         self.camera_label.setPixmap(pixmap)
 
-    def _on_tracking_finished(self) -> None:
+    def _on_tracking_finished(self, *_reason) -> None:
         """정지·이탈 판정으로 TRACKING -> FINISHED 자동 전환이 일어났을 때 UI를 갱신한다."""
         self._update_status_badge()
         self._update_button_states()
@@ -821,12 +726,13 @@ class MainWindow(QMainWindow):
         cv2.polylines(frame, [points], isClosed=True, color=MAT_OUTLINE_COLOR_BGR, thickness=MAT_OUTLINE_THICKNESS)
 
     def _show_camera_not_connected(self) -> None:
-        """카메라 패널에 안내 문구를 표시하고 FPS·좌표·검출 상태를 초기화한다."""
+        """카메라 패널에 안내 문구를 표시하고 FPS·좌표 표시를 초기화한다.
+
+        (검출 상태 자체는 엔진이 이미 비웠다. 여기서는 화면 표시만 정리한다.)
+        """
         self.camera_label.setText(CAMERA_NOT_CONNECTED_TEXT)
         self.fps_label.setText("FPS: -")
         self.coord_label.setText("좌표: -")
-        self._last_detection = None
-        self._last_detection_outside_mat = False
         self._last_frame_time = None
         self._fps = 0.0
 
@@ -975,18 +881,6 @@ class MainWindow(QMainWindow):
             thickness=TRAJECTORY_PATH_THICKNESS,
         )
 
-    def _trajectory_to_real(self) -> list[TrajectoryPoint]:
-        """현재 궤적 전체를 매트 실제 좌표(mm)로 변환한다.
-
-        호출하기 전에 self.calibration.is_calibrated()가 True인지
-        확인해야 한다 (그래야 pixel_to_real이 항상 값을 돌려준다).
-        """
-        result = []
-        for p in self.tracker.trajectory:
-            real_x, real_y = self.calibration.pixel_to_real(p.x, p.y)
-            result.append(TrajectoryPoint(x=real_x, y=real_y, timestamp=p.timestamp))
-        return result
-
     def _update_stats_panel(self) -> None:
         """오른쪽 요약 통계 패널을 갱신한다.
 
@@ -1002,22 +896,12 @@ class MainWindow(QMainWindow):
             self.stats_label.setText(STATS_NEEDS_CALIBRATION_TEXT)
             return
 
-        real_trajectory = self._trajectory_to_real()
-        real_start = (
-            self.calibration.pixel_to_real(*self.tracker.start_position)
-            if self.tracker.start_position is not None
-            else None
-        )
-        real_stop = (
-            self.calibration.pixel_to_real(*self.tracker.stop_position)
-            if self.tracker.stop_position is not None
-            else None
-        )
-
-        stats = compute_trajectory_stats(real_trajectory, real_start, real_stop)
-        if stats is None:
+        # 통계 계산은 엔진이 한다 (점이 2개 미만이면 None)
+        current = self.engine.current_stats()
+        if current is None:
             self.stats_label.setText(STATS_PLACEHOLDER_TEXT)
             return
+        stats = current[0]
 
         # mm -> cm
         self.stats_label.setText(
@@ -1084,8 +968,8 @@ class MainWindow(QMainWindow):
                 "다른 프로그램이 이미 사용 중일 수 있습니다. 다른 포트를 지정해 주세요.",
             )
 
-    def _refresh_after_protocol_command(self) -> None:
-        """앱 명령으로 상태가 바뀌었을 때, 버튼을 눌렀을 때와 같게 화면을 갱신한다."""
+    def _refresh_after_engine_change(self) -> None:
+        """앱 명령 등으로 엔진 상태가 바뀌었을 때, 버튼을 눌렀을 때와 같게 화면을 갱신한다."""
         self._update_status_badge()
         self._update_button_states()
         self._update_start_point_label()
@@ -1093,10 +977,11 @@ class MainWindow(QMainWindow):
         self._render_trajectory_panel()
 
     def closeEvent(self, event) -> None:
-        """창을 닫을 때 타이머를 멈추고 카메라 장치를 반납한다."""
-        self._camera_timer.stop()
-        self.protocol_server.stop()
-        self.camera.release()
+        """창을 닫을 때 열려 있는 대화상자를 닫는다.
+
+        엔진(카메라·타이머·통신 서버) 정리는 프로그램이 끝날 때 src/app.py가
+        engine.shutdown()으로 한다 (창을 닫는 것 = 프로그램 종료).
+        """
         if self.tuning_dialog is not None:
             self.tuning_dialog.close()
         if self.settings_dialog is not None:
