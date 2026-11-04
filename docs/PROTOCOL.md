@@ -96,6 +96,9 @@ ALIGN → SET_ADDR → (공 올려둠) → INIT → ADD → [STATUS 실시간] �
 - 모르는 명령: `{"cmd":"ERROR","reason":"unknown_cmd","received":"FOO"}`
 
 ## 설정 (`config/settings.json`의 `protocol`)
+`enabled`와 `port`는 프로그램의 설정 창(설정 > 프로필/매트 설정... > 앱 통신 설정)에서도 바꿀 수 있습니다.
+`addr_radius_mm`, `status_hz`는 파일을 고친 뒤 프로그램을 다시 시작해야 적용됩니다.
+
 | 키 | 기본값 | 뜻 |
 |---|---|---|
 | `enabled` | `true` | 서버 사용 여부 |

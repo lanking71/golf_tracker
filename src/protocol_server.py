@@ -58,6 +58,21 @@ class ProtocolServer(QObject):
             sock.disconnectFromHost()
         self._server.close()
 
+    def apply_settings(self, enabled: bool, port: int) -> bool:
+        """사용 여부/포트가 바뀌었으면 서버를 새 설정으로 다시 시작한다.
+
+        바뀐 게 없고 이미 원하는 상태면 아무 것도 하지 않는다 (접속 유지).
+        반환값은 '지금 켜져 있어야 하는 상태와 실제 상태가 같은지'이다 -
+        켜야 하는데 포트가 이미 사용 중이라 못 켠 경우 False.
+        """
+        unchanged = enabled == self.enabled and port == self.port
+        if not (unchanged and self.is_listening() == enabled):
+            self.stop()
+            self.enabled = enabled
+            self.port = port
+            self.start()
+        return self.is_listening() == self.enabled
+
     def is_listening(self) -> bool:
         return self._server.isListening()
 

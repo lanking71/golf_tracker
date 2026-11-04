@@ -5,6 +5,7 @@ HSV 슬라이더로 실시간 튜닝하는 TuningDialog와 달리, 이 다이얼
 - 검출 프로필 목록 관리(선택·추가·삭제·이름 변경)
 - 매트 실제 크기(mat_width_mm/mat_height_mm)
 - 매트 밖 필터(filter_outside_mat) on/off
+- 앱 통신(TCP 서버) 사용 여부와 포트
 같은 '폼' 형태의 설정을 다룬다. 실시간 카메라 미리보기는 필요 없다.
 
 프로필 목록 조작(선택·추가·삭제·이름 변경)은 클릭하는 즉시
@@ -42,6 +43,7 @@ from src.detector import (
     DEFAULT_MIN_AREA,
     DEFAULT_MIN_CIRCULARITY,
 )
+from src.protocol_server import DEFAULT_ENABLED, DEFAULT_PORT
 
 PROFILE_KEY_ROLE = Qt.UserRole
 
@@ -51,11 +53,14 @@ class SettingsDialog(QDialog):
 
     # 프로필/매트 설정이 저장돼서 메인 창이 detector·calibration을 다시 불러와야 할 때
     settings_changed = Signal()
+    # 앱 통신(TCP 서버) 설정이 저장됐을 때. 서버를 다시 시작해야 하므로 별도 시그널로 뺐다
+    # (프로필을 클릭할 때마다 서버가 재시작되면 앱 접속이 끊기기 때문).
+    protocol_settings_changed = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("설정")
-        self.resize(420, 520)
+        self.resize(420, 620)
 
         self._profiles: dict = {}
         self._active_profile_key: str = DEFAULT_DETECTION_SETTINGS["active_profile"]
@@ -63,6 +68,7 @@ class SettingsDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.addLayout(self._build_profile_section())
         layout.addLayout(self._build_mat_section())
+        layout.addLayout(self._build_protocol_section())
         layout.addStretch(1)
 
         close_button = QPushButton("닫기")
@@ -130,6 +136,35 @@ class SettingsDialog(QDialog):
 
         return layout
 
+    def _build_protocol_section(self) -> QVBoxLayout:
+        layout = QVBoxLayout()
+
+        title = QLabel("<b>앱 통신 설정</b>")
+        layout.addWidget(title)
+
+        self.protocol_enabled_checkbox = QCheckBox("앱(Flutter)과 통신 사용")
+        layout.addWidget(self.protocol_enabled_checkbox)
+
+        port_row = QHBoxLayout()
+        port_row.addWidget(QLabel("포트:"))
+        self.protocol_port_input = QSpinBox()
+        # 1024 미만은 시스템 예약 포트라 쓰지 않는다
+        self.protocol_port_input.setRange(1024, 65535)
+        port_row.addWidget(self.protocol_port_input)
+        port_row.addStretch(1)
+        layout.addLayout(port_row)
+
+        save_button = QPushButton("앱 통신 설정 저장")
+        save_button.setObjectName("primary")
+        save_button.clicked.connect(self._on_save_protocol_settings)
+        layout.addWidget(save_button)
+
+        hint = QLabel("저장하면 통신 서버가 바로 다시 시작되고, 접속 중인 앱은 연결이 끊깁니다.")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        return layout
+
     # ------------------------------------------------------------------
     # 불러오기 / 새로고침
     # ------------------------------------------------------------------
@@ -156,6 +191,10 @@ class SettingsDialog(QDialog):
         self.filter_checkbox.setChecked(
             calibration.get("filter_outside_mat", DEFAULT_FILTER_OUTSIDE_MAT)
         )
+
+        protocol = settings.get("protocol", {})
+        self.protocol_enabled_checkbox.setChecked(protocol.get("enabled", DEFAULT_ENABLED))
+        self.protocol_port_input.setValue(protocol.get("port", DEFAULT_PORT))
 
         self._refresh_profile_list()
 
@@ -289,3 +328,17 @@ class SettingsDialog(QDialog):
         calibration.save()
 
         self.settings_changed.emit()
+
+    # ------------------------------------------------------------------
+    # 앱 통신 설정 ('저장' 버튼을 눌러야 반영)
+    # ------------------------------------------------------------------
+    def _on_save_protocol_settings(self) -> None:
+        # 기존 protocol 항목(addr_radius_mm, status_hz 등)은 그대로 두고
+        # 사용 여부와 포트만 바꾼다.
+        settings = load_settings()
+        protocol = settings.setdefault("protocol", {})
+        protocol["enabled"] = self.protocol_enabled_checkbox.isChecked()
+        protocol["port"] = self.protocol_port_input.value()
+        save_settings(settings)
+
+        self.protocol_settings_changed.emit()

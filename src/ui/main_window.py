@@ -78,6 +78,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QMessageBox,
     QPushButton,
     QVBoxLayout,
     QWidget,
@@ -93,6 +94,8 @@ from src.detector import (
     build_mask,
 )
 from src.protocol_handler import ProtocolHandler
+from src.protocol_server import DEFAULT_ENABLED as DEFAULT_PROTOCOL_ENABLED
+from src.protocol_server import DEFAULT_PORT as DEFAULT_PROTOCOL_PORT
 from src.protocol_server import ProtocolServer
 from src.stats import compute_trajectory_stats
 from src.storage import Storage
@@ -209,6 +212,7 @@ class MainWindow(QMainWindow):
             settings=load_settings().get("protocol", {}),
         )
         self.protocol_server.command_received.connect(self.protocol_handler.handle)
+        self.protocol_server.client_count_changed.connect(self._update_app_label)
         self.protocol_server.start()
 
         self._build_menu()
@@ -240,6 +244,12 @@ class MainWindow(QMainWindow):
         self.stop_point_label = QLabel("정지점: -")
         self.stop_point_label.setObjectName("status")
         top_layout.addWidget(self.stop_point_label)
+
+        # 앱(Flutter) 통신 상태 (꺼짐 / 대기 중 / 접속 N대 / 포트 사용 불가)
+        self.app_label = QLabel("앱: -")
+        self.app_label.setObjectName("status")
+        top_layout.addWidget(self.app_label)
+        self._update_app_label()
 
         self.fps_label = QLabel("FPS: -")
         self.fps_label.setObjectName("status")
@@ -610,6 +620,9 @@ class MainWindow(QMainWindow):
         if self.settings_dialog is None:
             self.settings_dialog = SettingsDialog(self)
             self.settings_dialog.settings_changed.connect(self._on_settings_changed)
+            self.settings_dialog.protocol_settings_changed.connect(
+                self._on_protocol_settings_changed
+            )
         else:
             # 그 사이 다른 곳(HSV 튜닝 등)에서 바뀐 내용도 반영되도록 다시 불러온다.
             self.settings_dialog.reload_from_settings()
@@ -1040,6 +1053,36 @@ class MainWindow(QMainWindow):
         """
         super().resizeEvent(event)
         self._render_trajectory_panel()
+
+    def _update_app_label(self, *_args) -> None:
+        """상단의 앱 통신 상태 문구를 서버의 현재 상태로 갱신한다."""
+        server = self.protocol_server
+        if not server.enabled:
+            text = "앱: 꺼짐"
+        elif not server.is_listening():
+            # 같은 포트를 다른 프로그램이 쓰고 있을 때 등
+            text = f"앱: 포트 {server.port} 사용 불가"
+        elif server.client_count() > 0:
+            text = f"앱: 접속 {server.client_count()}대 (포트 {server.port})"
+        else:
+            text = f"앱: 대기 중 (포트 {server.port})"
+        self.app_label.setText(text)
+
+    def _on_protocol_settings_changed(self) -> None:
+        """설정창에서 앱 통신 설정이 저장되면 서버를 새 설정으로 다시 시작한다."""
+        protocol = load_settings().get("protocol", {})
+        ok = self.protocol_server.apply_settings(
+            protocol.get("enabled", DEFAULT_PROTOCOL_ENABLED),
+            protocol.get("port", DEFAULT_PROTOCOL_PORT),
+        )
+        self._update_app_label()
+        if not ok:
+            QMessageBox.warning(
+                self,
+                "앱 통신",
+                f"포트 {self.protocol_server.port}을(를) 열 수 없습니다.\n"
+                "다른 프로그램이 이미 사용 중일 수 있습니다. 다른 포트를 지정해 주세요.",
+            )
 
     def _refresh_after_protocol_command(self) -> None:
         """앱 명령으로 상태가 바뀌었을 때, 버튼을 눌렀을 때와 같게 화면을 갱신한다."""
