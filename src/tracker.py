@@ -1,9 +1,17 @@
 """
 프로그램 상태 관리 모듈 (PROJECT_PLAN.md의 "4. 프로그램 상태 설계" 참고).
 
-다섯 가지 상태를 관리한다.
+여섯 가지 상태를 관리한다.
 IDLE(대기) -> CALIBRATING(캘리브레이션 중) -> READY(시작 위치 등록 완료)
+-> ARMED(추적 대기: 공이 움직이길 기다리는 중)
 -> TRACKING(공 이동 중) -> FINISHED(추적 완료)
+
+'추적 준비'(앱의 ADD 명령)를 누르면 바로 TRACKING이 되지 않고 ARMED가 된다.
+ARMED에서는 정지·이탈 판정을 하지 않고 공이 시작점에서 arm_move_distance(px)
+이상 움직이는 순간 자동으로 TRACKING이 된다. 그래서 퍼팅 전에 공이 오래
+가만히 있어도 "정지"로 오판해 추적이 끝나버리지 않는다. 추적이 시작된 시각은
+공이 마지막으로 가만히 있던 프레임(tracking_started_at)으로 기록해서, 스윙 직후의
+시작 시각이 정확하다.
 
 버튼을 눌러 상태를 바꾸고 싶을 때는 각 동작 메서드(calibrate,
 register_start_position 등)를 호출한다. 현재 상태에서 그 동작이
@@ -55,6 +63,11 @@ DEFAULT_MAX_CONSECUTIVE_JUMPS = 10
 DEFAULT_STOP_THRESHOLD = 3
 DEFAULT_STOP_DURATION = 1.0
 DEFAULT_LOST_DURATION = 2.0
+# ARMED(추적 대기) 상태에서 공이 시작점에서 이 거리(px) 이상 움직이면 추적을 시작한다.
+# 검출 좌표의 흔들림(보통 1~3px)보다는 크게, 실제 퍼팅의 첫 움직임보다는 작게 잡는다.
+# 카메라 해상도·거리에 따라 현장에서 config/settings.json의
+# tracking.arm_move_distance로 조정한다.
+DEFAULT_ARM_MOVE_DISTANCE = 8
 
 # finish_reason에 남는 종료 사유 문구 (상태 배지에 그대로 표시됨)
 STOP_REASON = "정지 감지"
@@ -67,6 +80,7 @@ class TrackerState(Enum):
     IDLE = "대기 중"
     CALIBRATING = "캘리브레이션 중"
     READY = "시작 위치 등록 완료"
+    ARMED = "추적 대기 (공 이동 대기)"
     TRACKING = "공 이동 중"
     FINISHED = "추적 완료"
 
@@ -100,10 +114,14 @@ class Tracker:
             TrackerState.FINISHED,
         },
         "start_tracking": {TrackerState.READY},
-        "stop_tracking": {TrackerState.TRACKING},
+        # 공이 움직이기 시작하면 자동으로 일어나는 전환이라 버튼은 없다 (Tracker 내부용)
+        "begin_tracking": {TrackerState.ARMED},
+        # 대기 중(ARMED)이든 추적 중(TRACKING)이든 중지해서 READY로 돌아갈 수 있다
+        "stop_tracking": {TrackerState.ARMED, TrackerState.TRACKING},
         "finish_tracking": {TrackerState.TRACKING},
         "reset_trajectory": {
             TrackerState.READY,
+            TrackerState.ARMED,
             TrackerState.TRACKING,
             TrackerState.FINISHED,
         },
@@ -131,6 +149,15 @@ class Tracker:
         self._stop_threshold = loaded.get("stop_threshold", DEFAULT_STOP_THRESHOLD)
         self._stop_duration = loaded.get("stop_duration", DEFAULT_STOP_DURATION)
         self._lost_duration = loaded.get("lost_duration", DEFAULT_LOST_DURATION)
+        self._arm_move_distance = loaded.get("arm_move_distance", DEFAULT_ARM_MOVE_DISTANCE)
+
+        # ARMED(추적 대기)용:
+        # - 공이 마지막으로 시작점 근처에 가만히 있던 프레임의 시각 (추적 시작 시각이 된다)
+        # - 시작점이 없을 때(궤적 초기화 직후) 대신 기준으로 삼는 '처음 본 공 위치'
+        self._armed_still_time: float | None = None
+        self._arm_reference: tuple[int, int] | None = None
+        # 추적이 시작된(ARMED -> TRACKING) 시각. 아직 시작 전이면 None.
+        self.tracking_started_at: float | None = None
 
         # 직전 점과 너무 멀어서(오검출로 보고) 연속으로 버린 횟수
         self._consecutive_jump_count = 0
@@ -176,32 +203,38 @@ class Tracker:
         if not self._transition("register_start_position", TrackerState.READY):
             return False
         self.start_position = (x, y)
+        self._clear_attempt()
+        return True
+
+    def start_tracking(self) -> bool:
+        """'추적 준비' 버튼 / 앱의 ADD 명령: ARMED(추적 대기)로 들어간다.
+
+        바로 TRACKING이 되지 않는다. 공이 시작점에서 arm_move_distance 이상
+        움직이는 순간 update_detection()이 자동으로 TRACKING으로 바꾼다.
+        그 전까지(ARMED)는 정지·이탈 판정을 하지 않으므로 퍼팅 전에 공이 오래
+        가만히 있어도 추적이 끝나지 않는다.
+
+        새로운 시도를 시작하는 것이므로, 이전 시도(추적 중지 후 다시 준비한 경우)의
+        궤적과 판정 타이머를 모두 정리한다.
+        """
+        if not self._transition("start_tracking", TrackerState.ARMED):
+            return False
+        self._clear_attempt()
+        return True
+
+    def _clear_attempt(self) -> None:
+        """한 번의 시도(퍼팅)에 관한 기록·타이머를 모두 비운다. (시작점은 건드리지 않는다)"""
         self.trajectory = []
         self.stop_position = None
         self.finish_reason = None
+        self.tracking_started_at = None
         self._consecutive_jump_count = 0
         self._last_seen_position = None
         self._last_raw_position = None
         self._stop_since = None
         self._lost_since = None
-        return True
-
-    def start_tracking(self) -> bool:
-        """'추적 준비' 버튼.
-
-        원래는 공 움직임을 자동으로 감지해서 TRACKING으로 넘어가야 하지만
-        (# TODO: 6단계에서 실제 움직임 감지로 교체), 이번 단계는 상태
-        전환 자체가 목적이라 버튼을 누르면 바로 TRACKING으로 전환한다.
-        정지·이탈 판정에 쓰는 타이머들도 새로 시작하도록 초기화한다.
-        """
-        if not self._transition("start_tracking", TrackerState.TRACKING):
-            return False
-        self.stop_position = None
-        self.finish_reason = None
-        self._last_raw_position = None
-        self._stop_since = None
-        self._lost_since = None
-        return True
+        self._armed_still_time = None
+        self._arm_reference = None
 
     def add_trajectory_point(self, x: int, y: int, timestamp: float) -> bool:
         """TRACKING 상태일 때, 검출된 공 좌표를 궤적에 기록한다.
@@ -264,13 +297,19 @@ class Tracker:
         return True
 
     def update_detection(self, x: int | None, y: int | None, timestamp: float) -> str | None:
-        """TRACKING 상태에서 매 프레임 호출해 정지·이탈 여부를 판정한다.
+        """매 프레임 호출해 추적 시작(ARMED)과 정지·이탈(TRACKING)을 판정한다.
 
         공을 찾았으면 (x, y)를, 못 찾았으면 (None, None)을 넘긴다.
-        조건을 만족해 FINISHED로 전환됐으면 종료 사유
-        (STOP_REASON/LOST_REASON)를 반환하고, 아니면 내부 타이머만
-        갱신하고 None을 반환한다.
+        - ARMED: 공이 시작점에서 arm_move_distance 이상 움직이면 TRACKING으로 바꾼다
+          (이때는 None을 반환한다. 시작됐는지는 state나 tracking_started_at으로 안다).
+        - TRACKING: 조건을 만족해 FINISHED로 전환됐으면 종료 사유
+          (STOP_REASON/LOST_REASON)를 반환하고, 아니면 내부 타이머만 갱신하고
+          None을 반환한다.
+        그 밖의 상태에서는 아무 것도 하지 않는다.
         """
+        if self.state == TrackerState.ARMED:
+            self._update_armed(x, y, timestamp)
+            return None
         if self.state != TrackerState.TRACKING:
             return None
 
@@ -303,13 +342,57 @@ class Tracker:
 
         return None
 
+    def _update_armed(self, x: int | None, y: int | None, timestamp: float) -> None:
+        """ARMED 상태: 공이 시작점에서 충분히 움직였는지 확인하고, 움직였으면 추적을 시작한다.
+
+        - 공이 안 보이는 프레임은 무시한다 (퍼터·손이 가렸을 수 있다). 이탈 판정도 하지 않는다.
+        - 기준 위치는 등록된 시작점이다. 시작점이 없으면(궤적 초기화 직후)
+          처음 본 공 위치를 기준으로 삼는다.
+        - 기준에서 arm_move_distance 미만이면 '아직 가만히 있음'으로 보고 그 시각을
+          기억해 둔다. 움직인 순간의 추적 시작 시각은 이 마지막 '가만히 있던' 시각이다.
+        """
+        if x is None or y is None:
+            return
+
+        reference = self.start_position
+        if reference is None:
+            if self._arm_reference is None:
+                self._arm_reference = (x, y)
+            reference = self._arm_reference
+
+        distance = ((x - reference[0]) ** 2 + (y - reference[1]) ** 2) ** 0.5
+        if distance < self._arm_move_distance:
+            self._armed_still_time = timestamp
+            return
+
+        # 공이 움직였다 -> TRACKING 시작.
+        # 추적 시작 시각은 마지막으로 가만히 있던 프레임 (그런 프레임이 없었으면 지금).
+        started_at = self._armed_still_time if self._armed_still_time is not None else timestamp
+        if not self._transition("begin_tracking", TrackerState.TRACKING):
+            return
+        self.tracking_started_at = started_at
+        self.stop_position = None
+        self.finish_reason = None
+        self._stop_since = None
+        self._lost_since = None
+        self._consecutive_jump_count = 0
+        # 궤적은 '출발 위치(가만히 있던 마지막 시각)'와 '지금 위치' 두 점으로 시작한다.
+        # (이번 프레임의 add_trajectory_point는 ARMED였을 때 불려서 기록되지 않았으므로
+        # 여기서 직접 넣는다.)
+        self.trajectory = [
+            TrajectoryPoint(x=reference[0], y=reference[1], timestamp=started_at),
+            TrajectoryPoint(x=x, y=y, timestamp=timestamp),
+        ]
+        self._last_seen_position = (x, y)
+        self._last_raw_position = (x, y)
+
     def _finish_with_reason(self, reason: str) -> str:
         self.finish_tracking()
         self.finish_reason = reason
         return reason
 
     def stop_tracking(self) -> bool:
-        """'추적 중지' 버튼: 오검출 등 문제가 생겼을 때 수동으로 중지하고 READY로 되돌아간다."""
+        """'추적 중지' 버튼 / 앱의 ABORT: 대기(ARMED)나 추적(TRACKING)을 수동으로 중지하고 READY로 되돌아간다."""
         return self._transition("stop_tracking", TrackerState.READY)
 
     def finish_tracking(self) -> bool:
@@ -325,12 +408,5 @@ class Tracker:
         if not self._transition("reset_trajectory", TrackerState.READY):
             return False
         self.start_position = None
-        self.trajectory = []
-        self.stop_position = None
-        self.finish_reason = None
-        self._consecutive_jump_count = 0
-        self._last_seen_position = None
-        self._last_raw_position = None
-        self._stop_since = None
-        self._lost_since = None
+        self._clear_attempt()
         return True

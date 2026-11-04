@@ -202,7 +202,8 @@ class TrackingFlowTests(EngineTestCase):
         self.assertEqual(self.engine.align_auto(4500, 2000), "OK")
         self.assertEqual(self.engine.register_start(), START_OK)
         self.assertTrue(self.engine.start_tracking())
-        self.assertEqual(self.engine.tracker.state, TrackerState.TRACKING)
+        # '추적 준비' 직후에는 추적 대기(ARMED). 공이 움직여야 TRACKING이 된다.
+        self.assertEqual(self.engine.tracker.state, TrackerState.ARMED)
 
     def roll_and_stop(self):
         """공을 오른쪽으로 굴린 뒤 가만히 두어 '정지 감지'까지 진행한다."""
@@ -240,6 +241,96 @@ class TrackingFlowTests(EngineTestCase):
         self.assertEqual(self.engine.save_result(), (SAVE_NO_TRAJECTORY, None))
 
 
+class ArmedFlowTests(EngineTestCase):
+    """ADD 후 추적 대기(ARMED) -> 공이 움직이면 자동 추적 시작."""
+
+    def setUp(self):
+        super().setUp()
+        # 엔진에 연결된 실제 핸들러가 보내는 메시지를 모은다 (테스트용으로 보내는 함수만 교체)
+        self.sent = []
+        self.engine.protocol_handler._send = self.sent.append
+        self.started = []
+        self.engine.tracking_started.connect(lambda: self.started.append(1))
+
+        self.step()
+        self.assertEqual(self.engine.align_auto(4500, 2000), "OK")
+        self.assertEqual(self.engine.register_start(), START_OK)
+        self.assertTrue(self.engine.start_tracking())
+        self.sent.clear()
+
+    def test_waiting_ball_does_not_finish(self):
+        # 퍼팅 전에 공이 2초 동안 가만히 있다 (정지 판정 기준 0.5초의 4배)
+        for _ in range(40):
+            self.step()
+        self.assertEqual(self.engine.tracker.state, TrackerState.ARMED)
+        self.assertEqual(self.finished, [])
+        self.assertEqual(self.started, [])
+        self.assertEqual([m for m in self.sent if m["cmd"] == "TRACK"], [])
+
+    def test_ball_lost_while_armed_is_ignored(self):
+        self.camera.ball = None  # 퍼터·손이 공을 가려서 안 보인다
+        for _ in range(60):  # 이탈 판정 기준(2초)을 넘는 3초
+            self.step()
+        self.assertEqual(self.engine.tracker.state, TrackerState.ARMED)
+        self.assertEqual(self.finished, [])
+
+    def test_small_jitter_does_not_start(self):
+        self.step(ball=(503, 401))
+        self.step(ball=(497, 399))
+        self.assertEqual(self.engine.tracker.state, TrackerState.ARMED)
+
+    def test_move_starts_tracking_with_event(self):
+        for _ in range(10):
+            self.step()
+        t_still = self.clock  # 공이 마지막으로 가만히 있던 시각
+
+        self.step(ball=(540, 400))  # 40px 이동
+
+        self.assertEqual(self.engine.tracker.state, TrackerState.TRACKING)
+        self.assertEqual(self.started, [1])
+        self.assertEqual(self.engine.tracker.tracking_started_at, t_still)
+        # 궤적은 출발 위치(마지막으로 가만히 있던 시각)와 현재 위치로 시작한다
+        trajectory = self.engine.tracker.trajectory
+        self.assertEqual(len(trajectory), 2)
+        self.assertEqual(trajectory[0].timestamp, t_still)
+        self.assertEqual((trajectory[0].x, trajectory[0].y), self.engine.tracker.start_position)
+
+        commands = [m["cmd"] for m in self.sent]
+        # ARMED로 들어간 직후 STATUS(ARMED)가 먼저 한 번 나간다 (상태가 바뀌었으므로)
+        self.assertEqual(self.sent[0]["state"], "ARMED")
+        track_index = commands.index("TRACK")
+        track = self.sent[track_index]
+        self.assertEqual(track, {"cmd": "TRACK", "event": "START", "ts": int(t_still * 1000)})
+        # TRACK START 이벤트가 STATUS(TRACKING)보다 먼저 간다
+        tracking_statuses = [
+            i for i, m in enumerate(self.sent) if m["cmd"] == "STATUS" and m["state"] == "TRACKING"
+        ]
+        self.assertTrue(tracking_statuses)
+        self.assertLess(track_index, tracking_statuses[0])
+        status = self.sent[tracking_statuses[0]]
+        self.assertAlmostEqual(status["t"], 0.05, places=3)  # 출발 시각을 0으로 센 경과 시간
+
+    def test_full_putt_after_waiting(self):
+        for _ in range(40):
+            self.step()
+        for i in range(1, 11):
+            self.step(ball=(500 + i * 20, 400))
+        for _ in range(20):
+            self.step()
+        self.assertEqual(self.finished, [STOP_REASON])
+        self.assertEqual(self.engine.save_result()[0], SAVE_OK)
+        results = [m for m in self.sent if m["cmd"] == "RESULT"]
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["reason"], "STOP")
+
+    def test_abort_from_armed_returns_to_ready(self):
+        self.assertTrue(self.engine.tracker.stop_tracking())
+        self.assertEqual(self.engine.tracker.state, TrackerState.READY)
+        # 다시 준비할 수 있다
+        self.assertTrue(self.engine.start_tracking())
+        self.assertEqual(self.engine.tracker.state, TrackerState.ARMED)
+
+
 class ProtocolIntegrationTests(EngineTestCase):
     """앱 명령(핸들러)이 엔진과 같은 규칙으로 동작하는지 확인한다."""
 
@@ -264,7 +355,7 @@ class ProtocolIntegrationTests(EngineTestCase):
 
         self.handler.handle({"cmd": "ADD", "type": "BALL"})
         self.assertEqual(self.last(), {"cmd": "ADD", "result": "OK"})
-        self.assertEqual(self.engine.tracker.state, TrackerState.TRACKING)
+        self.assertEqual(self.engine.tracker.state, TrackerState.ARMED)
         # 상태를 바꾼 명령마다 화면에 알리는 시그널이 나갔다 (ALIGN, INIT, ADD)
         self.assertEqual(len(self.changes), 3)
 

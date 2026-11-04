@@ -9,7 +9,7 @@ UI 없이도 테스트할 수 있다. 상세 규격은 docs/PROTOCOL.md 참고.
     ALIGN     매트 자동 정렬(캘리브레이션). 선택: width_mm, height_mm
     SET_ADDR  어드레스(공을 놓을) 위치를 매트 mm 좌표로 지정. 선택: radius_mm
     INIT      type=BALL: 지금 보이는 공을 시작점으로 등록
-    ADD       type=BALL: 추적 시작(READY -> TRACKING)
+    ADD       type=BALL: 추적 대기(READY -> ARMED). 공이 움직이면 자동으로 TRACKING
     STATUS    현재 상태를 1회 조회
 
 엔진 -> 앱 (먼저 보내는 것):
@@ -155,7 +155,11 @@ class ProtocolHandler:
         self._engine.changed.emit()
 
     def _cmd_add(self, message: dict) -> None:
-        """추적을 시작한다 (시작 위치가 등록된 READY 상태에서만)."""
+        """추적 대기(ARMED)로 들어간다 (시작 위치가 등록된 READY 상태에서만).
+
+        실제 추적은 공이 움직이는 순간 자동으로 시작되고, 그때 TRACK START
+        이벤트가 간다. 그 전에는 정지 판정을 하지 않는다.
+        """
         if message.get("type", "BALL") != "BALL":
             return self._ng("ADD", "bad_type")
         if not self._engine.start_tracking():
@@ -192,6 +196,19 @@ class ProtocolHandler:
         if state_changed or due:
             self._last_push_time = now
             self._send(self._build_status(now, detection))
+
+    def on_tracking_started(self, started_at: float | None) -> None:
+        """공이 움직여 추적이 시작됐을 때 TRACK START 이벤트를 1회 보낸다.
+
+        started_at은 공이 마지막으로 가만히 있던 시각(time.time() 값)으로,
+        스윙 직후의 정확한 출발 시각이다. 이후 STATUS의 t(경과 시간)도 이 시각을
+        0으로 해서 센다.
+        """
+        if started_at is None:
+            started_at = time.time()
+        self._track_t0 = started_at
+        self._prev_sample = None
+        self._send({"cmd": "TRACK", "event": "START", "ts": int(started_at * 1000)})
 
     def on_finished(self, reason: str) -> None:
         """추적이 정지/이탈로 끝났을 때 호출. 결과(RESULT)를 1회 보낸다."""

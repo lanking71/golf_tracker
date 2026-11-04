@@ -75,6 +75,8 @@ class VisionEngine(QObject):
     changed = Signal()
     # 궤적에 점이 새로 기록됐을 때
     trajectory_updated = Signal()
+    # 공이 움직여서 추적 대기(ARMED)에서 추적(TRACKING)으로 자동 전환됐을 때
+    tracking_started = Signal()
     # 정지·이탈로 추적이 자동 종료됐을 때 (종료 사유 문구를 함께 전달)
     tracking_finished = Signal(str)
 
@@ -184,6 +186,7 @@ class VisionEngine(QObject):
         self.last_detection = detection
         self.last_detection_outside_mat = outside_mat
 
+        was_armed = self.tracker.state == TrackerState.ARMED
         if detection is not None:
             # TRACKING 상태일 때만 실제로 기록된다 (Tracker가 알아서 상태를 확인한다).
             if self.tracker.add_trajectory_point(detection.x, detection.y, now):
@@ -191,6 +194,13 @@ class VisionEngine(QObject):
             finish_reason = self.tracker.update_detection(detection.x, detection.y, now)
         else:
             finish_reason = self.tracker.update_detection(None, None, now)
+
+        if was_armed and self.tracker.state == TrackerState.TRACKING:
+            # 이번 프레임에서 공이 움직여 추적이 시작됐다 (ARMED -> TRACKING).
+            # 앱에는 STATUS(TRACKING)보다 먼저 TRACK START 이벤트를 보낸다.
+            self.protocol_handler.on_tracking_started(self.tracker.tracking_started_at)
+            self.tracking_started.emit()
+            self.trajectory_updated.emit()
 
         # 앱에 상태 변화·실시간 좌표를 보낸다 (종료 시에는 STATUS(FINISHED) 다음에 RESULT가 간다).
         self.protocol_handler.on_frame(detection, now)
@@ -286,7 +296,11 @@ class VisionEngine(QObject):
         return START_OK
 
     def start_tracking(self) -> bool:
-        """'추적 준비' / 앱의 ADD 명령. 허용되는 상태(시작점 등록 후)가 아니면 False."""
+        """'추적 준비' / 앱의 ADD 명령: 추적 대기(ARMED)로 들어간다.
+
+        공이 시작점에서 움직이는 순간 process_frame이 자동으로 추적(TRACKING)을
+        시작한다. 허용되는 상태(시작점 등록 후)가 아니면 False.
+        """
         return self.tracker.start_tracking()
 
     # ------------------------------------------------------------------

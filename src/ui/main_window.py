@@ -283,6 +283,7 @@ class MainWindow(QMainWindow):
         engine.camera_unavailable.connect(self._show_camera_not_connected)
         engine.changed.connect(self._refresh_after_engine_change)
         engine.trajectory_updated.connect(self._render_trajectory_panel)
+        engine.tracking_started.connect(self._refresh_after_engine_change)
         engine.tracking_finished.connect(self._on_tracking_finished)
         engine.protocol_server.client_count_changed.connect(self._update_app_label)
 

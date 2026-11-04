@@ -17,7 +17,7 @@ socket.write(jsonEncode({'cmd': 'STATUS'}) + '\n');
 
 ## 일반 흐름
 ```
-ALIGN → SET_ADDR → (공 올려둠) → INIT → ADD → [STATUS 실시간] → RESULT
+ALIGN → SET_ADDR → (공 올려둠) → INIT → ADD → (공이 움직임) → TRACK START → [STATUS 실시간] → RESULT
 ```
 다음 퍼팅은 `INIT`부터 다시 하면 됩니다 (결과가 나온 FINISHED 상태에서도 가능).
 
@@ -49,12 +49,15 @@ ALIGN → SET_ADDR → (공 올려둠) → INIT → ADD → [STATUS 실시간] �
 - 응답: `{"cmd":"INIT","result":"OK","x":1125.6,"y":1137.6}`
 - NG 이유: `not_calibrated`, `no_ball`(공이 안 보이거나 매트 밖), `bad_state`(추적 중), `bad_type`
 
-### ADD: 추적 시작
+### ADD: 추적 대기(무장)
 ```json
 {"cmd":"ADD","type":"BALL"}
 ```
-- 시작점이 등록된 상태(READY)에서 추적을 시작합니다.
-- 응답: `{"cmd":"ADD","result":"OK"}`
+- 시작점이 등록된 상태(READY)에서 **추적 대기(`ARMED`)** 로 들어갑니다. 바로 추적이 시작되지 않습니다.
+- `ARMED`에서는 공이 오래 가만히 있어도 "정지"로 판정하지 않고, 공이 안 보여도 "이탈"로 판정하지 않습니다 (퍼팅 전에 기다리는 동안 결과가 나와버리지 않도록).
+- 공이 시작점에서 `tracking.arm_move_distance`(기본 8픽셀) 이상 움직이는 순간 자동으로 `TRACKING`이 되고 `TRACK START` 이벤트가 옵니다.
+- 대기를 취소하려면 `RESET`(19단계 예정) 또는 화면의 "추적 중지"를 씁니다.
+- 응답: `{"cmd":"ADD","result":"OK"}` (이때 상태는 `ARMED`)
 - NG 이유: `bad_state`(INIT을 안 했거나 이미 추적 중), `bad_type`
 
 ### STATUS: 상태 조회
@@ -69,11 +72,18 @@ ALIGN → SET_ADDR → (공 올려둠) → INIT → ADD → [STATUS 실시간] �
 ```json
 {"cmd":"STATUS","state":"TRACKING","calibrated":true,"x":1532.4,"y":980.1,"t":1.24,"speed":850.3}
 ```
-- `state`: `IDLE`(대기) / `CALIBRATING` / `READY`(시작점 등록됨) / `TRACKING`(추적 중) / `FINISHED`(추적 완료)
+- `state`: `IDLE`(대기) / `CALIBRATING` / `READY`(시작점 등록됨) / `ARMED`(추적 대기, 공이 움직이길 기다림) / `TRACKING`(추적 중) / `FINISHED`(추적 완료)
 - `x`, `y`: 공의 현재 위치(mm). 공이 안 보이거나 매트 밖이면 `null`
-- `t`: 추적 시작 후 경과 시간(초). TRACKING일 때만 값이 있고 아니면 `null`
+- `t`: 추적 시작 후 경과 시간(초). 0은 `TRACK START`의 시각(공이 마지막으로 가만히 있던 순간)입니다. TRACKING일 때만 값이 있고 아니면 `null`
 - `speed`: 속도(mm/초). TRACKING일 때만 포함됩니다.
 - 전송 시점: 상태가 바뀔 때, 그리고 TRACKING 중에는 초당 최대 30회 (`protocol.status_hz`).
+
+### TRACK: 추적 시작
+```json
+{"cmd":"TRACK","event":"START","ts":1730728512345}
+```
+- `ARMED`에서 공이 움직여 `TRACKING`이 된 순간 1번 옵니다. `STATUS(TRACKING)`보다 먼저 옵니다.
+- `ts`: 추적 시작 시각 (epoch 밀리초). 공이 **마지막으로 가만히 있던 프레임**의 시각이라, 스윙 직후의 출발 시각을 정확히 알 수 있습니다.
 
 ### ADDR: 어드레스 위치 진입/이탈
 ```json
