@@ -1,10 +1,20 @@
 # 메인 컨트롤 ↔ 비전 엔진 통신 규격 (v2.0)
 
-비전 엔진은 화면 없이 돌아가며, 메인 컨트롤 프로그램이 보내는 JSON 명령에 따라 캘리브레이션을 하고
+**메인 컨트롤(Flutter 등) 개발자에게 전달하는 문서입니다. 이 문서만 보면 연동할 수 있습니다.**
+
+비전 엔진은 PC에서 화면 없이 돌아가며, 메인 컨트롤이 보내는 JSON 명령에 따라 캘리브레이션을 하고
 공의 좌표·거리·속도를 실시간으로 돌려줍니다.
 
+### 한눈에 보기
+1. 컨트롤이 엔진 PC의 **TCP 9000번 포트**에 접속한다. (엔진이 서버)
+2. 엔진이 `HELLO`와 현재 `STATUS`를 보낸다.
+3. 컨트롤이 `ALIGN` → `SET_ADDR` → `INIT` → `ADD` 순서로 명령을 보낸다.
+4. 공이 움직이면 엔진이 `TRACK START` → `STATUS`(실시간 좌표) → `RESULT`(거리·속도·궤적)를 보낸다.
+
+메시지는 전부 **한 줄짜리 JSON**입니다. 아래 "연동 예제(Dart)"를 그대로 시작점으로 쓰시면 됩니다.
+
 ## 연결
-- TCP 소켓. 비전 엔진(PC)이 서버이고 컨트롤이 접속합니다. 기본 포트 **9000** (`config/settings.json`의 `protocol.port`).
+- TCP 소켓. 비전 엔진(PC)이 서버이고 컨트롤이 접속합니다. 기본 포트 **9000** (엔진 쪽 설정으로 바꿀 수 있음).
 - 메시지는 **JSON 객체 1개 + 줄바꿈(`\n`)** 입니다. 한 줄에 하나씩 주고받습니다. 인코딩은 UTF-8입니다.
 - 접속하면 엔진이 먼저 `HELLO`와 현재 `STATUS`를 보냅니다 (그 컨트롤에만).
 - 여러 컨트롤이 동시에 접속할 수 있습니다.
@@ -28,13 +38,128 @@
 ← {"cmd":"INIT","result":"OK","x":1125.6,"y":1137.6,"id":"a1"}
 ```
 
-### Flutter(Dart) 예시
+### 응답과 이벤트 구분하기
+- 메시지에 **`id`가 있으면 내가 보낸 명령의 응답**, **없으면 엔진이 먼저 보낸 이벤트**입니다.
+- 이벤트: `HELLO`, `STATUS`(실시간), `TRACK`, `ADDR`(`event` 필드가 있는 것), `RESULT`(`result` 필드가 없는 것)
+- 응답은 `result`가 `"OK"`/`"NG"`입니다 (`PING`→`PONG`, 오류→`ERROR` 제외).
+
+## 연동 예제 (Dart)
+> 참고용 예시입니다. 엔진 개발 환경에는 Dart가 없어서 **직접 실행해 보지는 못했습니다.**
+> 프로토콜 자체는 엔진 쪽에서 실제 TCP 소켓으로 시험했습니다.
+
 ```dart
-final socket = await Socket.connect(pcIp, 9000);
-socket.cast<List<int>>().transform(utf8.decoder).transform(const LineSplitter())
-    .listen((line) => handle(jsonDecode(line)));
-socket.write(jsonEncode({'cmd': 'STATUS', 'id': 1}) + '\n');
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+
+/// 비전 엔진과 통신하는 클라이언트.
+/// - request(): 명령을 보내고, 같은 id의 응답이 올 때까지 기다린다.
+/// - events: 엔진이 먼저 보내는 메시지(HELLO, STATUS, TRACK, RESULT ...)
+class VisionClient {
+  Socket? _socket;
+  int _nextId = 1;
+  final _pending = <int, Completer<Map<String, dynamic>>>{};
+  final _events = StreamController<Map<String, dynamic>>.broadcast();
+
+  Stream<Map<String, dynamic>> get events => _events.stream;
+
+  Future<void> connect(String host, {int port = 9000}) async {
+    final socket = await Socket.connect(host, port, timeout: const Duration(seconds: 5));
+    socket.setOption(SocketOption.tcpNoDelay, true);
+    _socket = socket;
+    socket
+        .cast<List<int>>()
+        .transform(utf8.decoder)
+        .transform(const LineSplitter()) // 줄 단위로 잘라 준다 (쪼개져 온 데이터도 처리)
+        .listen(_onLine, onDone: _onClosed, onError: (_) => _onClosed());
+  }
+
+  void _onLine(String line) {
+    final Map<String, dynamic> message;
+    try {
+      message = jsonDecode(line) as Map<String, dynamic>;
+    } catch (_) {
+      return; // 규격에 없는 줄은 무시
+    }
+    final id = message['id'];
+    final waiting = id is int ? _pending.remove(id) : null;
+    if (waiting != null) {
+      waiting.complete(message); // 내가 보낸 명령의 응답
+    } else {
+      _events.add(message); // 엔진이 먼저 보낸 이벤트
+    }
+  }
+
+  void _onClosed() {
+    _socket = null;
+    for (final c in _pending.values) {
+      c.completeError(const SocketException('엔진과 연결이 끊어졌습니다'));
+    }
+    _pending.clear();
+    _events.add({'cmd': 'DISCONNECTED'}); // 엔진 메시지가 아니라 이 클라이언트가 만든 알림
+  }
+
+  /// 명령을 보내고 응답을 기다린다. 5초 안에 응답이 없으면 TimeoutException.
+  Future<Map<String, dynamic>> request(Map<String, dynamic> command,
+      {Duration timeout = const Duration(seconds: 5)}) {
+    final socket = _socket;
+    if (socket == null) {
+      return Future.error(const SocketException('엔진에 연결되어 있지 않습니다'));
+    }
+    final id = _nextId++;
+    final completer = Completer<Map<String, dynamic>>();
+    _pending[id] = completer;
+    socket.write('${jsonEncode({...command, 'id': id})}\n');
+    return completer.future.timeout(timeout, onTimeout: () {
+      _pending.remove(id);
+      throw TimeoutException('${command['cmd']} 응답 없음');
+    });
+  }
+
+  Future<void> close() async => _socket?.destroy();
+}
+
+// ---- 사용 예 ----
+Future<void> main() async {
+  final client = VisionClient();
+  await client.connect('192.168.0.10'); // 엔진이 돌아가는 PC의 주소
+
+  client.events.listen((m) {
+    switch (m['cmd']) {
+      case 'STATUS': // 실시간 좌표 (TRACKING 중에는 초당 최대 30번)
+        print('상태 ${m['state']}  x=${m['x']} y=${m['y']} t=${m['t']} 속도=${m['speed']}');
+      case 'TRACK': // 공이 움직여서 추적이 시작됨
+        print('추적 시작 ts=${m['ts']}');
+      case 'RESULT': // 추적 끝: 거리·속도·궤적 점
+        print('거리 ${m['distance_mm']}mm, 점 ${(m['points'] as List).length}개');
+    }
+  });
+
+  final align = await client.request(
+      {'cmd': 'ALIGN', 'type': 'REQ', 'width_mm': 4500, 'height_mm': 2000});
+  if (align['result'] != 'OK') {
+    print('매트 정렬 실패: ${align['reason']}');
+    return;
+  }
+  await client.request({'cmd': 'SET_ADDR', 'x': 1000, 'y': 1000});
+  final init = await client.request({'cmd': 'INIT', 'type': 'BALL'}); // 공이 보여야 OK
+  if (init['result'] != 'OK') {
+    print('공을 못 찾음: ${init['reason']}');
+    return;
+  }
+  await client.request({'cmd': 'ADD', 'type': 'BALL'}); // 이제 공이 움직이길 기다림
+}
 ```
+
+### 연동할 때 알아둘 점
+- **Flutter Web은 안 됩니다.** 웹 앱은 브라우저 제한 때문에 일반 TCP 소켓(`dart:io`의 `Socket`)을 쓸 수 없습니다. 모바일(Android/iOS)·Windows·macOS·Linux 앱이면 위 예제가 그대로 동작합니다. 웹이 필요하면 엔진에 WebSocket 방식을 추가해야 하니 알려 주세요.
+- **같은 네트워크**여야 하고, 엔진 PC의 Windows 방화벽에서 **TCP 9000 허용**이 필요합니다.
+- Android 에뮬레이터에서 같은 PC의 엔진에 접속하려면 주소를 `10.0.2.2`로 씁니다. 실제 기기는 엔진 PC의 IP를 씁니다.
+- Android는 `AndroidManifest.xml`에 `INTERNET` 권한이, iOS는 로컬 네트워크 접근 허용(`NSLocalNetworkUsageDescription`)이 필요할 수 있습니다.
+- **접속이 끊겼다가 다시 붙으면**: 접속 직후 `HELLO`와 `STATUS`가 다시 오니 현재 상태를 바로 알 수 있고, 놓친 결과는 `GET_RESULT`로 다시 받을 수 있습니다. 엔진은 끊김과 상관없이 계속 동작합니다.
+- 시각(`ts`)은 **엔진 PC의 시계** 기준입니다. 컨트롤 PC와 시계가 다를 수 있으니, 시각을 비교하기보다 `t`(추적 시작 후 경과 시간)나 `PING`의 `PONG.ts`로 차이를 재서 쓰세요.
+- 실시간 `STATUS`는 초당 최대 30개이니 화면을 매번 다시 그리지 말고 최신 값만 반영하세요. 공이 안 보이면 `x`, `y`가 `null`입니다 (0이 아님에 주의).
+- 명령은 **응답을 기다린 뒤** 다음 명령을 보내는 것이 안전합니다 (예: `INIT`이 OK여야 `ADD`가 가능).
 
 ## 일반 흐름
 ```
@@ -200,23 +325,37 @@ RESET: READY / ARMED / TRACKING / FINISHED → READY (시작점과 궤적을 지
 - JSON이 아닌 줄: `{"cmd":"ERROR","reason":"bad_json"}` (보낸 컨트롤에게만)
 - 모르는 명령: `{"cmd":"ERROR","reason":"unknown_cmd","received":"FOO"}`
 
-## 설정 (`config/settings.json`의 `protocol`)
-`enabled`와 `port`는 프로그램의 설정 창(`python main.py --ui` → 설정 > 프로필/매트 설정... > 앱 통신 설정)에서도 바꿀 수 있습니다.
-나머지는 파일을 고친 뒤 프로그램을 다시 시작해야 적용됩니다.
+## 초기 손그림 규격과의 대응표
+처음에 정리된 손그림 규격(APP ↔ Ball)을 JSON으로 옮긴 것입니다. 기존에 알고 계신 이름과 맞춰 보세요.
+
+| 손그림 (앱 → 엔진) | 이 문서의 JSON | 손그림 (엔진 → 앱) | 이 문서의 JSON |
+|---|---|---|---|
+| `ALIGN REQ` | `{"cmd":"ALIGN","type":"REQ"}` | `ALIGN OK` | `{"cmd":"ALIGN","result":"OK"}` |
+| `SET ADDR 1000,2000` | `{"cmd":"SET_ADDR","x":1000,"y":2000}` | `ADDR OK` | `{"cmd":"ADDR","result":"OK"}` |
+| (엔진이 먼저) | | `ADDR IN` / `ADDR OUT` | `{"cmd":"ADDR","event":"IN"}` / `"OUT"` |
+| `INIT BALL` | `{"cmd":"INIT","type":"BALL"}` | `INIT OK` | `{"cmd":"INIT","result":"OK","x":..,"y":..}` |
+| `ADD BALL` | `{"cmd":"ADD","type":"BALL"}` | `ADD OK` | `{"cmd":"ADD","result":"OK"}` |
+| `STATUS` | `{"cmd":"STATUS"}` | `STATUS` + 좌표 `(x, y)` | `{"cmd":"STATUS","state":..,"x":..,"y":..}` |
+
+손그림에 없던 것(이 문서에서 추가): `ABORT`, `RESET`, `GET_RESULT`, `PING`, `HELLO`, `TRACK`, `RESULT`(거리·속도·궤적), 요청 `id`.
+
+## 확인이 필요한 가정
+손그림만으로는 의미가 분명하지 않아 **엔진 쪽에서 아래처럼 해석해서 구현**했습니다. 컨트롤 쪽 생각과 다르면 알려 주세요.
+
+| 명령 | 엔진의 해석 |
+|---|---|
+| `SET_ADDR` | 공을 놓을 **어드레스 위치**(매트 mm 좌표) 지정. 공이 그 반경(기본 100mm) 안에 들어오면 `ADDR IN`, 나가면 `ADDR OUT` 이벤트 |
+| `INIT` | **지금 보이는 공을 시작점으로 등록** (공이 안 보이면 NG `no_ball`) |
+| `ADD` | **추적 준비.** 공이 움직이기 시작하면 자동으로 추적 시작 (`ARMED` 상태로 대기) |
+| 좌표계 | **원점은 매트 좌상단**, x는 오른쪽, y는 아래쪽, 단위 mm. 컨트롤(게임)이 다른 좌표계(예: 홀컵 기준)를 쓰면 컨트롤에서 변환 필요 |
+| 매트 크기 | `ALIGN`의 `width_mm`/`height_mm`(실전 4500×2000)을 컨트롤이 보내는 것으로 가정. 안 보내면 엔진에 저장된 값 사용 |
+
+## 엔진 쪽 설정 (참고: 엔진 담당자가 조정)
+컨트롤 개발자가 건드릴 필요는 없지만, 동작을 이해하는 데 참고하세요. 엔진의 `config/settings.json`의 `protocol` 항목입니다.
 
 | 키 | 기본값 | 뜻 |
 |---|---|---|
-| `enabled` | `true` | 서버 사용 여부 |
 | `port` | `9000` | 접속 포트 |
-| `addr_radius_mm` | `100` | 어드레스 영역 반경 (`SET_ADDR`의 `radius_mm`으로 덮어쓸 수 있음) |
 | `status_hz` | `30` | 추적 중 `STATUS` 최대 전송 횟수(초당) |
+| `addr_radius_mm` | `100` | 어드레스 영역 반경 (`SET_ADDR`의 `radius_mm`으로 덮어쓸 수 있음) |
 | `result_points` | `true` | `RESULT`에 궤적 점 전체를 포함할지 |
-
-## v1 → v2 변경점
-v1은 컨트롤 연동 전의 시안이라 호환성은 신경 쓰지 않았습니다.
-- `ADD`가 바로 추적하지 않고 `ARMED`(추적 대기)로 들어갑니다. `TRACK START` 이벤트가 추가됐습니다.
-- 응답이 **요청한 컨트롤에게만** 가고, 요청의 `id`가 응답에 되돌아옵니다.
-- 새 명령: `ABORT`, `RESET`, `GET_RESULT`, `PING`. 새 메시지: `HELLO`, `PONG`, `TRACK`.
-- `STATUS`에 `camera`, `ts`, `frame` 필드가 추가됐습니다.
-- `RESULT`에 `ts`, `fields`, `points`(좌표·시간·누적 거리·속도)가 추가됐습니다.
-- 작은 메시지를 지연 없이 보내도록 TCP_NODELAY를 켰습니다.
