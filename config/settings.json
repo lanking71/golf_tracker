@@ -68,9 +68,19 @@
         "lost_duration": 2.0
     },
     "calibration": {
-        "mat_width_mm": 4000,
+        "mat_width_mm": 4500,
         "mat_height_mm": 2000,
         "filter_outside_mat": true,
+        "mat_hsv_lower": [
+            35,
+            40,
+            40
+        ],
+        "mat_hsv_upper": [
+            85,
+            255,
+            255
+        ],
         "corners": [
             [
                 16,
@@ -106,6 +116,10 @@
                 1.0
             ]
         ]
+    },
+    "protocol": {
+        "enabled": true,
+        "port": 9000
     },
     "storage": {
         "db_path": "data/results.db"

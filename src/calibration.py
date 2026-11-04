@@ -25,12 +25,64 @@ from src.config import load_settings, save_settings
 # config/settings.json에 "calibration" 항목이 없거나 값이 빠져 있을 때 쓸 기본값.
 # 4000x2000mm은 실전 매트 크기. 집에서 수건으로 테스트할 때는 이 값을
 # 수건 실측 크기로 바꿔서 쓴다.
-DEFAULT_MAT_WIDTH_MM = 4000
+DEFAULT_MAT_WIDTH_MM = 4500
 DEFAULT_MAT_HEIGHT_MM = 2000
 DEFAULT_FILTER_OUTSIDE_MAT = True
 
+# 녹색 매트 자동 검출용 HSV 기본 범위 (OpenCV: H 0~179, S/V 0~255).
+# 조명에 따라 다르므로 config/settings.json의 calibration.mat_hsv_lower/upper로 조정한다.
+DEFAULT_MAT_HSV_LOWER = [35, 40, 40]
+DEFAULT_MAT_HSV_UPPER = [85, 255, 255]
+# 녹색 영역이 화면의 이 비율보다 작으면 매트가 아닌 잡음으로 보고 실패 처리한다.
+MIN_MAT_AREA_RATIO = 0.2
+
 # 모서리를 찍는 순서 (상태 배지에 다음에 찍을 위치를 안내하는 데 쓴다)
 CORNER_NAMES = ["좌상단", "우상단", "우하단", "좌하단"]
+
+
+def _order_corners(points) -> list[tuple[int, int]]:
+    """꼭짓점 4개를 좌상 -> 우상 -> 우하 -> 좌하 순서로 정렬한다.
+
+    x+y가 가장 작은 점이 좌상, 가장 큰 점이 우하이고,
+    y-x가 가장 작은 점이 우상, 가장 큰 점이 좌하이다.
+    """
+    pts = np.array(points, dtype=np.float32).reshape(4, 2)
+    s = pts.sum(axis=1)
+    d = pts[:, 1] - pts[:, 0]
+    ordered = [pts[np.argmin(s)], pts[np.argmin(d)], pts[np.argmax(s)], pts[np.argmax(d)]]
+    return [(int(round(p[0])), int(round(p[1]))) for p in ordered]
+
+
+def detect_mat_corners(frame: np.ndarray, hsv_lower, hsv_upper) -> list[tuple[int, int]] | None:
+    """카메라 프레임에서 녹색 매트의 네 모서리를 자동으로 찾는다.
+
+    순서: HSV 녹색 마스크 -> 잡음 제거(모폴로지) -> 가장 큰 덩어리 ->
+    다각형 근사로 꼭짓점 4개 추출. 4개로 안 떨어지면 최소 외접 사각형으로 대체한다.
+    매트를 못 찾으면(덩어리가 없거나 너무 작으면) None을 반환한다.
+    반환 순서는 좌상, 우상, 우하, 좌하.
+    """
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(
+        hsv, np.array(hsv_lower, dtype=np.uint8), np.array(hsv_upper, dtype=np.uint8)
+    )
+    # close: 매트 안의 작은 구멍(공, 그림자) 메우기 / open: 바깥의 작은 점 잡음 제거
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+    largest = max(contours, key=cv2.contourArea)
+    if cv2.contourArea(largest) < MIN_MAT_AREA_RATIO * frame.shape[0] * frame.shape[1]:
+        return None
+
+    # 외곽선 길이의 2%까지 오차를 허용하며 꼭짓점 수를 줄여본다
+    approx = cv2.approxPolyDP(largest, 0.02 * cv2.arcLength(largest, True), True)
+    if len(approx) == 4:
+        return _order_corners(approx)
+    # 꼭짓점이 4개가 아니면(둥글게 찍히거나 가려진 경우) 최소 외접 사각형으로 대체
+    return _order_corners(cv2.boxPoints(cv2.minAreaRect(largest)))
 
 
 class Calibration:
@@ -42,6 +94,8 @@ class Calibration:
         self.mat_width_mm = loaded.get("mat_width_mm", DEFAULT_MAT_WIDTH_MM)
         self.mat_height_mm = loaded.get("mat_height_mm", DEFAULT_MAT_HEIGHT_MM)
         self.filter_outside_mat = loaded.get("filter_outside_mat", DEFAULT_FILTER_OUTSIDE_MAT)
+        self.mat_hsv_lower = loaded.get("mat_hsv_lower", DEFAULT_MAT_HSV_LOWER)
+        self.mat_hsv_upper = loaded.get("mat_hsv_upper", DEFAULT_MAT_HSV_UPPER)
 
         corners = loaded.get("corners") or []
         # 저장된 값이 깨져 있어도(예: 형식이 다름) 크래시 없이 빈 목록으로 시작한다.
@@ -74,6 +128,19 @@ class Calibration:
         self.corners.append((x, y))
         if len(self.corners) == 4:
             self._compute_matrix()
+        return True
+
+    def set_corners(self, corners: list[tuple[int, int]]) -> None:
+        """모서리 4점을 한 번에 설정하고 변환 행렬을 계산한다 (자동 검출 결과 적용용)."""
+        self.corners = [(int(x), int(y)) for x, y in corners]
+        self._compute_matrix()
+
+    def auto_calibrate(self, frame: np.ndarray) -> bool:
+        """프레임에서 녹색 매트를 자동 검출해 캘리브레이션한다. 성공 여부를 반환한다."""
+        corners = detect_mat_corners(frame, self.mat_hsv_lower, self.mat_hsv_upper)
+        if corners is None:
+            return False
+        self.set_corners(corners)
         return True
 
     def reset_corners(self) -> None:
@@ -137,6 +204,8 @@ class Calibration:
             "mat_width_mm": self.mat_width_mm,
             "mat_height_mm": self.mat_height_mm,
             "filter_outside_mat": self.filter_outside_mat,
+            "mat_hsv_lower": list(self.mat_hsv_lower),
+            "mat_hsv_upper": list(self.mat_hsv_upper),
             "corners": [list(c) for c in self.corners],
             "perspective_matrix": self.matrix.tolist() if self.matrix is not None else None,
         }

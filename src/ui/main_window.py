@@ -92,6 +92,7 @@ from src.detector import (
     BallDetector,
     build_mask,
 )
+from src.protocol_server import ProtocolServer
 from src.stats import compute_trajectory_stats
 from src.storage import Storage
 from src.tracker import Tracker, TrackerState, TrajectoryPoint
@@ -162,6 +163,8 @@ NOT_DETECTED_MESSAGE = "공이 감지되지 않습니다"
 # 공은 보이지만 매트 영역 밖이라 무시됐을 때 보여줄 안내 문구
 OUTSIDE_MAT_MESSAGE = "공이 매트 밖에 있습니다"
 NOT_DETECTED_MESSAGE_DURATION_MS = 1500
+# 녹색 매트 자동 검출에 실패했을 때 보여줄 안내 문구 (이후 4점 클릭으로 진행)
+AUTO_CALIBRATION_FAILED_MESSAGE = "매트 자동 검출 실패 - 모서리 4점을 클릭하세요"
 
 # 매트 영역 밖에서 검출됐지만 무시된 공 표시 색 (경고색)
 OUTSIDE_MAT_DETECTION_COLOR_BGR = (0, 100, 255)  # 주황빛 빨강
@@ -191,6 +194,11 @@ class MainWindow(QMainWindow):
         # 버튼 활성화 여부를 계산하려면 레이아웃을 만들기 전에 필요하다.
         self.tracker = Tracker()
         self.calibration = Calibration()
+        # 앱(Flutter)과 JSON으로 통신하는 TCP 서버 (14단계: 아직은 받은 메시지를 그대로 돌려주는 에코만 한다.
+        # 실제 명령 처리는 15단계에서 protocol_handler로 연결한다).
+        self.protocol_server = ProtocolServer(parent=self)
+        self.protocol_server.command_received.connect(self._on_protocol_command)
+        self.protocol_server.start()
         self._buttons: dict[str, QPushButton] = {}
 
         self._build_menu()
@@ -245,6 +253,9 @@ class MainWindow(QMainWindow):
         self.detector = BallDetector()
         self._last_frame_time: float | None = None
         self._fps: float = 0.0
+        # 그리기(윤곽선·점 표시)가 들어가기 전의 가장 최근 원본 프레임.
+        # '캘리브레이션' 버튼을 눌렀을 때 녹색 매트를 자동 검출하는 데 쓴다.
+        self._last_raw_frame = None
         # 가장 최근 프레임에서 검출된 공 (없으면 None). '시작 위치 등록'
         # 버튼을 눌렀을 때 이 값을 시작점으로 쓴다.
         self._last_detection: BallDetection | None = None
@@ -378,9 +389,20 @@ class MainWindow(QMainWindow):
                 # 잘못 찍었을 때 같은 버튼으로 '다시 지정'할 수 있다.
                 self.calibration.reset_corners()
                 self.tracker.calibrate()
+                # 먼저 녹색 매트 모서리 자동 검출을 시도한다. 성공하면 바로 저장하고,
+                # 실패하면(매트가 안 보이거나 조명 문제) 기존처럼 4점 클릭 모드로 남는다.
+                auto_ok = (
+                    self._last_raw_frame is not None
+                    and self.calibration.auto_calibrate(self._last_raw_frame)
+                )
+                if auto_ok:
+                    self.calibration.save()
             elif action is not None:
                 getattr(self.tracker, action)()
             self._update_status_badge()
+            if action == "calibrate" and not auto_ok:
+                # 상태 배지를 먼저 갱신한 뒤 안내 문구를 잠깐 덮어 보여준다.
+                self._show_temporary_status(AUTO_CALIBRATION_FAILED_MESSAGE)
 
         self._update_button_states()
         self._update_start_point_label()
@@ -622,6 +644,9 @@ class MainWindow(QMainWindow):
             self.camera.release()
             self._show_camera_not_connected()
             return
+
+        # 이후 프레임에 그림을 그리므로, 자동 캘리브레이션용 깨끗한 원본을 복사해 둔다.
+        self._last_raw_frame = frame.copy()
 
         # 궤적 결과 패널을 카메라와 같은 좌표계로 그리기 위해 실제 프레임 크기를 기억해둔다.
         # 크기가 처음 정해지거나 바뀔 때만 패널을 다시 그린다 (매 프레임 다시 그리면 낭비).
@@ -1000,9 +1025,14 @@ class MainWindow(QMainWindow):
         super().resizeEvent(event)
         self._render_trajectory_panel()
 
+    def _on_protocol_command(self, message: dict) -> None:
+        """앱에서 온 JSON 명령 수신. (14단계 임시 동작: 받은 내용을 그대로 되돌려준다)"""
+        self.protocol_server.send({"cmd": "ECHO", "received": message})
+
     def closeEvent(self, event) -> None:
         """창을 닫을 때 타이머를 멈추고 카메라 장치를 반납한다."""
         self._camera_timer.stop()
+        self.protocol_server.stop()
         self.camera.release()
         if self.tuning_dialog is not None:
             self.tuning_dialog.close()
