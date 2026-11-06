@@ -10,10 +10,11 @@ UI 쪽에서 안내 문구를 보여줄 수 있게 한다.
 읽어온다. 카메라 기종이 바뀌거나 카메라가 옆으로/거꾸로 설치돼도,
 이 파일이 아니라 config/settings.json 값만 바꾸면 된다.
 
-카메라가 90/180/270도 돌아간 채로 설치된 경우를 위해 "rotate" 값을
-지원한다. read_frame()이 돌려주는 프레임이 이미 회전이 적용된
-상태라서, 검출·궤적·시작점 등 이후 모든 코드는 이 회전된 프레임
-기준의 좌표를 그대로 쓰면 된다.
+22단계부터 이 파일은 카메라에서 '원본 그대로'의 프레임만 읽어 온다.
+회전(rotate) -> 처리용 축소(process_scale) -> 렌즈 왜곡 보정(undistort_k1)은
+src/lens.py의 FramePreprocessor가 한 곳에서 차례로 처리한다 (엔진이 읽은 직후 적용).
+그래서 검출·궤적·시작점·캘리브레이션 등 이후 모든 코드는 그 '전처리된 프레임'
+기준의 좌표를 쓴다.
 """
 
 import logging
@@ -22,24 +23,23 @@ import cv2
 import numpy as np
 
 from src.config import load_settings
+from src.lens import DEFAULT_PROCESS_SCALE, DEFAULT_UNDISTORT_K1
 
 logger = logging.getLogger("camera")
 
-# config/settings.json에 "camera" 항목이 없거나 일부 값이 빠져 있을 때 쓸 기본값
+# config/settings.json에 "camera" 항목이 없거나 일부 값이 빠져 있을 때 쓸 기본값.
+# 1920x1080: 이 카메라는 1280x720으로 열면 센서 가운데만 잘려 매트 일부만 보이고,
+# 1920x1080(MJPG)으로 열어야 매트 전체가 보인다 (22단계 현장 확인).
+# fps 0 = 카메라 기본값을 그대로 쓴다.
+# process_scale·undistort_k1은 src/lens.py(전처리)가 쓰는 값이다.
 DEFAULT_CAMERA_SETTINGS = {
     "width": 1920,
     "height": 1080,
-    "fps": 90,
+    "fps": 0,
     "use_mjpg": True,
     "rotate": 0,
-}
-
-# rotate 설정값(도) -> cv2.rotate()에 넘길 코드. 0은 회전 없음(회전 코드 없음).
-ROTATE_CODES = {
-    0: None,
-    90: cv2.ROTATE_90_CLOCKWISE,
-    180: cv2.ROTATE_180,
-    270: cv2.ROTATE_90_COUNTERCLOCKWISE,
+    "process_scale": DEFAULT_PROCESS_SCALE,
+    "undistort_k1": DEFAULT_UNDISTORT_K1,
 }
 
 
@@ -53,6 +53,11 @@ class Camera:
         # settings를 직접 넘기지 않으면 config/settings.json에서 읽는다.
         loaded = settings if settings is not None else load_settings().get("camera", {})
         self._settings = {**DEFAULT_CAMERA_SETTINGS, **loaded}
+
+    @property
+    def settings(self) -> dict:
+        """기본값과 합친 camera 설정 (엔진이 전처리기(FramePreprocessor)를 만들 때 쓴다)."""
+        return dict(self._settings)
 
     def open(self) -> bool:
         """카메라를 연다. 성공하면 True, 실패하면 False를 반환한다."""
@@ -126,23 +131,15 @@ class Camera:
     def read_frame(self) -> np.ndarray | None:
         """프레임 한 장을 읽는다. 카메라가 없거나 읽기에 실패하면 None.
 
-        config/settings.json의 rotate 값(0/90/180/270)이 설정돼 있으면
-        회전을 적용한 뒤 돌려준다. 이후 코드는 이미 회전된 프레임만 보게 된다.
+        카메라가 보낸 원본 그대로 돌려준다. 회전·축소·왜곡 보정은 엔진이
+        src/lens.py의 FramePreprocessor로 한다.
         """
         if not self.is_opened():
             return None
         ok, frame = self._capture.read()
         if not ok:
             return None
-        return self._apply_rotation(frame)
-
-    def _apply_rotation(self, frame: np.ndarray) -> np.ndarray:
-        rotate_degrees = self._settings.get("rotate", 0)
-        rotate_code = ROTATE_CODES.get(rotate_degrees)
-        if rotate_code is None:
-            # rotate: 0이거나, 0/90/180/270이 아닌 잘못된 값이면 회전하지 않는다.
-            return frame
-        return cv2.rotate(frame, rotate_code)
+        return frame
 
     def release(self) -> None:
         """카메라 장치를 반납한다."""

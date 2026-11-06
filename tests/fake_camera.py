@@ -70,7 +70,8 @@ def make_test_settings(tmp_dir: str, **overrides) -> mock._patch:
     overrides로 설정의 일부 항목을 바꿀 수 있다 (예: tracking={"stop_duration": 1.0}).
     """
     settings = {
-        "camera": {},
+        # 가짜 카메라 영상(1280x720)을 줄이지 않고 그대로 써서 좌표를 예측하기 쉽게 한다
+        "camera": {"process_scale": 1.0, "undistort_k1": 0.0},
         "detection": {
             "active_profile": "test",
             "profiles": {

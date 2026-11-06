@@ -188,6 +188,17 @@ SAVE_NEEDS_CALIBRATION_MESSAGE = "캘리브레이션이 필요합니다"
 SAVE_NO_TRAJECTORY_MESSAGE = "저장할 궤적이 없습니다"
 SAVE_SUCCESS_MESSAGE = "저장 완료"
 
+# 카메라 화면 격자선 (렌즈 왜곡 보정 때 직선인지 보기 쉽게). 가로·세로 각각 몇 칸으로 나눌지
+GRID_DIVISIONS = 10
+GRID_COLOR_BGR = (255, 255, 0)  # 하늘색 (매트 녹색·공 색과 잘 구분됨)
+GRID_THICKNESS = 1
+
+# 검출 디버그 표시 (덩어리 면적·지름 글자). 통과한 덩어리는 흰색, 걸러진 덩어리는 주황색
+DEBUG_ACCEPTED_COLOR_BGR = (255, 255, 255)
+DEBUG_REJECTED_COLOR_BGR = (0, 165, 255)
+DEBUG_FONT_SCALE = 0.5
+DEBUG_FONT_THICKNESS = 1
+
 # 카메라가 없을 때, 다시 연결됐는지 확인하는 문구
 CAMERA_NOT_CONNECTED_TEXT = "카메라를 연결해주세요"
 
@@ -246,6 +257,13 @@ class MainWindow(QMainWindow):
         self.fps_label.setObjectName("status")
         top_layout.addWidget(self.fps_label)
 
+        # 1-1) 경고 띠: 해상도/왜곡 보정이 바뀌어 캘리브레이션을 다시 해야 할 때만 보인다
+        self.warning_label = QLabel("")
+        self.warning_label.setObjectName("warning")
+        self.warning_label.setWordWrap(True)
+        self.warning_label.hide()
+        root_layout.addWidget(self.warning_label)
+
         # 2) 본문: 왼쪽(카메라/궤적) + 오른쪽(버튼들)을 가로로 배치
         body_layout = QHBoxLayout()
         body_layout.setSpacing(12)
@@ -274,6 +292,8 @@ class MainWindow(QMainWindow):
 
         # 프로필/매트 설정 다이얼로그 (설정 메뉴에서 연다)
         self.settings_dialog: SettingsDialog | None = None
+        # 카메라 화면에 격자선을 그릴지 (설정창의 '격자선 표시'로 켠다)
+        self._show_grid = False
 
         # 측정 결과 기록 보기 다이얼로그 (기록 메뉴에서 연다)
         self.records_dialog: RecordsDialog | None = None
@@ -286,6 +306,7 @@ class MainWindow(QMainWindow):
         engine.tracking_started.connect(self._refresh_after_engine_change)
         engine.tracking_finished.connect(self._on_tracking_finished)
         engine.protocol_server.client_count_changed.connect(self._update_app_label)
+        engine.calibration_invalidated.connect(self._update_warning_label)
 
         # 시작 상태(IDLE)에 맞게 배지 문구와 버튼 활성화 상태를 맞춘다.
         self._update_status_badge()
@@ -293,6 +314,7 @@ class MainWindow(QMainWindow):
         self._update_start_point_label()
         self._update_stop_point_label()
         self._render_trajectory_panel()
+        self._update_warning_label()
 
     # 엔진의 부품에 self.tracker처럼 짧게 접근하기 위한 통로.
     # (엔진이 설정을 다시 불러오면 calibration 객체가 새로 바뀌므로, 객체를 이 창에
@@ -575,6 +597,10 @@ class MainWindow(QMainWindow):
             self.settings_dialog.protocol_settings_changed.connect(
                 self._on_protocol_settings_changed
             )
+            # 렌즈 왜곡 보정 슬라이더: 엔진의 전처리 값을 바로 바꿔 카메라 영상에 반영 (미리보기)
+            self.settings_dialog.lens_k1_preview.connect(self.engine.set_undistort_k1)
+            self.settings_dialog.grid_toggled.connect(self._on_grid_toggled)
+            self.settings_dialog.detection_debug_toggled.connect(self.engine.set_detection_debug)
         else:
             # 그 사이 다른 곳(HSV 튜닝 등)에서 바뀐 내용도 반영되도록 다시 불러온다.
             self.settings_dialog.reload_from_settings()
@@ -630,6 +656,11 @@ class MainWindow(QMainWindow):
         frame = raw_frame.copy()
 
         self._update_coord_label(result.detection, result.outside_mat)
+        if self._show_grid:
+            # 격자선은 가장 먼저(맨 아래에) 그려서 공·모서리 표시를 가리지 않게 한다
+            self._draw_grid(frame)
+        if result.candidates is not None:
+            self._draw_debug_candidates(frame, result.candidates)
         if result.detection is not None:
             self._draw_detection(frame, result.detection)
         elif result.outside_mat:
@@ -647,6 +678,7 @@ class MainWindow(QMainWindow):
             self._draw_mat_outline(frame, self.calibration.corners)
 
         self._update_fps()
+        self._update_warning_label()
         pixmap = self._frame_to_pixmap(frame, self.camera_label.size())
         self.camera_label.setPixmap(pixmap)
 
@@ -717,6 +749,53 @@ class MainWindow(QMainWindow):
                 CALIBRATION_FONT_THICKNESS,
                 cv2.LINE_AA,
             )
+
+    @staticmethod
+    def _draw_grid(frame) -> None:
+        """카메라 화면에 가로·세로 격자선을 그린다. 매트 테두리가 격자선과 나란하면 왜곡이 펴진 것."""
+        height, width = frame.shape[:2]
+        for i in range(1, GRID_DIVISIONS):
+            x = round(width * i / GRID_DIVISIONS)
+            y = round(height * i / GRID_DIVISIONS)
+            cv2.line(frame, (x, 0), (x, height - 1), GRID_COLOR_BGR, GRID_THICKNESS)
+            cv2.line(frame, (0, y), (width - 1, y), GRID_COLOR_BGR, GRID_THICKNESS)
+
+    @staticmethod
+    def _draw_debug_candidates(frame, candidates: list) -> None:
+        """검출 디버그: 색 범위에 맞은 덩어리마다 면적(px²)·지름(px)·원형도를 글자로 쓴다.
+
+        흰 글자 = 공 조건(면적·원형도)을 통과한 덩어리, 주황 글자 = 걸러진 덩어리.
+        공이 주황색으로 나오면 min_area/max_area/min_circularity를 이 숫자에 맞게 고치면 된다.
+        """
+        for c in candidates:
+            color = DEBUG_ACCEPTED_COLOR_BGR if c.accepted else DEBUG_REJECTED_COLOR_BGR
+            cv2.circle(frame, (c.x, c.y), max(2, round(c.diameter / 2)), color, 1)
+            text = f"A{c.area:.0f} D{c.diameter:.1f} C{c.circularity:.2f}"
+            cv2.putText(
+                frame,
+                text,
+                (c.x + round(c.diameter / 2) + 4, c.y - 4),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                DEBUG_FONT_SCALE,
+                color,
+                DEBUG_FONT_THICKNESS,
+                cv2.LINE_AA,
+            )
+
+    def _on_grid_toggled(self, enabled: bool) -> None:
+        self._show_grid = bool(enabled)
+
+    def _update_warning_label(self, *_args) -> None:
+        """엔진에 캘리브레이션 경고가 있으면 경고 띠를 보여주고, 없으면 숨긴다."""
+        warning = self.engine.calibration_warning
+        if warning:
+            text = f"{warning} - '캘리브레이션' 버튼을 눌러 다시 지정하세요"
+            if self.warning_label.text() != text:
+                self.warning_label.setText(text)
+            if self.warning_label.isHidden():
+                self.warning_label.show()
+        elif not self.warning_label.isHidden():
+            self.warning_label.hide()
 
     @staticmethod
     def _draw_mat_outline(frame, corners: list) -> None:

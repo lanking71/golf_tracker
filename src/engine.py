@@ -16,8 +16,13 @@
 돌아야 하기 때문). 시그널·타이머·TCP 서버를 위한 QtCore/QtNetwork만 쓴다.
 
 한 프레임이 처리되는 순서 (process_frame):
-    카메라 읽기 -> 공 검출 -> 매트 밖 검출 무시 -> 궤적 기록·정지/이탈 판정
-    -> 앱(메인 컨트롤)에 상태 전송 -> (끝났으면) 결과 전송 -> 화면에 알림
+    카메라 읽기 -> 전처리(회전·축소·왜곡 보정, src/lens.py) -> 공 검출 -> 매트 밖 검출 무시
+    -> 궤적 기록·정지/이탈 판정 -> 앱(메인 컨트롤)에 상태 전송 -> (끝났으면) 결과 전송 -> 화면에 알림
+
+22단계부터 엔진의 모든 픽셀 좌표(검출, 시작점, 캘리브레이션 모서리, 화면 표시,
+프로토콜 ALIGN corners)는 '전처리가 끝난 프레임' 기준이다. 처리 프레임 크기나
+왜곡 보정 값(k1)이 바뀌면 예전에 찍은 모서리는 맞지 않으므로, 엔진이 캘리브레이션을
+'안 된 상태'로 돌리고 로그·화면에 다시 하라고 알린다 (_check_processing_changed).
 """
 
 import logging
@@ -31,6 +36,7 @@ from src.calibration import Calibration, check_corners, detect_mat_corners
 from src.camera import Camera
 from src.config import load_settings, save_settings
 from src.detector import DEFAULT_DETECTION_SETTINGS, BallDetection, BallDetector
+from src.lens import FramePreprocessor
 from src.protocol_handler import ProtocolHandler
 from src.protocol_server import ProtocolServer
 from src.stats import compute_trajectory_stats
@@ -49,6 +55,9 @@ ERROR_LOG_INTERVAL_S = 5.0
 # 상태 요약(FPS·처리 시간)을 로그에 남기는 기본 간격(초). 0이면 남기지 않는다.
 DEFAULT_STATS_INTERVAL_S = 10
 
+# 처리 프레임 크기·왜곡 보정이 바뀌어 저장된 캘리브레이션을 쓸 수 없을 때 알리는 문구
+CALIBRATION_STALE_MESSAGE = "해상도/왜곡 보정이 바뀌어 캘리브레이션을 다시 해야 합니다"
+
 # register_start()가 돌려주는 결과 코드
 START_OK = "OK"
 START_NO_BALL = "no_ball"  # 공이 검출되지 않음
@@ -65,13 +74,16 @@ SAVE_NO_TRAJECTORY = "no_trajectory"  # 궤적 점이 2개 미만이라 통계�
 class FrameResult:
     """한 프레임을 처리한 결과. 화면(UI)은 이걸 받아서 그리기만 한다."""
 
-    frame: np.ndarray  # 카메라 원본 프레임 (그림을 그리기 전). 그리려면 복사해서 쓸 것
+    # 전처리(회전·축소·왜곡 보정)가 끝난 프레임 (그림을 그리기 전). 그리려면 복사해서 쓸 것
+    frame: np.ndarray
     detection: BallDetection | None  # 매트 안에서 인정된 공 (없으면 None)
     raw_detection: BallDetection | None  # 매트 밖이라 무시된 것까지 포함한 원래 검출
     outside_mat: bool  # 공은 찾았지만 매트 밖이라 무시했는지
     now: float  # 이 프레임을 처리한 시각 (time.time())
     # True면 HSV 튜닝 미리보기 중이라 검출·추적을 건너뛴 프레임이다.
     paused: bool = False
+    # 검출 디버그 표시가 켜져 있을 때만 채워지는 덩어리 목록 (DetectionCandidate). 면적 측정용
+    candidates: list | None = None
 
 
 class VisionEngine(QObject):
@@ -91,16 +103,29 @@ class VisionEngine(QObject):
     tracking_started = Signal()
     # 정지·이탈로 추적이 자동 종료됐을 때 (종료 사유 문구를 함께 전달)
     tracking_finished = Signal(str)
+    # 처리 조건이 바뀌어 저장된 캘리브레이션이 무효가 됐을 때 (알림 문구를 함께 전달)
+    calibration_invalidated = Signal(str)
 
     def __init__(self, camera=None, parent=None):
         """camera를 넘기지 않으면 실제 USB 카메라를 쓴다 (테스트에서는 가짜 카메라를 넘긴다)."""
         super().__init__(parent)
 
         self.camera = camera if camera is not None else Camera()
+        # 카메라 원본 -> 처리 프레임 (회전·축소·왜곡 보정). 설정은 config/settings.json의 camera
+        self.preprocessor = FramePreprocessor(load_settings().get("camera", {}))
+        # 검출 디버그 표시(덩어리 면적·지름) 켜짐 여부. 검출기를 새로 만들어도 유지한다.
+        self.detection_debug = False
         self.detector = BallDetector()
         self.tracker = Tracker()
         self.calibration = Calibration()
         self.storage = Storage()
+
+        # 처리 프레임 크기 (폭, 높이). 첫 프레임을 받기 전에는 모른다(None).
+        self.frame_size: tuple[int, int] | None = None
+        # 마지막으로 캘리브레이션을 검사한 처리 조건 (프레임 크기, k1)
+        self._checked_processing: tuple | None = None
+        # 캘리브레이션이 무효가 된 이유 문구 (화면이 보여준다). 문제 없으면 None
+        self.calibration_warning: str | None = None
 
         # 앱(메인 컨트롤)과 JSON으로 통신하는 TCP 서버 + 명령 처리기.
         # 서버가 받은 명령을 핸들러가 해석하고, 핸들러는 화면 버튼과 같은
@@ -135,6 +160,7 @@ class VisionEngine(QObject):
         self._stats_frames = 0
         self._stats_proc_total = 0.0
         self._stats_proc_max = 0.0
+        self._stats_pre_total = 0.0  # 그중 전처리(축소·왜곡 보정)에 걸린 시간 합계
         self._proc_started = 0.0
 
         # 가장 최근 프레임의 정보 (앱 명령 처리와 화면이 읽어 간다)
@@ -161,6 +187,10 @@ class VisionEngine(QObject):
             self._stats_timer = QTimer(self)
             self._stats_timer.setInterval(int(stats_interval * 1000))
             self._stats_timer.timeout.connect(self.log_stats)
+
+        # 시작하자마자 k1·처리 조건 기록 여부만이라도 먼저 검사한다 (예전 설정 파일은 여기서
+        # 무효 처리된다). 프레임 크기는 첫 프레임을 받은 뒤 _check_processing_changed에서 검사한다.
+        self._validate_calibration()
 
     # ------------------------------------------------------------------
     # 시작 / 종료
@@ -235,12 +265,18 @@ class VisionEngine(QObject):
 
     def _process_frame(self, now: float) -> bool:
         """프레임 한 장 처리 본체. 프레임을 실제로 처리했으면 True, 카메라에서 못 읽었으면 False."""
-        frame = self._read_frame(now)
-        if frame is None:
+        raw = self._read_frame(now)
+        if raw is None:
             self._on_no_frame(now)
             return False
 
         self._proc_started = time.perf_counter()  # 여기부터가 엔진의 처리 시간 (log_stats용)
+        # 전처리: 회전 -> 축소 -> 왜곡 보정. 이후 모든 좌표는 이 프레임 기준이다.
+        frame = self.preprocessor.process(raw)
+        self._stats_pre_total += time.perf_counter() - self._proc_started
+        self._check_processing_changed((frame.shape[1], frame.shape[0]))
+
+        # (이름은 예전 그대로 last_raw_frame: '그림을 그리기 전' 프레임이라는 뜻. 전처리는 끝난 상태)
         self.last_raw_frame = frame
         self._set_camera_ok(True)
         self.frame_count += 1
@@ -253,6 +289,7 @@ class VisionEngine(QObject):
             return True
 
         # 공 검출 (못 찾아도 예외 없이 None만 돌아온다)
+        self.detector.debug_enabled = self.detection_debug
         raw_detection = self.detector.detect(frame)
         detection = raw_detection
         outside_mat = False
@@ -293,8 +330,109 @@ class VisionEngine(QObject):
         if finish_reason is not None:
             self._finish_tracking(finish_reason)
 
-        self.frame_processed.emit(FrameResult(frame, detection, raw_detection, outside_mat, now))
+        candidates = list(self.detector.last_candidates) if self.detection_debug else None
+        self.frame_processed.emit(
+            FrameResult(frame, detection, raw_detection, outside_mat, now, candidates=candidates)
+        )
         return True
+
+    # ------------------------------------------------------------------
+    # 처리 조건(프레임 크기·왜곡 보정)과 캘리브레이션
+    # ------------------------------------------------------------------
+    def _check_processing_changed(self, frame_size: tuple[int, int]) -> None:
+        """처리 프레임 크기나 k1이 지난 검사 때와 달라졌으면 캘리브레이션을 다시 검사한다.
+
+        매 프레임 불리지만 값 두 개를 비교할 뿐이라 가볍다.
+        - 첫 프레임: 지금 쓰고 있는 캘리브레이션이 이 크기에서 찍은 것인지 확인한다.
+        - 그 뒤에 바뀜(설정창의 k1 슬라이더 등): 설정 파일에서 다시 불러와서 확인한다.
+          값을 원래대로 되돌리면 저장돼 있던 캘리브레이션이 다시 살아난다.
+        """
+        self.frame_size = frame_size
+        key = (frame_size, self.preprocessor.undistort_k1)
+        if key == self._checked_processing:
+            return
+        first_check = self._checked_processing is None
+        self._checked_processing = key
+        if first_check:
+            self._validate_calibration()
+            return
+
+        logger.info(
+            "처리 조건 바뀜 - 처리 프레임 %dx%d, 왜곡 보정 k1=%.2f",
+            frame_size[0],
+            frame_size[1],
+            self.preprocessor.undistort_k1,
+        )
+        self._reload_calibration_for_processing()
+
+    def _reload_calibration_for_processing(self) -> None:
+        """설정 파일의 캘리브레이션을 다시 불러와 지금 처리 조건과 맞는지 검사한다."""
+        fresh = Calibration()
+        if fresh.is_calibrated() and fresh.matches_processing(
+            self.frame_size, self.preprocessor.undistort_k1
+        ):
+            # 저장된 캘리브레이션이 지금 조건과 맞다 (예: k1을 원래 값으로 되돌림) -> 다시 쓴다
+            was_stale = self.calibration_warning is not None
+            self.calibration = fresh
+            self.calibration_warning = None
+            if was_stale:
+                logger.info("저장된 캘리브레이션이 지금 처리 조건과 맞아 다시 사용합니다")
+                self.changed.emit()
+            return
+        if not self.calibration.is_calibrated():
+            # 이미 미보정(무효) 상태면 다시 알릴 필요가 없다 (슬라이더를 끄는 동안 알림이 반복되지 않게)
+            return
+        self._validate_calibration()
+
+    def _validate_calibration(self) -> None:
+        """지금 캘리브레이션이 현재 처리 조건(프레임 크기·k1)에서 찍은 것이 아니면 무효로 만든다."""
+        if not self.calibration.is_calibrated():
+            return
+        k1 = self.preprocessor.undistort_k1
+        if self.calibration.matches_processing(self.frame_size, k1):
+            return
+
+        saved_size = self.calibration.frame_size
+        saved_text = f"{saved_size[0]}x{saved_size[1]}" if saved_size else "기록 없음"
+        saved_k1 = self.calibration.undistort_k1
+        saved_k1_text = f"{saved_k1:.2f}" if saved_k1 is not None else "기록 없음"
+        now_text = f"{self.frame_size[0]}x{self.frame_size[1]}" if self.frame_size else "첫 프레임 전"
+        logger.warning(
+            "%s (저장: %s, k1=%s / 현재: %s, k1=%.2f) - 캘리브레이션 안 된 상태로 취급합니다",
+            CALIBRATION_STALE_MESSAGE,
+            saved_text,
+            saved_k1_text,
+            now_text,
+            k1,
+        )
+        self.calibration.invalidate()
+        self.calibration_warning = CALIBRATION_STALE_MESSAGE
+        self.calibration_invalidated.emit(CALIBRATION_STALE_MESSAGE)
+        self.changed.emit()
+
+    def _save_calibration(self) -> None:
+        """캘리브레이션을 지금 처리 조건(프레임 크기·k1)과 함께 저장한다.
+
+        프레임 크기를 아직 모르면(첫 프레임 전) 저장돼 있던 크기를 그대로 둔다.
+        """
+        frame_size = self.frame_size if self.frame_size is not None else self.calibration.frame_size
+        self.calibration.stamp(frame_size, self.preprocessor.undistort_k1)
+        self.calibration.save()
+        self.calibration_warning = None
+
+    def set_undistort_k1(self, k1: float) -> None:
+        """렌즈 왜곡 보정 값(k1)을 바로 바꾼다 (설정창 슬라이더의 실시간 미리보기용).
+
+        settings.json에는 저장하지 않는다 (설정창의 '저장' 버튼이 따로 저장한다).
+        다음 프레임부터 바뀐 값으로 처리되고, 캘리브레이션 검사도 그때 다시 한다.
+        """
+        self.preprocessor.set_undistort_k1(k1)
+
+    def set_detection_debug(self, enabled: bool) -> None:
+        """검출 디버그 표시(덩어리 면적·지름)를 켜거나 끈다."""
+        self.detection_debug = bool(enabled)
+        if not enabled:
+            self.detector.last_candidates = []
 
     def _finish_tracking(self, reason: str) -> None:
         """정지·이탈로 추적이 끝났을 때: 결과를 앱에 보내고 화면에 알린다."""
@@ -374,13 +512,22 @@ class VisionEngine(QObject):
             "fps": frames / elapsed if elapsed > 0 else 0.0,
             "avg_ms": (self._stats_proc_total / frames * 1000) if frames else 0.0,
             "max_ms": self._stats_proc_max * 1000,
+            # 처리 시간 중 전처리(축소·왜곡 보정)가 차지한 평균 시간
+            "pre_avg_ms": (self._stats_pre_total / frames * 1000) if frames else 0.0,
             "errors": self.error_count,
         }
+        frame_text = f"{self.frame_size[0]}x{self.frame_size[1]}" if self.frame_size else "-"
         logger.info(
-            "상태 요약 - FPS %.1f, 처리 시간(프레임을 받은 뒤 검출~전송) 평균 %.1fms 최대 %.1fms, 카메라 %s, 접속 %d대, 상태 %s, 오류 %d번",
+            "상태 요약 - FPS %.1f, 처리 시간(프레임을 받은 뒤 전처리~전송) 평균 %.1fms 최대 %.1fms "
+            "(그중 전처리 평균 %.1fms), 처리 프레임 %s (scale %.2f, k1 %.2f), "
+            "카메라 %s, 접속 %d대, 상태 %s, 오류 %d번",
             summary["fps"],
             summary["avg_ms"],
             summary["max_ms"],
+            summary["pre_avg_ms"],
+            frame_text,
+            self.preprocessor.process_scale,
+            self.preprocessor.undistort_k1,
             "OK" if self.camera_ok else "LOST",
             self.protocol_server.client_count(),
             self.tracker.state.name,
@@ -390,6 +537,7 @@ class VisionEngine(QObject):
         self._stats_frames = 0
         self._stats_proc_total = 0.0
         self._stats_proc_max = 0.0
+        self._stats_pre_total = 0.0
         return summary
 
     # ------------------------------------------------------------------
@@ -409,7 +557,7 @@ class VisionEngine(QObject):
             self.last_raw_frame
         )
         if auto_ok:
-            self.calibration.save()
+            self._save_calibration()
         return auto_ok
 
     def add_calibration_corner(self, x: int, y: int) -> bool:
@@ -423,7 +571,7 @@ class VisionEngine(QObject):
         if not self.calibration.add_corner(x, y):
             return False
         if self.calibration.is_calibrated():
-            self.calibration.save()
+            self._save_calibration()
         return True
 
     # 앱의 ALIGN 명령은 매트 모서리를 얻는 방법이 세 가지다. 셋 모두 같은 규칙을 따른다:
@@ -505,7 +653,7 @@ class VisionEngine(QObject):
         self.calibration.set_mat_size(*size)
         if corners is not None:
             self.calibration.set_corners(corners)
-        self.calibration.save()
+        self._save_calibration()
         self.tracker.calibrate()
 
     def register_start(self) -> str:
@@ -655,12 +803,15 @@ class VisionEngine(QObject):
     def reload_detector(self) -> None:
         """검출 설정(프로필)이 바뀌었을 때 검출기를 새로 만든다."""
         self.detector = BallDetector()
+        self.detector.debug_enabled = self.detection_debug
 
     def reload_settings(self) -> None:
         """프로필·매트 설정이 바뀌었을 때 검출기와 캘리브레이션을 새로 불러온다."""
-        self.detector = BallDetector()
+        self.reload_detector()
         # 핸들러는 항상 engine.calibration을 통해 접근하므로 따로 맞출 필요가 없다.
         self.calibration = Calibration()
+        # 다시 불러온 캘리브레이션도 지금 처리 조건(프레임 크기·k1)에 맞는지 확인한다.
+        self._validate_calibration()
 
 
 def _is_positive_number(value) -> bool:

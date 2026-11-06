@@ -30,6 +30,24 @@ QLabel#status {
     qproperty-alignment: AlignCenter;
 }
 
+/* 경고 띠 (예: 해상도/왜곡 보정이 바뀌어 캘리브레이션을 다시 해야 할 때) */
+QLabel#warning {
+    background-color: #2D6A4F;
+    color: #FFD166;
+    border: 2px solid #D4A017;
+    border-radius: 10px;
+    padding: 8px 16px;
+    font-size: 14px;
+    font-weight: bold;
+}
+
+/* 설정창의 구역 제목 (예: 렌즈 왜곡 보정) */
+QLabel#section {
+    font-size: 15px;
+    font-weight: bold;
+    padding-top: 12px;
+}
+
 /* 기본 버튼 스타일 (초록 배경 + 흰 글씨) */
 QPushButton {
     background-color: #2D6A4F;

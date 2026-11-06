@@ -44,7 +44,9 @@ logger = logging.getLogger("protocol")
 # 프로토콜 버전 (HELLO로 컨트롤에 알려 준다). 호환되는 추가(새 명령·필드)는 끝자리를,
 # 호환되지 않는 변경은 앞자리를 올린다. 2.1: ALIGN corners/use_saved, SAVE, PROFILE 추가.
 # 2.2: CAMERA 이벤트, 명령 처리 오류 응답(internal_error) 추가.
-PROTOCOL_VERSION = "2.2"
+# 2.3: HELLO에 처리 프레임 크기(frame_w, frame_h) 추가. 픽셀 좌표(ALIGN corners)는
+#      전처리(축소·왜곡 보정)가 끝난 프레임 기준임을 명시.
+PROTOCOL_VERSION = "2.3"
 
 # config/settings.json의 "protocol" 항목에 없을 때 쓸 기본값
 DEFAULT_ADDR_RADIUS_MM = 100
@@ -188,6 +190,7 @@ class ProtocolHandler:
         캘리브레이션이 돼 있는지 바로 알 수 있다.
         """
         reply = self._reply_function(client)
+        frame_size = getattr(self._engine, "frame_size", None)
         reply({
             "cmd": "HELLO",
             "version": PROTOCOL_VERSION,
@@ -195,6 +198,10 @@ class ProtocolHandler:
             "calibrated": self.calibration.is_calibrated(),
             "camera": self._camera_text(),
             "profile": self._engine.profiles()[0],
+            # 처리 프레임 크기(픽셀). ALIGN corners는 이 크기의 화면 기준 좌표다.
+            # 아직 첫 프레임을 못 받았으면 null.
+            "frame_w": frame_size[0] if frame_size else None,
+            "frame_h": frame_size[1] if frame_size else None,
         })
         reply(self._build_status(time.time()))
 

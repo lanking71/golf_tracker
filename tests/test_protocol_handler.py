@@ -335,6 +335,9 @@ class AlignOptionsTests(HandlerTestCase):
         self.assertEqual((reply["result"], reply["reason"]), ("NG", "not_calibrated"))
 
     def test_saved_calibration_survives_engine_restart(self):
+        # 영상을 한 장 받아서 처리 프레임 크기를 안 뒤에 정렬해야, 그 크기가 함께 저장된다
+        # (22단계: 저장된 크기·k1이 지금과 다르면 캘리브레이션을 무효로 본다).
+        self.step()
         self.ask(self.corners_message(width_mm=4500, height_mm=2000))  # 설정 파일에 저장된다
 
         from src.engine import VisionEngine

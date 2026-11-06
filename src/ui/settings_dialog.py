@@ -6,11 +6,14 @@ HSV 슬라이더로 실시간 튜닝하는 TuningDialog와 달리, 이 다이얼
 - 매트 실제 크기(mat_width_mm/mat_height_mm)
 - 매트 밖 필터(filter_outside_mat) on/off
 - 앱 통신(TCP 서버) 사용 여부와 포트
+- 렌즈 왜곡 보정(k1) 슬라이더 + 격자선·검출 디버그 표시 (22단계)
 같은 '폼' 형태의 설정을 다룬다. 실시간 카메라 미리보기는 필요 없다.
 
 프로필 목록 조작(선택·추가·삭제·이름 변경)은 클릭하는 즉시
 config/settings.json에 저장된다. 매트 설정은 '매트 설정 저장' 버튼을
-눌러야 저장된다. 뭔가 저장될 때마다 settings_changed 시그널을 보내서,
+눌러야 저장된다. 렌즈 왜곡 보정은 슬라이더를 움직이면 메인 화면 카메라 영상에
+바로 반영되고(미리보기), '저장'을 눌러야 settings.json에 저장된다. '취소'를 누르거나
+저장하지 않고 창을 닫으면 이전 값으로 되돌린다. 뭔가 저장될 때마다 settings_changed 시그널을 보내서,
 메인 창이 검출기(BallDetector)·캘리브레이션(Calibration)을 새로
 불러오게 한다.
 """
@@ -26,6 +29,7 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QMessageBox,
     QPushButton,
+    QSlider,
     QSpinBox,
     QVBoxLayout,
 )
@@ -43,9 +47,17 @@ from src.detector import (
     DEFAULT_MIN_AREA,
     DEFAULT_MIN_CIRCULARITY,
 )
+from src.lens import DEFAULT_UNDISTORT_K1
 from src.protocol_server import DEFAULT_ENABLED, DEFAULT_PORT
 
 PROFILE_KEY_ROLE = Qt.UserRole
+
+# 렌즈 왜곡 보정 슬라이더: 정수 슬라이더 값 / 100 = k1. -60~+50 -> k1 -0.60~+0.50 (0.01 단위)
+# 이 카메라(광각)는 k1 약 -0.5에서 가장 곧게 펴졌다. k1 모델은 약 -0.59보다 작아지면 화면 좌우 끝이
+# 접혀서(모델이 성립 안 함) 의미가 없으므로 -0.60까지만 둔다.
+K1_SLIDER_STEPS_PER_UNIT = 100
+K1_SLIDER_MIN = -60
+K1_SLIDER_MAX = 50
 
 
 class SettingsDialog(QDialog):
@@ -56,11 +68,19 @@ class SettingsDialog(QDialog):
     # 앱 통신(TCP 서버) 설정이 저장됐을 때. 서버를 다시 시작해야 하므로 별도 시그널로 뺐다
     # (프로필을 클릭할 때마다 서버가 재시작되면 앱 접속이 끊기기 때문).
     protocol_settings_changed = Signal()
+    # 렌즈 왜곡 보정 슬라이더를 움직였을 때 (미리보기용, 아직 저장 안 됨). 값 = k1
+    lens_k1_preview = Signal(float)
+    # 카메라 화면에 가로·세로 격자선을 그릴지 (직선이 곧은지 보기 쉽게)
+    grid_toggled = Signal(bool)
+    # 검출된 덩어리의 면적·지름을 카메라 화면에 글자로 보여줄지 (min_area/max_area 맞출 때)
+    detection_debug_toggled = Signal(bool)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("설정")
-        self.resize(420, 620)
+        self.resize(460, 860)
+        # settings.json에 저장돼 있는 k1 (취소할 때 이 값으로 되돌린다)
+        self._saved_k1: float = DEFAULT_UNDISTORT_K1
 
         self._profiles: dict = {}
         self._active_profile_key: str = DEFAULT_DETECTION_SETTINGS["active_profile"]
@@ -69,6 +89,7 @@ class SettingsDialog(QDialog):
         layout.addLayout(self._build_profile_section())
         layout.addLayout(self._build_mat_section())
         layout.addLayout(self._build_protocol_section())
+        layout.addLayout(self._build_lens_section())
         layout.addStretch(1)
 
         close_button = QPushButton("닫기")
@@ -165,6 +186,59 @@ class SettingsDialog(QDialog):
 
         return layout
 
+    def _build_lens_section(self) -> QVBoxLayout:
+        layout = QVBoxLayout()
+        layout.setSpacing(8)
+
+        title = QLabel("렌즈 왜곡 보정")
+        title.setObjectName("section")
+        layout.addWidget(title)
+
+        hint = QLabel(
+            "격자선을 켜고, 매트 가장자리가 격자선과 나란한 직선이 되도록 슬라이더를 움직이세요. "
+            "가운데가 부풀어 보이면 - 쪽, 오목해 보이면 + 쪽입니다."
+        )
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        slider_row = QHBoxLayout()
+        self.k1_slider = QSlider(Qt.Horizontal)
+        self.k1_slider.setRange(K1_SLIDER_MIN, K1_SLIDER_MAX)
+        self.k1_slider.setSingleStep(1)  # 화살표 키 1칸 = 0.01
+        self.k1_slider.setPageStep(5)
+        self.k1_slider.valueChanged.connect(self._on_k1_slider_changed)
+        slider_row.addWidget(self.k1_slider, 1)
+        # 현재 값 표시 (예: k1 = -0.12)
+        self.k1_value_label = QLabel("k1 = 0.00")
+        self.k1_value_label.setMinimumWidth(90)
+        slider_row.addWidget(self.k1_value_label)
+        layout.addLayout(slider_row)
+
+        self.grid_checkbox = QCheckBox("카메라 화면에 격자선 표시")
+        self.grid_checkbox.toggled.connect(self.grid_toggled.emit)
+        layout.addWidget(self.grid_checkbox)
+
+        self.debug_checkbox = QCheckBox("검출 디버그 표시 (공 면적·지름)")
+        self.debug_checkbox.toggled.connect(self.detection_debug_toggled.emit)
+        layout.addWidget(self.debug_checkbox)
+
+        button_row = QHBoxLayout()
+        button_row.setSpacing(12)
+        cancel_button = QPushButton("취소")
+        cancel_button.clicked.connect(self._on_cancel_lens)
+        save_button = QPushButton("저장")
+        save_button.setObjectName("primary")
+        save_button.clicked.connect(self._on_save_lens)
+        button_row.addWidget(cancel_button)
+        button_row.addWidget(save_button)
+        layout.addLayout(button_row)
+
+        lens_hint = QLabel("값을 바꿔 저장하면 화면 좌표가 달라지므로 캘리브레이션을 다시 해야 합니다.")
+        lens_hint.setWordWrap(True)
+        layout.addWidget(lens_hint)
+
+        return layout
+
     # ------------------------------------------------------------------
     # 불러오기 / 새로고침
     # ------------------------------------------------------------------
@@ -195,6 +269,13 @@ class SettingsDialog(QDialog):
         protocol = settings.get("protocol", {})
         self.protocol_enabled_checkbox.setChecked(protocol.get("enabled", DEFAULT_ENABLED))
         self.protocol_port_input.setValue(protocol.get("port", DEFAULT_PORT))
+
+        camera = settings.get("camera", {})
+        k1 = camera.get("undistort_k1", DEFAULT_UNDISTORT_K1)
+        if isinstance(k1, bool) or not isinstance(k1, (int, float)):
+            k1 = DEFAULT_UNDISTORT_K1
+        self._saved_k1 = float(k1)
+        self._set_k1_slider(self._saved_k1)
 
         self._refresh_profile_list()
 
@@ -342,3 +423,52 @@ class SettingsDialog(QDialog):
         save_settings(settings)
 
         self.protocol_settings_changed.emit()
+
+    # ------------------------------------------------------------------
+    # 렌즈 왜곡 보정 (슬라이더는 실시간 미리보기, '저장'을 눌러야 반영)
+    # ------------------------------------------------------------------
+    def _slider_k1(self) -> float:
+        """슬라이더의 정수 값을 k1(실수)로 바꾼다. 예: -12 -> -0.12"""
+        return self.k1_slider.value() / K1_SLIDER_STEPS_PER_UNIT
+
+    def _set_k1_slider(self, k1: float) -> None:
+        """k1 값에 맞게 슬라이더와 값 표시를 맞춘다 (이때는 미리보기 시그널을 보내지 않는다)."""
+        value = round(k1 * K1_SLIDER_STEPS_PER_UNIT)
+        value = max(K1_SLIDER_MIN, min(K1_SLIDER_MAX, value))
+        self.k1_slider.blockSignals(True)
+        self.k1_slider.setValue(value)
+        self.k1_slider.blockSignals(False)
+        self.k1_value_label.setText(f"k1 = {k1:+.2f}")
+
+    def _on_k1_slider_changed(self, _value: int) -> None:
+        k1 = self._slider_k1()
+        self.k1_value_label.setText(f"k1 = {k1:+.2f}")
+        # 메인 화면이 엔진의 전처리 값을 바로 바꿔서 카메라 영상에 반영한다 (저장은 아직 안 함)
+        self.lens_k1_preview.emit(k1)
+
+    def _has_unsaved_k1(self) -> bool:
+        return abs(self._slider_k1() - self._saved_k1) > 1e-9
+
+    def _on_save_lens(self) -> None:
+        """'저장': 지금 슬라이더 값을 config/settings.json의 camera.undistort_k1에 저장한다."""
+        k1 = self._slider_k1()
+        settings = load_settings()
+        settings.setdefault("camera", {})["undistort_k1"] = k1
+        save_settings(settings)
+        self._saved_k1 = k1
+        self.k1_value_label.setText(f"k1 = {k1:+.2f} (저장됨)")
+
+    def _on_cancel_lens(self) -> None:
+        """'취소': 저장된 값으로 슬라이더와 화면을 되돌린다."""
+        self._set_k1_slider(self._saved_k1)
+        self.lens_k1_preview.emit(self._saved_k1)
+
+    def closeEvent(self, event) -> None:
+        """저장하지 않고 창을 닫으면 k1 미리보기를 저장된 값으로 되돌린다.
+
+        격자선·디버그 표시는 저장하는 값이 아니라 '보기 옵션'이라 창을 닫아도 그대로 둔다
+        (창을 닫고 공을 여기저기 옮겨 가며 면적을 재기 편하게). 다시 열어서 끄면 된다.
+        """
+        if self._has_unsaved_k1():
+            self._on_cancel_lens()
+        super().closeEvent(event)

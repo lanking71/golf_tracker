@@ -21,9 +21,13 @@ import numpy as np
 
 from src.config import load_settings
 
-# 프로필에 min_area/max_area/min_circularity가 없을 때 쓰는 기본값
-DEFAULT_MIN_AREA = 200
-DEFAULT_MAX_AREA = 8000
+# 프로필에 min_area/max_area/min_circularity가 없을 때 쓰는 기본값.
+# 22단계 현장 측정(1920x1080 -> process_scale 0.75 = 1440x810): 매트 끝에 놓인 공의 면적이
+# 약 190~210px²(지름 약 18px)였다. 예전 기본값(200~8000)이면 공이 걸러질 수 있어서
+# 최소는 그 절반 이하(80), 최대는 공의 약 3배(600)로 잡았다. (0.5배로 줄이면 공 면적이
+# 약 70px²라 min_area를 30 정도로 더 낮춰야 한다)
+DEFAULT_MIN_AREA = 80
+DEFAULT_MAX_AREA = 600
 DEFAULT_MIN_CIRCULARITY = 0.7
 
 # config/settings.json에 "detection" 항목이 없거나 일부 값이 빠져 있을 때 쓸 기본값.
@@ -71,6 +75,10 @@ BLUR_KERNEL_SIZE = (9, 9)
 # 마스크의 작은 구멍/잡티를 정리할 때 쓰는 모폴로지 커널 크기
 MORPH_KERNEL_SIZE = (5, 5)
 
+# 디버그 표시용으로 남겨 둘 덩어리: 이 넓이(px²) 이상인 것 중 큰 순서로 최대 몇 개
+DEBUG_CANDIDATE_MIN_AREA = 10
+DEBUG_CANDIDATE_LIMIT = 5
+
 
 @dataclass
 class BallDetection:
@@ -79,6 +87,25 @@ class BallDetection:
     x: int
     y: int
     radius: int
+    # 공으로 고른 덩어리의 넓이(픽셀²). min_area/max_area를 현장에서 맞출 때 참고한다 (22단계).
+    area: float = 0.0
+
+
+@dataclass
+class DetectionCandidate:
+    """색 범위에 맞은 덩어리 하나 (공으로 뽑혔든 걸러졌든). 디버그 표시용.
+
+    공이 min_area보다 작아서 걸러지면 화면에 아무것도 안 나와 원인을 알기 어렵다.
+    그래서 '어떤 덩어리가 얼마 크기로 있었는지'를 남겨 두고, 화면 모드에서
+    면적·지름·원형도를 글자로 보여준다.
+    """
+
+    x: int
+    y: int
+    area: float
+    diameter: float  # 최소 외접원의 지름(픽셀)
+    circularity: float
+    accepted: bool  # 면적·원형도 조건을 모두 통과했는지
 
 
 def build_mask(frame: np.ndarray, hsv_lower, hsv_upper) -> np.ndarray:
@@ -114,6 +141,10 @@ class BallDetector:
             **merged.get("profiles", {}),
         }
         self._settings = merged
+        # debug_enabled가 True면 detect()할 때마다 덩어리 목록(last_candidates)을 남긴다.
+        # 원형도 계산이 덩어리마다 들어가므로 평소(False)에는 하지 않는다.
+        self.debug_enabled = False
+        self.last_candidates: list[DetectionCandidate] = []
 
     def _active_profile(self) -> dict:
         name = self._settings.get("active_profile", "practice")
@@ -138,6 +169,8 @@ class BallDetector:
         mask = build_mask(frame, profile["hsv_lower"], profile["hsv_upper"])
 
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if self.debug_enabled:
+            self.last_candidates = self._collect_candidates(contours, profile)
         if not contours:
             return None
 
@@ -147,7 +180,31 @@ class BallDetector:
             return None
 
         (x, y), radius = cv2.minEnclosingCircle(best_contour)
-        return BallDetection(x=int(x), y=int(y), radius=int(radius))
+        return BallDetection(
+            x=int(x), y=int(y), radius=int(radius), area=float(cv2.contourArea(best_contour))
+        )
+
+    @staticmethod
+    def _collect_candidates(contours, profile: dict) -> list[DetectionCandidate]:
+        """디버그 표시용: 큰 덩어리 몇 개의 면적·지름·원형도와 통과 여부를 모은다."""
+        min_area = profile.get("min_area", DEFAULT_MIN_AREA)
+        max_area = profile.get("max_area", DEFAULT_MAX_AREA)
+        min_circularity = profile.get("min_circularity", DEFAULT_MIN_CIRCULARITY)
+
+        sized = [(cv2.contourArea(c), c) for c in contours]
+        sized = [item for item in sized if item[0] >= DEBUG_CANDIDATE_MIN_AREA]
+        sized.sort(key=lambda item: item[0], reverse=True)
+
+        candidates = []
+        for area, contour in sized[:DEBUG_CANDIDATE_LIMIT]:
+            perimeter = cv2.arcLength(contour, True)
+            circularity = 4 * np.pi * area / (perimeter * perimeter) if perimeter else 0.0
+            (x, y), radius = cv2.minEnclosingCircle(contour)
+            accepted = min_area <= area <= max_area and circularity >= min_circularity
+            candidates.append(
+                DetectionCandidate(int(x), int(y), float(area), 2 * radius, float(circularity), accepted)
+            )
+        return candidates
 
     @staticmethod
     def _pick_best_contour(contours, profile: dict):

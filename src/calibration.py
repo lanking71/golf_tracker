@@ -15,6 +15,12 @@ pixel_to_real()로 카메라 픽셀 좌표를 매트 위의 실제 mm 좌표로 
 is_inside()로 어떤 픽셀 좌표가 캘리브레이션된 매트 네 모서리 안쪽에
 있는지 확인할 수 있다. config/settings.json의 filter_outside_mat이
 true(기본값)면, 매트 밖에서 검출된 공은 오검출로 보고 무시한다.
+
+22단계: 모서리 좌표는 '전처리(회전·축소·왜곡 보정)가 끝난 프레임' 기준이다.
+그래서 저장할 때 그때의 처리 프레임 크기(frame_size)와 왜곡 보정 값(undistort_k1)을
+함께 저장하고(stamp), 나중에 둘 중 하나라도 바뀌면 저장된 모서리가 화면과 맞지 않으므로
+엔진이 '캘리브레이션 안 된 상태'로 취급한다(matches_processing / invalidate).
+예전(21단계까지) 설정 파일에는 이 값이 없으므로 자동으로 무효 처리된다.
 """
 
 import math
@@ -174,6 +180,20 @@ class Calibration:
         except (TypeError, ValueError):
             self.corners = []
 
+        # 이 모서리를 찍었을 때의 처리 프레임 크기 (폭, 높이)와 왜곡 보정 k1.
+        # 없으면(예전 설정 파일) None -> 어떤 처리 조건과도 맞지 않는 것으로 본다.
+        self.frame_size: tuple[int, int] | None = None
+        frame_size = loaded.get("frame_size")
+        try:
+            if frame_size is not None:
+                self.frame_size = (int(frame_size[0]), int(frame_size[1]))
+        except (TypeError, ValueError, IndexError):
+            self.frame_size = None
+        k1 = loaded.get("undistort_k1")
+        self.undistort_k1: float | None = (
+            float(k1) if isinstance(k1, (int, float)) and not isinstance(k1, bool) else None
+        )
+
         self.matrix: np.ndarray | None = None
         matrix = loaded.get("perspective_matrix")
         if matrix is not None:
@@ -185,6 +205,34 @@ class Calibration:
     def is_calibrated(self) -> bool:
         """네 모서리로 변환 행렬이 만들어져 있는지."""
         return self.matrix is not None
+
+    def stamp(self, frame_size: tuple[int, int] | None, undistort_k1: float) -> None:
+        """'이 모서리는 이 처리 조건(프레임 크기·k1)에서 찍었다'고 기록한다 (저장 전에 부른다)."""
+        self.frame_size = (int(frame_size[0]), int(frame_size[1])) if frame_size else None
+        self.undistort_k1 = float(undistort_k1)
+
+    def matches_processing(self, frame_size: tuple[int, int] | None, undistort_k1: float) -> bool:
+        """저장된 처리 조건이 지금 조건과 같은지.
+
+        frame_size가 None이면(아직 첫 프레임을 못 받아 크기를 모르면) k1만 비교한다.
+        저장된 값이 없으면(예전 설정 파일) 항상 False.
+        """
+        if self.undistort_k1 is None or self.frame_size is None:
+            return False
+        if abs(self.undistort_k1 - float(undistort_k1)) > 1e-9:
+            return False
+        if frame_size is not None and tuple(frame_size) != self.frame_size:
+            return False
+        return True
+
+    def invalidate(self) -> None:
+        """처리 조건이 바뀌어 저장된 모서리가 화면과 맞지 않을 때: 미보정 상태로 만든다.
+
+        메모리에서만 지운다 (settings.json의 예전 값은 그대로 남는다 - 값을 되돌리면
+        다시 쓸 수 있게). 새로 캘리브레이션해서 저장하면 그때 덮어쓴다.
+        """
+        self.corners = []
+        self.matrix = None
 
     def add_corner(self, x: int, y: int) -> bool:
         """모서리 좌표를 하나 추가한다.
@@ -278,5 +326,8 @@ class Calibration:
             "mat_hsv_upper": list(self.mat_hsv_upper),
             "corners": [list(c) for c in self.corners],
             "perspective_matrix": self.matrix.tolist() if self.matrix is not None else None,
+            # 이 모서리를 찍은 처리 조건 (22단계). 바뀌면 엔진이 캘리브레이션을 무효로 본다.
+            "frame_size": list(self.frame_size) if self.frame_size is not None else None,
+            "undistort_k1": self.undistort_k1,
         }
         save_settings(settings)
