@@ -192,6 +192,8 @@ MAGNIFIER_CROSS_COLOR_BGR = (0, 0, 255)  # 돋보기 가운데 십자선 (빨강
 PROPOSAL_COLOR_BGR = (255, 200, 0)
 # 드래그 중인 점 표시 색 (빨강)
 DRAG_COLOR_BGR = (0, 0, 255)
+# 캘리브레이션 안내 띠 높이(px). 숨겨져 있어도 이 높이만큼 자리를 비워 둔다 (화면 크기 고정용)
+GUIDE_LABEL_HEIGHT = 64
 # 4점이 거절된 이유 코드 -> 화면에 보여줄 문구
 CORNER_PROBLEM_TEXTS = {
     "bad_corners": "점 순서(좌상 → 우상 → 우하 → 좌하)나 사각형 모양이 올바르지 않습니다",
@@ -286,6 +288,14 @@ class MainWindow(QMainWindow):
         self.guide_label = QLabel("")
         self.guide_label.setObjectName("guide")
         self.guide_label.setWordWrap(True)
+        # 안내 띠가 나타나고 사라질 때 카메라 화면 크기가 바뀌지 않도록 자리를 항상 확보해 둔다.
+        # - 높이 고정: 두 줄(거절 이유 + 안내)까지 들어가는 높이
+        # - retainSizeWhenHidden: 숨겨도 자리는 그대로 남긴다 (빈 공간으로 보임)
+        # 카메라 화면 크기가 바뀌면 클릭하려던 위치가 순간 움직여서 모서리를 잘못 찍을 수 있다.
+        self.guide_label.setFixedHeight(GUIDE_LABEL_HEIGHT)
+        guide_policy = self.guide_label.sizePolicy()
+        guide_policy.setRetainSizeWhenHidden(True)
+        self.guide_label.setSizePolicy(guide_policy)
         self.guide_label.hide()
         root_layout.addWidget(self.guide_label)
 

@@ -9,7 +9,7 @@
         "undistort_k1": -0.5
     },
     "detection": {
-        "active_profile": "흰색 공",
+        "active_profile": "practice",
         "profiles": {
             "practice": {
                 "name": "연습용 (흰 공)",
@@ -58,22 +58,6 @@
                 "min_area": 80,
                 "min_circularity": 0.7,
                 "name": "연습용 (연두 공)"
-            },
-            "흰색 공": {
-                "name": "흰색 공",
-                "hsv_lower": [
-                    0,
-                    84,
-                    108
-                ],
-                "hsv_upper": [
-                    179,
-                    255,
-                    255
-                ],
-                "min_area": 80,
-                "max_area": 600,
-                "min_circularity": 0.7
             }
         }
     },
