@@ -6,10 +6,10 @@
         "use_mjpg": true,
         "rotate": 0,
         "process_scale": 0.75,
-        "undistort_k1": 0.0
+        "undistort_k1": -0.5
     },
     "detection": {
-        "active_profile": "practice_lime",
+        "active_profile": "흰색 공",
         "profiles": {
             "practice": {
                 "name": "연습용 (흰 공)",
@@ -58,6 +58,22 @@
                 "min_area": 80,
                 "min_circularity": 0.7,
                 "name": "연습용 (연두 공)"
+            },
+            "흰색 공": {
+                "name": "흰색 공",
+                "hsv_lower": [
+                    0,
+                    84,
+                    108
+                ],
+                "hsv_upper": [
+                    179,
+                    255,
+                    255
+                ],
+                "min_area": 80,
+                "max_area": 600,
+                "min_circularity": 0.7
             }
         }
     },
@@ -70,9 +86,10 @@
         "lost_duration": 2.0
     },
     "calibration": {
-        "mat_width_mm": 4500,
-        "mat_height_mm": 2000,
+        "mat_width_mm": 3000,
+        "mat_height_mm": 1000,
         "filter_outside_mat": true,
+        "auto_detect": false,
         "mat_hsv_lower": [
             35,
             40,
@@ -85,39 +102,44 @@
         ],
         "corners": [
             [
-                51,
-                83
+                96,
+                207
             ],
             [
-                875,
-                73
+                1289,
+                212
             ],
             [
-                924,
-                609
+                1289,
+                604
             ],
             [
-                73,
-                590
+                107,
+                591
             ]
         ],
         "perspective_matrix": [
             [
-                5.811314248906414,
-                -0.2521674822010673,
-                -275.4471256715386
+                2.5595649205067006,
+                -0.07332087011868156,
+                -230.54081225407614
             ],
             [
-                0.049662307136402496,
-                4.092174108039594,
-                -342.18322863124286
+                -0.0107787653201192,
+                2.5718134053804227,
+                -531.330613443016
             ],
             [
-                6.927015367804054e-05,
-                5.5687628047526424e-05,
+                1.7775632345244514e-05,
+                -2.4440290039560504e-05,
                 1.0
             ]
-        ]
+        ],
+        "frame_size": [
+            1440,
+            810
+        ],
+        "undistort_k1": -0.5
     },
     "protocol": {
         "enabled": true,

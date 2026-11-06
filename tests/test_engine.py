@@ -99,16 +99,16 @@ class CalibrationTests(EngineTestCase):
         self.assertEqual(self.engine.calibration.mat_width_mm, 4500)
 
     def test_start_calibration_button_flow(self):
-        self.step()
-        self.assertTrue(self.engine.start_calibration())
-        self.assertTrue(self.engine.calibration.is_calibrated())
+        """23단계: 기본(auto_detect 꺼짐)은 자동 검출 없이 바로 수동 4점 클릭 모드다.
 
-        self.camera.show_mat = False
+        자동 검출을 켠 경우의 흐름은 tests/test_manual_calibration.py에서 확인한다.
+        """
         self.step()
-        # 자동 검출 실패 -> False, 모서리는 지워져 4점 클릭 모드가 된다
-        self.assertFalse(self.engine.start_calibration())
+        self.assertEqual(self.engine.start_calibration(), "manual")
         self.assertEqual(self.engine.tracker.state, TrackerState.CALIBRATING)
         self.assertEqual(self.engine.calibration.corners, [])
+        self.assertFalse(self.engine.calibration.is_calibrated())
+        self.assertIsNone(self.engine.calibration_proposal)
 
     def test_manual_corner_clicks(self):
         self.engine.tracker.calibrate()

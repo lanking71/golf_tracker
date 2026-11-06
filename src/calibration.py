@@ -5,9 +5,14 @@
 좌하단 순서)로 cv2.getPerspectiveTransform 원근 변환 행렬을 만들고,
 config/settings.json에 저장/로드한다.
 
-매트의 실제 크기(mm)도 여기서 관리한다. 집에서 수건으로 연습할 때는
-실측값을, 실전 매트에서는 4000x2000(mm)을 config/settings.json의
-mat_width_mm/mat_height_mm에 넣으면 된다.
+매트의 실제 크기(mm)도 여기서 관리한다. 기본값은 지금 매트의 측정 영역인
+3000x1000(mm)이고, 다른 규격(예: 4500x2000) 현장은 config/settings.json의
+mat_width_mm/mat_height_mm(또는 설정창)에서 바꾼다.
+
+23단계: 녹색 매트 자동 검출은 매트 모양에 따라 틀린 4점으로 '성공'할 수 있어서
+기본은 사람이 4점을 직접 찍는다(auto_detect = False). 마지막 점 취소(undo_last_corner),
+점 옮기기용 가장 가까운 점 찾기(nearest_corner), 매트 크기 오타를 잡는 비율 검사
+(aspect_ratio_warning)도 여기 있다.
 
 pixel_to_real()로 카메라 픽셀 좌표를 매트 위의 실제 mm 좌표로 바꾼다
 (10단계에서 좌표 배지·요약 통계·궤적 패널에 실제로 적용했다).
@@ -31,11 +36,25 @@ import cv2
 from src.config import load_settings, save_settings
 
 # config/settings.json에 "calibration" 항목이 없거나 값이 빠져 있을 때 쓸 기본값.
-# 4000x2000mm은 실전 매트 크기. 집에서 수건으로 테스트할 때는 이 값을
-# 수건 실측 크기로 바꿔서 쓴다.
-DEFAULT_MAT_WIDTH_MM = 4500
-DEFAULT_MAT_HEIGHT_MM = 2000
+# 23단계: 지금 설치된 매트의 실제 측정 영역은 가로 3000mm x 세로 1000mm다
+# (화면에서 긴 쪽이 가로). 4500x2000 같은 다른 규격 현장은 설정창에서 바꾼다.
+DEFAULT_MAT_WIDTH_MM = 3000
+DEFAULT_MAT_HEIGHT_MM = 1000
 DEFAULT_FILTER_OUTSIDE_MAT = True
+
+# 설정창에서 입력할 수 있는 매트 크기 범위(mm). 오타(예: 1000을 10000으로)를 줄이려고
+# 현실적인 값으로 제한한다.
+MAT_WIDTH_RANGE_MM = (500, 10000)
+MAT_HEIGHT_RANGE_MM = (300, 5000)
+
+# 녹색 매트 자동 검출 사용 여부의 기본값 (23단계).
+# 매트 모양이 현장마다 달라(계단 모양, 퍼팅 그린이 붙어 있음 등) 자동 검출은
+# 틀린 4점으로 "성공"할 수 있다. 그래서 기본은 사람이 4점을 직접 찍는 수동 모드다.
+# true로 바꾸면 자동 검출 결과를 바로 저장하지 않고 '제안'으로만 보여준다.
+DEFAULT_AUTO_DETECT = False
+
+# 찍은 4점의 가로:세로 비율이 입력한 매트 크기의 비율과 이만큼(30%) 이상 다르면 경고한다.
+ASPECT_WARNING_TOLERANCE = 0.3
 
 # 녹색 매트 자동 검출용 HSV 기본 범위 (OpenCV: H 0~179, S/V 0~255).
 # 조명에 따라 다르므로 config/settings.json의 calibration.mat_hsv_lower/upper로 조정한다.
@@ -50,6 +69,46 @@ CORNER_NAMES = ["좌상단", "우상단", "우하단", "좌하단"]
 
 # 모서리 네 점이 이루는 사각형의 넓이가 이보다 작으면(px²) 사각형으로 보지 않는다.
 MIN_CORNERS_AREA_PX = 100
+
+
+def corners_aspect_ratio(corners) -> float | None:
+    """찍은 4점(좌상, 우상, 우하, 좌하)이 화면에서 이루는 '가로 / 세로' 비율.
+
+    가로 길이 = 윗변과 아랫변 길이의 평균, 세로 길이 = 왼쪽 변과 오른쪽 변 길이의 평균.
+    점이 4개가 아니거나 세로 길이가 0이면 None.
+    """
+    if len(corners) != 4:
+        return None
+    (x0, y0), (x1, y1), (x2, y2), (x3, y3) = [(float(x), float(y)) for x, y in corners]
+    top = math.hypot(x1 - x0, y1 - y0)
+    bottom = math.hypot(x2 - x3, y2 - y3)
+    left = math.hypot(x3 - x0, y3 - y0)
+    right = math.hypot(x2 - x1, y2 - y1)
+    height = (left + right) / 2
+    if height == 0:
+        return None
+    return ((top + bottom) / 2) / height
+
+
+def aspect_ratio_warning(corners, width_mm, height_mm, tolerance: float = ASPECT_WARNING_TOLERANCE) -> str | None:
+    """찍은 4점의 모양과 입력한 매트 크기의 비율이 크게 다르면 경고 문구를, 아니면 None을 돌려준다.
+
+    매트 크기 오타(예: 세로 1000을 10000으로 입력)를 잡기 위한 것이다.
+    두 비율 중 큰 값 / 작은 값이 (1 + tolerance) 이상이면 '크게 다르다'고 본다.
+    카메라가 비스듬히 보면 실제로도 비율이 좀 달라질 수 있어서 저장을 막지는 않고 경고만 한다.
+    """
+    pixel_ratio = corners_aspect_ratio(corners)
+    if pixel_ratio is None or pixel_ratio <= 0 or not width_mm or not height_mm:
+        return None
+    mm_ratio = width_mm / height_mm
+    if mm_ratio <= 0:
+        return None
+    if max(pixel_ratio, mm_ratio) / min(pixel_ratio, mm_ratio) < 1 + tolerance:
+        return None
+    return (
+        f"입력한 매트 크기({width_mm:g}x{height_mm:g})와 화면에서 찍은 모양의 비율이 크게 다릅니다. "
+        f"크기를 확인하세요 (화면 비율 {pixel_ratio:.2f} : 입력 비율 {mm_ratio:.2f})"
+    )
 
 
 def check_corners(corners, frame_size: tuple[int, int] | None = None) -> str | None:
@@ -172,6 +231,8 @@ class Calibration:
         self.filter_outside_mat = loaded.get("filter_outside_mat", DEFAULT_FILTER_OUTSIDE_MAT)
         self.mat_hsv_lower = loaded.get("mat_hsv_lower", DEFAULT_MAT_HSV_LOWER)
         self.mat_hsv_upper = loaded.get("mat_hsv_upper", DEFAULT_MAT_HSV_UPPER)
+        # 녹색 매트 자동 검출을 쓸지 (기본 False = 사람이 4점을 직접 찍음)
+        self.auto_detect = bool(loaded.get("auto_detect", DEFAULT_AUTO_DETECT))
 
         corners = loaded.get("corners") or []
         # 저장된 값이 깨져 있어도(예: 형식이 다름) 크래시 없이 빈 목록으로 시작한다.
@@ -261,6 +322,33 @@ class Calibration:
         self.set_corners(corners)
         return True
 
+    def undo_last_corner(self) -> bool:
+        """마지막으로 찍은 점 하나를 지운다 (화면에서 오른쪽 클릭). 지운 점이 없으면 False.
+
+        4점이 다 찍혀 있었다면 변환 행렬도 지운다 (점이 3개면 행렬을 만들 수 없다).
+        """
+        if not self.corners:
+            return False
+        self.corners.pop()
+        self.matrix = None
+        return True
+
+    def nearest_corner(self, x: float, y: float, max_distance: float) -> int | None:
+        """(x, y)에서 max_distance(px) 안에 있는 가장 가까운 모서리의 번호(0~3). 없으면 None.
+
+        4점을 다 찍은 뒤 점을 드래그해서 옮길 때 '어느 점을 잡았는지' 찾는 데 쓴다.
+        """
+        best_index, best_distance = None, max_distance
+        for index, (cx, cy) in enumerate(self.corners):
+            distance = math.hypot(cx - x, cy - y)
+            if distance <= best_distance:
+                best_index, best_distance = index, distance
+        return best_index
+
+    def aspect_warning(self) -> str | None:
+        """지금 모서리 모양과 매트 크기의 비율이 크게 다르면 경고 문구 (aspect_ratio_warning 참고)."""
+        return aspect_ratio_warning(self.corners, self.mat_width_mm, self.mat_height_mm)
+
     def reset_corners(self) -> None:
         """'다시 지정': 지금까지 찍은 모서리와 변환 행렬을 지운다."""
         self.corners = []
@@ -322,6 +410,7 @@ class Calibration:
             "mat_width_mm": self.mat_width_mm,
             "mat_height_mm": self.mat_height_mm,
             "filter_outside_mat": self.filter_outside_mat,
+            "auto_detect": self.auto_detect,
             "mat_hsv_lower": list(self.mat_hsv_lower),
             "mat_hsv_upper": list(self.mat_hsv_upper),
             "corners": [list(c) for c in self.corners],

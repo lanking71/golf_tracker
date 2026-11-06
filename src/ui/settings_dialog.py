@@ -36,8 +36,11 @@ from PySide6.QtWidgets import (
 
 from src.calibration import (
     DEFAULT_FILTER_OUTSIDE_MAT,
+    DEFAULT_AUTO_DETECT,
     DEFAULT_MAT_HEIGHT_MM,
     DEFAULT_MAT_WIDTH_MM,
+    MAT_HEIGHT_RANGE_MM,
+    MAT_WIDTH_RANGE_MM,
     Calibration,
 )
 from src.config import load_settings, save_settings
@@ -70,6 +73,8 @@ class SettingsDialog(QDialog):
     protocol_settings_changed = Signal()
     # 렌즈 왜곡 보정 슬라이더를 움직였을 때 (미리보기용, 아직 저장 안 됨). 값 = k1
     lens_k1_preview = Signal(float)
+    # 슬라이더를 놓았거나 저장·취소함 (엔진이 미뤄 둔 '처리 조건 바뀜' 로그를 한 번만 남긴다)
+    lens_k1_preview_finished = Signal()
     # 카메라 화면에 가로·세로 격자선을 그릴지 (직선이 곧은지 보기 쉽게)
     grid_toggled = Signal(bool)
     # 검출된 덩어리의 면적·지름을 카메라 화면에 글자로 보여줄지 (min_area/max_area 맞출 때)
@@ -139,16 +144,22 @@ class SettingsDialog(QDialog):
         size_row = QHBoxLayout()
         size_row.addWidget(QLabel("가로(mm):"))
         self.mat_width_input = QSpinBox()
-        self.mat_width_input.setRange(1, 100000)
+        # 오타(예: 1000을 10000으로)를 줄이려고 현실적인 범위로 제한한다 (가로 500~10000mm)
+        self.mat_width_input.setRange(*MAT_WIDTH_RANGE_MM)
         size_row.addWidget(self.mat_width_input)
         size_row.addWidget(QLabel("세로(mm):"))
         self.mat_height_input = QSpinBox()
-        self.mat_height_input.setRange(1, 100000)
+        self.mat_height_input.setRange(*MAT_HEIGHT_RANGE_MM)  # 세로 300~5000mm
         size_row.addWidget(self.mat_height_input)
         layout.addLayout(size_row)
 
         self.filter_checkbox = QCheckBox("매트 영역 밖에서 검출된 공은 무시")
         layout.addWidget(self.filter_checkbox)
+
+        # 23단계: 녹색 매트 자동 검출은 매트 모양에 따라 틀릴 수 있어 기본은 꺼 둔다.
+        # 켜도 결과를 바로 저장하지 않고 화면에 '제안'으로만 보여준다.
+        self.auto_detect_checkbox = QCheckBox("캘리브레이션 때 녹색 매트 자동 검출 제안 보기")
+        layout.addWidget(self.auto_detect_checkbox)
 
         save_button = QPushButton("매트 설정 저장")
         save_button.setObjectName("primary")
@@ -207,6 +218,8 @@ class SettingsDialog(QDialog):
         self.k1_slider.setSingleStep(1)  # 화살표 키 1칸 = 0.01
         self.k1_slider.setPageStep(5)
         self.k1_slider.valueChanged.connect(self._on_k1_slider_changed)
+        # 슬라이더를 놓으면 '움직이는 중'이 끝났다고 알린다 (로그를 한 번만 남기게)
+        self.k1_slider.sliderReleased.connect(self.lens_k1_preview_finished.emit)
         slider_row.addWidget(self.k1_slider, 1)
         # 현재 값 표시 (예: k1 = -0.12)
         self.k1_value_label = QLabel("k1 = 0.00")
@@ -262,6 +275,7 @@ class SettingsDialog(QDialog):
         calibration = settings.get("calibration", {})
         self.mat_width_input.setValue(calibration.get("mat_width_mm", DEFAULT_MAT_WIDTH_MM))
         self.mat_height_input.setValue(calibration.get("mat_height_mm", DEFAULT_MAT_HEIGHT_MM))
+        self.auto_detect_checkbox.setChecked(bool(calibration.get("auto_detect", DEFAULT_AUTO_DETECT)))
         self.filter_checkbox.setChecked(
             calibration.get("filter_outside_mat", DEFAULT_FILTER_OUTSIDE_MAT)
         )
@@ -406,7 +420,14 @@ class SettingsDialog(QDialog):
         calibration = Calibration()
         calibration.set_mat_size(self.mat_width_input.value(), self.mat_height_input.value())
         calibration.filter_outside_mat = self.filter_checkbox.isChecked()
+        calibration.auto_detect = self.auto_detect_checkbox.isChecked()
         calibration.save()
+
+        # 오타 방지: 이미 찍어 둔 4점 모양과 입력한 크기의 비율이 크게 다르면 알려 준다.
+        # (카메라가 비스듬하면 실제로도 조금 다를 수 있으므로 저장은 그대로 한다)
+        warning = calibration.aspect_warning()
+        if warning:
+            QMessageBox.warning(self, "매트 크기 확인", warning)
 
         self.settings_changed.emit()
 
@@ -456,12 +477,14 @@ class SettingsDialog(QDialog):
         settings.setdefault("camera", {})["undistort_k1"] = k1
         save_settings(settings)
         self._saved_k1 = k1
+        self.lens_k1_preview_finished.emit()
         self.k1_value_label.setText(f"k1 = {k1:+.2f} (저장됨)")
 
     def _on_cancel_lens(self) -> None:
         """'취소': 저장된 값으로 슬라이더와 화면을 되돌린다."""
         self._set_k1_slider(self._saved_k1)
         self.lens_k1_preview.emit(self._saved_k1)
+        self.lens_k1_preview_finished.emit()
 
     def closeEvent(self, event) -> None:
         """저장하지 않고 창을 닫으면 k1 미리보기를 저장된 값으로 되돌린다.

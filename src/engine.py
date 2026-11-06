@@ -58,6 +58,11 @@ DEFAULT_STATS_INTERVAL_S = 10
 # 처리 프레임 크기·왜곡 보정이 바뀌어 저장된 캘리브레이션을 쓸 수 없을 때 알리는 문구
 CALIBRATION_STALE_MESSAGE = "해상도/왜곡 보정이 바뀌어 캘리브레이션을 다시 해야 합니다"
 
+# start_calibration()이 돌려주는 결과 코드 (23단계)
+CALIBRATION_MANUAL = "manual"  # 자동 검출 안 함(기본): 바로 4점 클릭 모드
+CALIBRATION_PROPOSED = "proposed"  # 자동 검출 결과를 '제안'으로 보여줌 (아직 저장 안 됨)
+CALIBRATION_AUTO_FAILED = "auto_failed"  # 자동 검출 실패: 4점 클릭 모드
+
 # register_start()가 돌려주는 결과 코드
 START_OK = "OK"
 START_NO_BALL = "no_ball"  # 공이 검출되지 않음
@@ -126,6 +131,15 @@ class VisionEngine(QObject):
         self._checked_processing: tuple | None = None
         # 캘리브레이션이 무효가 된 이유 문구 (화면이 보여준다). 문제 없으면 None
         self.calibration_warning: str | None = None
+        # 23단계: 수동 캘리브레이션 관련 상태 (화면이 읽어서 보여준다)
+        # - calibration_proposal: 자동 검출이 '제안'한 4점 (auto_detect가 켜져 있을 때만, 확정 전)
+        # - corner_problem: 마지막으로 찍은/옮긴 4점이 왜 거절됐는지 (check_corners의 이유 코드)
+        # - calibration_notice: 저장은 됐지만 확인이 필요한 점 (매트 크기와 찍은 모양의 비율 차이)
+        self.calibration_proposal: list | None = None
+        self.corner_problem: str | None = None
+        self.calibration_notice: str | None = None
+        # 설정창의 k1 슬라이더를 움직이는 중인지 (그동안은 '처리 조건 바뀜' 로그를 남기지 않는다)
+        self._k1_previewing = False
 
         # 앱(메인 컨트롤)과 JSON으로 통신하는 TCP 서버 + 명령 처리기.
         # 서버가 받은 명령을 핸들러가 해석하고, 핸들러는 화면 버튼과 같은
@@ -191,6 +205,8 @@ class VisionEngine(QObject):
         # 시작하자마자 k1·처리 조건 기록 여부만이라도 먼저 검사한다 (예전 설정 파일은 여기서
         # 무효 처리된다). 프레임 크기는 첫 프레임을 받은 뒤 _check_processing_changed에서 검사한다.
         self._validate_calibration()
+        # 저장된 모서리 모양과 매트 크기의 비율이 크게 다르면(크기 오타) 경고를 남긴다.
+        self._update_calibration_notice()
 
     # ------------------------------------------------------------------
     # 시작 / 종료
@@ -217,6 +233,10 @@ class VisionEngine(QObject):
         self._timer.start()
         if self._stats_timer is not None:
             self._stats_timer.start()
+        # 화면(있다면)이 통신 상태 문구 등을 다시 그리게 알린다. 23단계 버그 수정:
+        # 화면은 엔진이 시작되기 전에 만들어지므로, 이 알림이 없으면 서버가 정상적으로
+        # 열렸는데도 처음 그린 "포트 9000 사용 불가" 문구가 그대로 남아 있었다.
+        self.changed.emit()
         return (not server.enabled) or server.is_listening()
 
     def shutdown(self) -> None:
@@ -357,13 +377,18 @@ class VisionEngine(QObject):
             self._validate_calibration()
             return
 
-        logger.info(
-            "처리 조건 바뀜 - 처리 프레임 %dx%d, 왜곡 보정 k1=%.2f",
-            frame_size[0],
-            frame_size[1],
-            self.preprocessor.undistort_k1,
-        )
+        if not self._k1_previewing:
+            # 슬라이더를 움직이는 동안에는 값마다 로그가 쌓이지 않게 남기지 않는다
+            # (슬라이더를 놓거나 저장할 때 end_k1_preview()가 한 번만 남긴다).
+            self._log_processing()
         self._reload_calibration_for_processing()
+
+    def _log_processing(self) -> None:
+        size = self.frame_size
+        size_text = f"{size[0]}x{size[1]}" if size else "첫 프레임 전"
+        logger.info(
+            "처리 조건 바뀜 - 처리 프레임 %s, 왜곡 보정 k1=%.2f", size_text, self.preprocessor.undistort_k1
+        )
 
     def _reload_calibration_for_processing(self) -> None:
         """설정 파일의 캘리브레이션을 다시 불러와 지금 처리 조건과 맞는지 검사한다."""
@@ -419,14 +444,31 @@ class VisionEngine(QObject):
         self.calibration.stamp(frame_size, self.preprocessor.undistort_k1)
         self.calibration.save()
         self.calibration_warning = None
+        self._update_calibration_notice()
 
-    def set_undistort_k1(self, k1: float) -> None:
+    def _update_calibration_notice(self) -> None:
+        """찍은 4점 모양과 매트 크기의 비율이 크게 다르면 calibration_notice에 경고를 남긴다 (저장은 막지 않음)."""
+        notice = self.calibration.aspect_warning() if self.calibration.is_calibrated() else None
+        if notice and notice != self.calibration_notice:
+            logger.warning(notice)
+        self.calibration_notice = notice
+
+    def set_undistort_k1(self, k1: float, preview: bool = False) -> None:
         """렌즈 왜곡 보정 값(k1)을 바로 바꾼다 (설정창 슬라이더의 실시간 미리보기용).
 
         settings.json에는 저장하지 않는다 (설정창의 '저장' 버튼이 따로 저장한다).
         다음 프레임부터 바뀐 값으로 처리되고, 캘리브레이션 검사도 그때 다시 한다.
+        preview=True(슬라이더를 움직이는 중)이면 '처리 조건 바뀜' 로그를 미뤄 둔다.
         """
+        if preview:
+            self._k1_previewing = True
         self.preprocessor.set_undistort_k1(k1)
+
+    def end_k1_preview(self) -> None:
+        """슬라이더를 놓았거나 저장·취소했을 때: 미뤄 둔 '처리 조건 바뀜' 로그를 한 번만 남긴다."""
+        if self._k1_previewing:
+            self._k1_previewing = False
+            self._log_processing()
 
     def set_detection_debug(self, enabled: bool) -> None:
         """검출 디버그 표시(덩어리 면적·지름)를 켜거나 끈다."""
@@ -543,36 +585,109 @@ class VisionEngine(QObject):
     # ------------------------------------------------------------------
     # 화면 버튼과 앱 명령이 함께 쓰는 동작
     # ------------------------------------------------------------------
-    def start_calibration(self) -> bool:
-        """'캘리브레이션' 버튼: 모서리를 지우고 CALIBRATING으로 들어가 자동 검출을 시도한다.
+    def start_calibration(self) -> str:
+        """'캘리브레이션'(또는 '다시 지정') 버튼: 모서리를 모두 지우고 CALIBRATING으로 들어간다.
 
-        성공하면 바로 저장하고 True, 실패하면(매트가 안 보이거나 조명 문제)
-        False를 돌려준다 - 이때는 화면에서 모서리 4점을 직접 클릭하게 된다.
-        다시 눌러도(이미 CALIBRATING이어도) 항상 새로 시작해서, 잘못 찍었을
-        때 같은 버튼으로 '다시 지정'할 수 있다.
+        23단계부터 흐름이 바뀌었다. 예전에는 녹색 매트 자동 검출이 먼저 돌았는데,
+        매트 모양에 따라 틀린 4점으로 '성공'해 버려서(4점이 이미 차 있으니) 클릭이
+        모두 무시되는 문제가 있었다. 그래서:
+        - calibration.auto_detect가 False(기본): 자동 검출 없이 바로 수동 4점 클릭 모드
+          -> CALIBRATION_MANUAL
+        - True: 자동 검출 결과를 저장하지 않고 '제안'(calibration_proposal)으로만 둔다.
+          화면에서 '이 모서리로 확정'(accept_calibration_proposal)을 누르거나, 그냥
+          직접 찍기 시작하면 된다 -> CALIBRATION_PROPOSED
+          검출에 실패하면 수동 모드 -> CALIBRATION_AUTO_FAILED
+        다시 눌러도(이미 CALIBRATING이어도) 항상 새로 시작한다.
         """
         self.calibration.reset_corners()
+        self.calibration_proposal = None
+        self.corner_problem = None
+        self.calibration_notice = None
         self.tracker.calibrate()
-        auto_ok = self.last_raw_frame is not None and self.calibration.auto_calibrate(
-            self.last_raw_frame
-        )
-        if auto_ok:
-            self._save_calibration()
-        return auto_ok
+        if not self.calibration.auto_detect:
+            return CALIBRATION_MANUAL
+        corners = None
+        if self.last_raw_frame is not None:
+            corners = detect_mat_corners(
+                self.last_raw_frame, self.calibration.mat_hsv_lower, self.calibration.mat_hsv_upper
+            )
+        if corners is None:
+            return CALIBRATION_AUTO_FAILED
+        self.calibration_proposal = [tuple(c) for c in corners]
+        return CALIBRATION_PROPOSED
+
+    def accept_calibration_proposal(self) -> bool:
+        """'이 모서리로 확정': 자동 검출 제안을 실제 캘리브레이션으로 적용하고 저장한다."""
+        if self.tracker.state != TrackerState.CALIBRATING or self.calibration_proposal is None:
+            return False
+        proposal = [list(c) for c in self.calibration_proposal]
+        self.calibration_proposal = None  # 확정하든 거절되든 제안은 여기서 끝난다
+        problem = check_corners(proposal, self.frame_size)
+        if problem is not None:
+            # 제안이 화면 밖으로 나가는 등 쓸 수 없는 모양이면 저장하지 않고 수동 모드로 남는다.
+            self.corner_problem = problem
+            return False
+        self.calibration.set_corners(proposal)
+        self._save_calibration()
+        return True
+
+    def reject_calibration_proposal(self) -> None:
+        """'직접 지정': 자동 검출 제안을 버리고 수동 4점 클릭 모드로 간다."""
+        self.calibration_proposal = None
 
     def add_calibration_corner(self, x: int, y: int) -> bool:
-        """화면에서 클릭한 매트 모서리를 등록한다 (CALIBRATING 상태일 때만).
+        """화면에서 클릭한 매트 모서리를 등록한다 (CALIBRATING 상태일 때만). 점이 등록되면 True.
 
-        4번째 점을 찍으면 원근 변환 행렬이 만들어지고 config/settings.json에
-        저장된다 (재실행 시 자동으로 다시 불러온다). 점이 등록되면 True.
+        자동 검출 제안이 떠 있는 상태에서 클릭하면 '직접 지정'으로 보고 제안을 버린다.
+        4번째 점을 찍으면 check_corners()로 검사한다 (볼록한 사각형인지, 좌상→우상→우하→좌하
+        순서인지, 화면 안인지).
+        - 문제가 없으면 원근 변환 행렬을 만들어 config/settings.json에 저장한다.
+        - 문제가 있으면 저장하지 않고 4점을 모두 지운 뒤 False를 돌려준다. 이유 코드는
+          corner_problem에 남는다 (화면이 이유를 보여주고 다시 찍게 한다).
         """
         if self.tracker.state != TrackerState.CALIBRATING:
             return False
+        self.calibration_proposal = None
         if not self.calibration.add_corner(x, y):
-            return False
-        if self.calibration.is_calibrated():
+            return False  # 이미 4점이 다 찍혀 있음 (옮기려면 드래그)
+        self.corner_problem = None
+        if len(self.calibration.corners) == 4:
+            problem = check_corners([list(c) for c in self.calibration.corners], self.frame_size)
+            if problem is not None:
+                logger.info("찍은 모서리 4점이 올바르지 않아 저장하지 않음 (%s) - 다시 찍어야 합니다", problem)
+                self.corner_problem = problem
+                self.calibration.reset_corners()
+                return False
             self._save_calibration()
         return True
+
+    def undo_last_corner(self) -> bool:
+        """화면 오른쪽 클릭: 마지막으로 찍은 점을 취소한다 (CALIBRATING 상태일 때만)."""
+        if self.tracker.state != TrackerState.CALIBRATING:
+            return False
+        self.corner_problem = None
+        self.calibration_notice = None
+        return self.calibration.undo_last_corner()
+
+    def move_calibration_corner(self, index: int, x: int, y: int) -> str | None:
+        """4점을 다 찍은 뒤 점 하나를 드래그해서 옮긴다 (미세 조정).
+
+        옮긴 모양도 check_corners()로 검사해서, 괜찮으면 행렬을 다시 계산하고 저장한다.
+        반환: None = 옮김 / 이유 코드 = 옮기지 않음 ("bad_state", "bad_corners",
+        "corners_out_of_frame")
+        """
+        if self.tracker.state != TrackerState.CALIBRATING or len(self.calibration.corners) != 4:
+            return "bad_state"
+        if not 0 <= index < 4:
+            return "bad_corners"
+        corners = [list(c) for c in self.calibration.corners]
+        corners[index] = [int(x), int(y)]
+        problem = check_corners(corners, self.frame_size)
+        if problem is not None:
+            return problem
+        self.calibration.set_corners(corners)
+        self._save_calibration()
+        return None
 
     # 앱의 ALIGN 명령은 매트 모서리를 얻는 방법이 세 가지다. 셋 모두 같은 규칙을 따른다:
     #   1) 상태·크기를 먼저 확인하고  2) 모서리를 얻고(여기서 실패하면 아무것도 바꾸지 않음)
@@ -653,6 +768,8 @@ class VisionEngine(QObject):
         self.calibration.set_mat_size(*size)
         if corners is not None:
             self.calibration.set_corners(corners)
+        self.calibration_proposal = None
+        self.corner_problem = None
         self._save_calibration()
         self.tracker.calibrate()
 
@@ -812,6 +929,8 @@ class VisionEngine(QObject):
         self.calibration = Calibration()
         # 다시 불러온 캘리브레이션도 지금 처리 조건(프레임 크기·k1)에 맞는지 확인한다.
         self._validate_calibration()
+        # 매트 크기가 바뀌었을 수 있으니 찍어 둔 모양과 비율이 맞는지 다시 본다 (오타 경고)
+        self._update_calibration_notice()
 
 
 def _is_positive_number(value) -> bool:

@@ -41,6 +41,23 @@ QLabel#warning {
     font-weight: bold;
 }
 
+/* 캘리브레이션 안내 띠 (몇 번째 모서리를 찍을지, 거절 이유 등) */
+QLabel#guide {
+    background-color: #D4A017;
+    color: #1B4332;
+    border-radius: 10px;
+    padding: 8px 16px;
+    font-size: 14px;
+    font-weight: bold;
+}
+
+/* 캘리브레이션 돋보기 (카메라 화면 위에 겹쳐 뜨는 확대 창) */
+QLabel#magnifier {
+    border: 2px solid #D4A017;
+    border-radius: 4px;
+    background-color: black;
+}
+
 /* 설정창의 구역 제목 (예: 렌즈 왜곡 보정) */
 QLabel#section {
     font-size: 15px;

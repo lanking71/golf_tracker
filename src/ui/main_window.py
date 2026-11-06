@@ -98,6 +98,7 @@ from src.detector import (
     build_mask,
 )
 from src.engine import (
+    CALIBRATION_AUTO_FAILED,
     SAVE_NO_TRAJECTORY,
     SAVE_NOT_CALIBRATED,
     SAVE_OK,
@@ -179,6 +180,23 @@ OUTSIDE_MAT_MESSAGE = "공이 매트 밖에 있습니다"
 NOT_DETECTED_MESSAGE_DURATION_MS = 1500
 # 녹색 매트 자동 검출에 실패했을 때 보여줄 안내 문구 (이후 4점 클릭으로 진행)
 AUTO_CALIBRATION_FAILED_MESSAGE = "매트 자동 검출 실패 - 모서리 4점을 클릭하세요"
+
+# --- 23단계: 수동 4점 캘리브레이션 ---
+# 4점을 다 찍은 뒤, 화면에서 점과 이 거리(화면 픽셀) 안을 누르면 그 점을 잡아 드래그할 수 있다
+CORNER_DRAG_RADIUS_SCREEN_PX = 15
+# 돋보기: 화면에 보이는 영상을 몇 배로 확대할지, 돋보기 창 크기(px)
+MAGNIFIER_ZOOM = 3
+MAGNIFIER_SIZE = 180
+MAGNIFIER_CROSS_COLOR_BGR = (0, 0, 255)  # 돋보기 가운데 십자선 (빨강)
+# 자동 검출 '제안' 모서리 표시 색 (하늘색 - 확정된 골드 모서리와 구분)
+PROPOSAL_COLOR_BGR = (255, 200, 0)
+# 드래그 중인 점 표시 색 (빨강)
+DRAG_COLOR_BGR = (0, 0, 255)
+# 4점이 거절된 이유 코드 -> 화면에 보여줄 문구
+CORNER_PROBLEM_TEXTS = {
+    "bad_corners": "점 순서(좌상 → 우상 → 우하 → 좌하)나 사각형 모양이 올바르지 않습니다",
+    "corners_out_of_frame": "화면 밖에 찍힌 점이 있습니다",
+}
 
 # 매트 영역 밖에서 검출됐지만 무시된 공 표시 색 (경고색)
 OUTSIDE_MAT_DETECTION_COLOR_BGR = (0, 100, 255)  # 주황빛 빨강
@@ -264,6 +282,13 @@ class MainWindow(QMainWindow):
         self.warning_label.hide()
         root_layout.addWidget(self.warning_label)
 
+        # 1-2) 캘리브레이션 안내 띠: CALIBRATING 상태에서만 보인다 (몇 번째 점을 어디에 찍을지 등)
+        self.guide_label = QLabel("")
+        self.guide_label.setObjectName("guide")
+        self.guide_label.setWordWrap(True)
+        self.guide_label.hide()
+        root_layout.addWidget(self.guide_label)
+
         # 2) 본문: 왼쪽(카메라/궤적) + 오른쪽(버튼들)을 가로로 배치
         body_layout = QHBoxLayout()
         body_layout.setSpacing(12)
@@ -273,6 +298,23 @@ class MainWindow(QMainWindow):
         body_layout.addLayout(self._build_right_panel(), 1)
 
         self.camera_label.clicked.connect(self._on_camera_clicked)
+        self.camera_label.dragged.connect(self._on_camera_dragged)
+        self.camera_label.released.connect(self._on_camera_released)
+        self.camera_label.right_clicked.connect(self._on_camera_right_clicked)
+        self.camera_label.hovered.connect(self._on_camera_hovered)
+        self.camera_label.left.connect(self._on_camera_left)
+
+        # 돋보기: 카메라 화면 위에 겹쳐 띄우는 작은 창 (캘리브레이션 중 마우스 주변을 확대)
+        self.magnifier = QLabel(self.camera_label)
+        self.magnifier.setObjectName("magnifier")
+        self.magnifier.setFixedSize(MAGNIFIER_SIZE, MAGNIFIER_SIZE)
+        self.magnifier.hide()
+        # 마우스가 가리키는 프레임 좌표 / 드래그로 옮기는 중인 점 (번호, 위치)
+        self._hover_point: tuple[int, int] | None = None
+        self._drag_index: int | None = None
+        self._drag_point: tuple[int, int] | None = None
+        # 마지막으로 화면에 그린 프레임 (돋보기가 이걸 확대한다)
+        self._last_drawn_frame = None
 
         # 전체 창에 QSS 스타일 적용
         self.setStyleSheet(QSS)
@@ -411,6 +453,22 @@ class MainWindow(QMainWindow):
             layout.addWidget(button)
             self._buttons[name] = button
 
+        # 23단계: 캘리브레이션 중에만 보이는 버튼들 (상태 전환이 아니라 모서리 지정 보조 동작)
+        #   - 이 모서리로 확정 / 직접 지정: 자동 검출 '제안'이 떠 있을 때만
+        #   - 다시 지정: 찍은 점을 모두 지우고 처음부터 (캘리브레이션 버튼을 다시 누르는 것과 같음)
+        self._calibration_buttons: dict[str, QPushButton] = {}
+        for name, handler in (
+            ("이 모서리로 확정", self._accept_proposal),
+            ("직접 지정", self._reject_proposal),
+            ("다시 지정", self._restart_calibration),
+        ):
+            button = QPushButton(name)
+            button.clicked.connect(lambda _checked=False, h=handler: h())
+            button.hide()
+            layout.addWidget(button)
+            self._calibration_buttons[name] = button
+        self._calibration_buttons["이 모서리로 확정"].setObjectName("primary")
+
         # 버튼들을 위쪽으로 붙이고 아래는 빈 공간으로 남김
         layout.addStretch(1)
         return layout
@@ -428,10 +486,10 @@ class MainWindow(QMainWindow):
         else:
             action = BUTTON_ACTIONS.get(button_name)
             if action == "calibrate":
-                # 엔진이 모서리를 지우고 녹색 매트 자동 검출을 시도한다. 성공하면
-                # 바로 저장하고, 실패하면(매트가 안 보이거나 조명 문제) 기존처럼
-                # 4점 클릭 모드로 남는다. 다시 눌러도 항상 새로 시작한다.
-                auto_ok = self.engine.start_calibration()
+                # 엔진이 모서리를 지우고 4점 클릭 모드로 들어간다 (23단계부터 기본은 수동).
+                # 자동 검출을 켜 둔 경우에는 결과를 '제안'으로만 보여주고 저장하지 않는다.
+                # 다시 눌러도 항상 새로 시작한다.
+                auto_ok = self.engine.start_calibration() != CALIBRATION_AUTO_FAILED
             elif action == "start_tracking":
                 self.engine.start_tracking()
             elif action is not None:
@@ -447,13 +505,156 @@ class MainWindow(QMainWindow):
         self._render_trajectory_panel()
 
     def _on_camera_clicked(self, x: int, y: int) -> None:
-        """카메라 화면 클릭. CALIBRATING 상태일 때만 매트 모서리로 등록한다.
+        """카메라 화면 왼쪽 클릭. CALIBRATING 상태일 때만 쓴다.
 
-        4번째 점을 찍으면 원근 변환 행렬이 자동으로 만들어지고
-        config/settings.json에 저장된다 (재실행 시 자동으로 다시 불러온다).
+        - 4점을 다 찍은 상태: 점 근처를 누르면 그 점을 '잡는다' (드래그로 옮기기 시작)
+        - 아직 4점 미만: 매트 모서리로 등록한다. 4번째 점을 찍으면 엔진이 모양을 검사해서
+          괜찮으면 원근 변환 행렬을 만들어 저장하고, 이상하면 저장하지 않고 이유를 남긴다.
         """
-        if self.engine.add_calibration_corner(x, y):
-            self._update_status_badge()
+        if self.tracker.state != TrackerState.CALIBRATING:
+            return
+        if len(self.calibration.corners) == 4:
+            scale = self.camera_label.display_scale() or 1.0
+            index = self.calibration.nearest_corner(x, y, CORNER_DRAG_RADIUS_SCREEN_PX * scale)
+            if index is not None:
+                self._drag_index = index
+                self._drag_point = (x, y)
+            return
+        self.engine.add_calibration_corner(x, y)
+        self._after_calibration_edit()
+
+    def _on_camera_dragged(self, x: int, y: int) -> None:
+        """점을 잡은 채 움직이는 중: 화면에만 새 위치를 보여준다 (놓을 때 저장)."""
+        if self._drag_index is not None:
+            self._drag_point = (x, y)
+
+    def _on_camera_released(self, x: int, y: int) -> None:
+        """잡은 점을 놓음: 엔진이 새 위치를 검사하고, 괜찮으면 행렬을 다시 계산해 저장한다."""
+        if self._drag_index is None:
+            return
+        index = self._drag_index
+        self._drag_index = None
+        self._drag_point = None
+        problem = self.engine.move_calibration_corner(index, x, y)
+        self.engine.corner_problem = problem if problem in CORNER_PROBLEM_TEXTS else None
+        self._after_calibration_edit()
+
+    def _on_camera_right_clicked(self) -> None:
+        """오른쪽 클릭: 마지막으로 찍은 점을 취소한다."""
+        self._drag_index = None
+        self._drag_point = None
+        if self.engine.undo_last_corner():
+            self._after_calibration_edit()
+
+    def _on_camera_hovered(self, x: int, y: int) -> None:
+        self._hover_point = (x, y)
+        self._update_magnifier()
+
+    def _on_camera_left(self) -> None:
+        self._hover_point = None
+        self.magnifier.hide()
+
+    def _accept_proposal(self) -> None:
+        """'이 모서리로 확정': 자동 검출 제안을 저장한다."""
+        self.engine.accept_calibration_proposal()
+        self._after_calibration_edit()
+
+    def _reject_proposal(self) -> None:
+        """'직접 지정': 제안을 버리고 4점을 직접 찍는다."""
+        self.engine.reject_calibration_proposal()
+        self._after_calibration_edit()
+
+    def _restart_calibration(self) -> None:
+        """'다시 지정': 찍은 점을 모두 지우고 처음부터 (캘리브레이션 버튼과 같음)."""
+        self._on_button_clicked("캘리브레이션")
+
+    def _after_calibration_edit(self) -> None:
+        """모서리를 찍거나 고친 뒤 상태 배지·안내 띠·경고 띠·궤적 패널을 다시 맞춘다."""
+        self._update_status_badge()
+        self._update_calibration_guide()
+        self._update_warning_label()
+        self._render_trajectory_panel()
+
+    def _update_calibration_guide(self) -> None:
+        """캘리브레이션 안내 띠와 보조 버튼(확정/직접 지정/다시 지정)을 지금 상태에 맞게 보여준다."""
+        calibrating = self.tracker.state == TrackerState.CALIBRATING
+        has_proposal = calibrating and self.engine.calibration_proposal is not None
+        self._calibration_buttons["이 모서리로 확정"].setVisible(has_proposal)
+        self._calibration_buttons["직접 지정"].setVisible(has_proposal)
+        self._calibration_buttons["다시 지정"].setVisible(calibrating)
+        if not calibrating:
+            if not self.guide_label.isHidden():
+                self.guide_label.hide()
+            self.magnifier.hide()
+            return
+
+        count = len(self.calibration.corners)
+        size_text = f"{self.calibration.mat_width_mm:g}x{self.calibration.mat_height_mm:g}mm"
+        if has_proposal:
+            text = (
+                "자동 검출 제안(하늘색 선)을 확인하세요. 맞으면 '이 모서리로 확정', "
+                "아니면 '직접 지정'을 누르거나 바로 모서리를 클릭하세요."
+            )
+        elif count < 4:
+            text = (
+                f"좌상 → 우상 → 우하 → 좌하 순서로 실제 측정 영역({size_text})의 모서리를 클릭하세요 "
+                f"({count}/4) · 오른쪽 클릭: 마지막 점 취소"
+            )
+        else:
+            text = (
+                "4점 완료·저장됨 - 점을 드래그해 미세 조정할 수 있습니다 · 오른쪽 클릭: 마지막 점 취소 · "
+                "다음 단계: '시작 위치 등록'"
+            )
+        problem = self.engine.corner_problem
+        if problem:
+            text = f"저장하지 않음: {CORNER_PROBLEM_TEXTS.get(problem, problem)}. 다시 찍어 주세요.\n" + text
+        if self.guide_label.text() != text:
+            self.guide_label.setText(text)
+        if self.guide_label.isHidden():
+            self.guide_label.show()
+
+    def _update_magnifier(self) -> None:
+        """캘리브레이션 중 마우스 주변을 확대해서 돋보기 창에 보여준다 (모서리를 정확히 찍기 위해).
+
+        화면에 보이는 영상 기준 MAGNIFIER_ZOOM배로 보이도록, 처리 프레임에서 작은 사각형을
+        잘라 돋보기 크기로 키운다. 가운데 빨간 십자선이 지금 클릭될 위치다.
+        """
+        point = self._drag_point or self._hover_point
+        frame = self._last_drawn_frame
+        scale = self.camera_label.display_scale()
+        if self.tracker.state != TrackerState.CALIBRATING or point is None or frame is None or not scale:
+            self.magnifier.hide()
+            return
+        # 돋보기 창 한 변이 프레임에서 몇 픽셀에 해당하는지 (화면 배율 x 확대 배율로 나눔)
+        half = max(4, int(MAGNIFIER_SIZE * scale / MAGNIFIER_ZOOM / 2))
+        x, y = point
+        # 가장자리에서도 크기가 일정하도록 테두리를 검은색으로 채운 뒤 자른다
+        padded = cv2.copyMakeBorder(frame, half, half, half, half, cv2.BORDER_CONSTANT, value=(0, 0, 0))
+        crop = padded[y : y + 2 * half, x : x + 2 * half]
+        zoomed = cv2.resize(crop, (MAGNIFIER_SIZE, MAGNIFIER_SIZE), interpolation=cv2.INTER_NEAREST)
+        center = MAGNIFIER_SIZE // 2
+        cv2.line(zoomed, (center, 0), (center, MAGNIFIER_SIZE), MAGNIFIER_CROSS_COLOR_BGR, 1)
+        cv2.line(zoomed, (0, center), (MAGNIFIER_SIZE, center), MAGNIFIER_CROSS_COLOR_BGR, 1)
+        rgb = cv2.cvtColor(zoomed, cv2.COLOR_BGR2RGB)
+        image = QImage(rgb.data, MAGNIFIER_SIZE, MAGNIFIER_SIZE, 3 * MAGNIFIER_SIZE, QImage.Format_RGB888).copy()
+        self.magnifier.setPixmap(QPixmap.fromImage(image))
+
+        # 돋보기 창은 마우스 오른쪽 아래에 띄우고, 화면 밖으로 나가면 반대편으로 옮긴다
+        label_point = self.camera_label.to_label_point(point)
+        if label_point is None:
+            self.magnifier.hide()
+            return
+        offset = 24
+        mx = int(label_point[0]) + offset
+        my = int(label_point[1]) + offset
+        if mx + MAGNIFIER_SIZE > self.camera_label.width():
+            mx = int(label_point[0]) - offset - MAGNIFIER_SIZE
+        if my + MAGNIFIER_SIZE > self.camera_label.height():
+            my = int(label_point[1]) - offset - MAGNIFIER_SIZE
+        self.magnifier.move(max(0, mx), max(0, my))
+        if self.magnifier.isHidden():
+            self.magnifier.show()
+        self.magnifier.raise_()
 
     def _register_start_position(self) -> None:
         """엔진에게 검출된 공의 현재 좌표를 시작점으로 등록하게 한다.
@@ -598,7 +799,11 @@ class MainWindow(QMainWindow):
                 self._on_protocol_settings_changed
             )
             # 렌즈 왜곡 보정 슬라이더: 엔진의 전처리 값을 바로 바꿔 카메라 영상에 반영 (미리보기)
-            self.settings_dialog.lens_k1_preview.connect(self.engine.set_undistort_k1)
+            # preview=True: 슬라이더를 움직이는 동안은 '처리 조건 바뀜' 로그를 쌓지 않는다
+            self.settings_dialog.lens_k1_preview.connect(
+                lambda k1: self.engine.set_undistort_k1(k1, preview=True)
+            )
+            self.settings_dialog.lens_k1_preview_finished.connect(self.engine.end_k1_preview)
             self.settings_dialog.grid_toggled.connect(self._on_grid_toggled)
             self.settings_dialog.detection_debug_toggled.connect(self.engine.set_detection_debug)
         else:
@@ -670,15 +875,28 @@ class MainWindow(QMainWindow):
         if self.tracker.start_position is not None:
             self._draw_start_point(frame, self.tracker.start_position)
 
+        corners = list(self.calibration.corners)
+        if self._drag_index is not None and self._drag_point is not None and len(corners) == 4:
+            # 드래그 중인 점은 아직 저장 전이지만 새 위치로 미리 보여준다
+            corners[self._drag_index] = self._drag_point
         if self.tracker.state == TrackerState.CALIBRATING:
-            self._draw_calibration_corners(frame, self.calibration.corners)
+            if self.engine.calibration_proposal is not None:
+                self._draw_proposal(frame, self.engine.calibration_proposal)
+            self._draw_calibration_corners(frame, corners)
+            if self._drag_index is not None and self._drag_point is not None:
+                cv2.circle(frame, self._drag_point, CALIBRATION_POINT_RADIUS + 4, DRAG_COLOR_BGR, 2)
         if self.calibration.is_calibrated():
             # 4점을 다 찍은 직후(아직 CALIBRATING 상태일 때)도 매트 영역이
             # 바로 확인되도록, 두 그리기를 동시에 할 수 있게 elif가 아닌 if로 둔다.
-            self._draw_mat_outline(frame, self.calibration.corners)
+            self._draw_mat_outline(frame, corners)
 
         self._update_fps()
         self._update_warning_label()
+        self._update_calibration_guide()
+        # 돋보기는 그림(모서리 점 등)이 그려진 프레임을 확대한다
+        self._last_drawn_frame = frame
+        if self._hover_point is not None or self._drag_point is not None:
+            self._update_magnifier()
         pixmap = self._frame_to_pixmap(frame, self.camera_label.size())
         self.camera_label.setPixmap(pixmap)
 
@@ -735,6 +953,24 @@ class MainWindow(QMainWindow):
         cv2.circle(frame, position, START_POINT_RING_RADIUS, START_POINT_COLOR_BGR, START_POINT_THICKNESS)
 
     @staticmethod
+    def _draw_proposal(frame, corners: list) -> None:
+        """자동 검출 '제안' 모서리를 하늘색 선과 번호로 그린다 (아직 저장 전)."""
+        points = np.array(corners, dtype=np.int32)
+        cv2.polylines(frame, [points], isClosed=True, color=PROPOSAL_COLOR_BGR, thickness=2)
+        for i, (x, y) in enumerate(corners, start=1):
+            cv2.circle(frame, (int(x), int(y)), CALIBRATION_POINT_RADIUS, PROPOSAL_COLOR_BGR, 2)
+            cv2.putText(
+                frame,
+                f"{i}?",
+                (int(x) + 10, int(y) + 24),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                CALIBRATION_FONT_SCALE,
+                PROPOSAL_COLOR_BGR,
+                CALIBRATION_FONT_THICKNESS,
+                cv2.LINE_AA,
+            )
+
+    @staticmethod
     def _draw_calibration_corners(frame, corners: list) -> None:
         """캘리브레이션 중 클릭한 매트 모서리를 골드 점 + 번호로 그린다. (frame을 그 자리에서 수정)"""
         for i, (x, y) in enumerate(corners, start=1):
@@ -786,10 +1022,19 @@ class MainWindow(QMainWindow):
         self._show_grid = bool(enabled)
 
     def _update_warning_label(self, *_args) -> None:
-        """엔진에 캘리브레이션 경고가 있으면 경고 띠를 보여주고, 없으면 숨긴다."""
+        """엔진에 캘리브레이션 경고가 있으면 경고 띠를 보여주고, 없으면 숨긴다.
+
+        - calibration_warning: 처리 조건이 바뀌어 캘리브레이션이 무효가 됨 (다시 해야 함)
+        - calibration_notice: 매트 크기와 찍은 모양의 비율이 크게 다름 (크기 오타일 수 있음)
+        """
         warning = self.engine.calibration_warning
+        notice = self.engine.calibration_notice
+        text = ""
         if warning:
             text = f"{warning} - '캘리브레이션' 버튼을 눌러 다시 지정하세요"
+        elif notice:
+            text = notice
+        if text:
             if self.warning_label.text() != text:
                 self.warning_label.setText(text)
             if self.warning_label.isHidden():
@@ -1050,6 +1295,9 @@ class MainWindow(QMainWindow):
 
     def _refresh_after_engine_change(self) -> None:
         """앱 명령 등으로 엔진 상태가 바뀌었을 때, 버튼을 눌렀을 때와 같게 화면을 갱신한다."""
+        # 엔진이 시작될 때도 이 알림이 온다 -> 통신 상태 문구("포트 사용 불가" 등)도 다시 맞춘다
+        self._update_app_label()
+        self._update_calibration_guide()
         self._update_status_badge()
         self._update_button_states()
         self._update_start_point_label()
