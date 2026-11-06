@@ -37,6 +37,7 @@ from src.camera import Camera
 from src.config import load_settings, save_settings
 from src.detector import DEFAULT_DETECTION_SETTINGS, BallDetection, BallDetector
 from src.lens import FramePreprocessor
+from src.search import SearchPlan, SearchPlanner
 from src.protocol_handler import ProtocolHandler
 from src.protocol_server import ProtocolServer
 from src.stats import compute_trajectory_stats
@@ -89,6 +90,8 @@ class FrameResult:
     paused: bool = False
     # 검출 디버그 표시가 켜져 있을 때만 채워지는 덩어리 목록 (DetectionCandidate). 면적 측정용
     candidates: list | None = None
+    # 이번 프레임의 검색 영역 (24단계, src/search.py). 디버그 표시 때 화면에 그린다
+    search_plan: SearchPlan | None = None
 
 
 class VisionEngine(QObject):
@@ -124,6 +127,10 @@ class VisionEngine(QObject):
         self.tracker = Tracker()
         self.calibration = Calibration()
         self.storage = Storage()
+        # 24단계: 공을 화면 전체가 아니라 '있을 만한 곳' 주변에서만 찾는다 (src/search.py)
+        self.search = SearchPlanner(load_settings().get("search"))
+        # 검색 영역을 넓혀 찾았지만 진행 방향·거리가 맞지 않아 버린 후보 수 (로그용)
+        self.rejected_candidates = 0
 
         # 처리 프레임 크기 (폭, 높이). 첫 프레임을 받기 전에는 모른다(None).
         self.frame_size: tuple[int, int] | None = None
@@ -175,6 +182,9 @@ class VisionEngine(QObject):
         self._stats_proc_total = 0.0
         self._stats_proc_max = 0.0
         self._stats_pre_total = 0.0  # 그중 전처리(축소·왜곡 보정)에 걸린 시간 합계
+        self._stats_detect_total = 0.0  # 그중 공 검출에 걸린 시간 합계 (24단계)
+        self._stats_roi_ratio_total = 0.0  # 검색 영역 넓이 / 화면 넓이 합계 (전체 검색 = 1.0)
+        self._stats_detect_frames = 0
         self._proc_started = 0.0
 
         # 가장 최근 프레임의 정보 (앱 명령 처리와 화면이 읽어 간다)
@@ -309,8 +319,20 @@ class VisionEngine(QObject):
             return True
 
         # 공 검출 (못 찾아도 예외 없이 None만 돌아온다)
+        # 24단계: 상태에 맞는 검색 영역(시작점·예상 위치 주변) 안에서만 찾는다.
+        plan = self._plan_search(now)
         self.detector.debug_enabled = self.detection_debug
-        raw_detection = self.detector.detect(frame)
+        detect_started = time.perf_counter()
+        raw_detection = self.detector.detect(frame, roi=plan.roi, prefer=plan.center)
+        self._stats_detect_total += time.perf_counter() - detect_started
+        self._stats_detect_frames += 1
+        self._stats_roi_ratio_total += _roi_ratio(plan.roi, self.frame_size)
+        if raw_detection is not None and not self.search.accept(plan, raw_detection.x, raw_detection.y):
+            # 공을 놓쳐서 넓힌 영역에서 찾았는데, 공이 가던 방향·거리와 맞지 않는 후보는 버린다
+            # (엉뚱한 물체를 공으로 잡지 않기 위해서)
+            self.rejected_candidates += 1
+            logger.debug("검색 후보 버림 (%d, %d): 예상 진행 방향·거리와 맞지 않음", raw_detection.x, raw_detection.y)
+            raw_detection = None
         detection = raw_detection
         outside_mat = False
         if (
@@ -326,6 +348,8 @@ class VisionEngine(QObject):
             detection = None
         self.last_detection = detection
         self.last_detection_outside_mat = outside_mat
+        # 검색 계획에 이번 결과(공 위치 또는 못 찾음)를 알려 준다 -> 다음 프레임의 예상 위치·속도
+        self.search.observe((detection.x, detection.y) if detection is not None else None, now)
 
         was_armed = self.tracker.state == TrackerState.ARMED
         if detection is not None:
@@ -352,9 +376,32 @@ class VisionEngine(QObject):
 
         candidates = list(self.detector.last_candidates) if self.detection_debug else None
         self.frame_processed.emit(
-            FrameResult(frame, detection, raw_detection, outside_mat, now, candidates=candidates)
+            FrameResult(
+                frame, detection, raw_detection, outside_mat, now, candidates=candidates, search_plan=plan
+            )
         )
         return True
+
+    def _plan_search(self, now: float) -> SearchPlan:
+        """지금 상태(시작점, 어드레스, 추적 중 예상 위치)에 맞는 검색 영역을 정한다 (src/search.py)."""
+        addr_px = None
+        addr_mm = self.protocol_handler.addr_mm
+        if addr_mm is not None:
+            addr_px = self.calibration.real_to_pixel(*addr_mm)
+
+        def to_px_radius(center, radius_mm, default_px):
+            # 매트 위 mm 반경 -> 그 위치 근처의 픽셀 반경. 캘리브레이션이 없으면 픽셀 기본값.
+            radius = self.calibration.mm_radius_to_px(center, radius_mm)
+            return radius if radius is not None else default_px
+
+        return self.search.plan(
+            self.tracker.state,
+            self.tracker.start_position,
+            addr_px,
+            self.frame_size,
+            now,
+            to_px_radius,
+        )
 
     # ------------------------------------------------------------------
     # 처리 조건(프레임 크기·왜곡 보정)과 캘리브레이션
@@ -556,17 +603,28 @@ class VisionEngine(QObject):
             "max_ms": self._stats_proc_max * 1000,
             # 처리 시간 중 전처리(축소·왜곡 보정)가 차지한 평균 시간
             "pre_avg_ms": (self._stats_pre_total / frames * 1000) if frames else 0.0,
+            # 24단계: 공 검출 시간과 검색 영역 크기 (화면 대비 %, 전체 검색이면 100%)
+            "detect_avg_ms": (
+                self._stats_detect_total / self._stats_detect_frames * 1000 if self._stats_detect_frames else 0.0
+            ),
+            "roi_avg_pct": (
+                self._stats_roi_ratio_total / self._stats_detect_frames * 100 if self._stats_detect_frames else 0.0
+            ),
             "errors": self.error_count,
         }
         frame_text = f"{self.frame_size[0]}x{self.frame_size[1]}" if self.frame_size else "-"
         logger.info(
             "상태 요약 - FPS %.1f, 처리 시간(프레임을 받은 뒤 전처리~전송) 평균 %.1fms 최대 %.1fms "
-            "(그중 전처리 평균 %.1fms), 처리 프레임 %s (scale %.2f, k1 %.2f), "
+            "(그중 전처리 평균 %.1fms, 공 검출 평균 %.1fms, 검색 영역 평균 화면의 %.0f%%%s), "
+            "처리 프레임 %s (scale %.2f, k1 %.2f), "
             "카메라 %s, 접속 %d대, 상태 %s, 오류 %d번",
             summary["fps"],
             summary["avg_ms"],
             summary["max_ms"],
             summary["pre_avg_ms"],
+            summary["detect_avg_ms"],
+            summary["roi_avg_pct"],
+            "" if self.search.enabled else " - 검색 영역 제한 꺼짐",
             frame_text,
             self.preprocessor.process_scale,
             self.preprocessor.undistort_k1,
@@ -580,6 +638,9 @@ class VisionEngine(QObject):
         self._stats_proc_total = 0.0
         self._stats_proc_max = 0.0
         self._stats_pre_total = 0.0
+        self._stats_detect_total = 0.0
+        self._stats_roi_ratio_total = 0.0
+        self._stats_detect_frames = 0
         return summary
 
     # ------------------------------------------------------------------
@@ -925,12 +986,22 @@ class VisionEngine(QObject):
     def reload_settings(self) -> None:
         """프로필·매트 설정이 바뀌었을 때 검출기와 캘리브레이션을 새로 불러온다."""
         self.reload_detector()
+        # 검색 영역 설정도 다시 읽는다 (search.enabled 등)
+        self.search = SearchPlanner(load_settings().get("search"))
         # 핸들러는 항상 engine.calibration을 통해 접근하므로 따로 맞출 필요가 없다.
         self.calibration = Calibration()
         # 다시 불러온 캘리브레이션도 지금 처리 조건(프레임 크기·k1)에 맞는지 확인한다.
         self._validate_calibration()
         # 매트 크기가 바뀌었을 수 있으니 찍어 둔 모양과 비율이 맞는지 다시 본다 (오타 경고)
         self._update_calibration_notice()
+
+
+def _roi_ratio(roi, frame_size) -> float:
+    """검색 영역 넓이가 화면 넓이의 몇 배인지 (전체 검색 = 1.0). 로그의 '검색 영역 평균' 계산용."""
+    if roi is None or not frame_size:
+        return 1.0
+    total = frame_size[0] * frame_size[1]
+    return (roi[2] * roi[3]) / total if total else 1.0
 
 
 def _is_positive_number(value) -> bool:

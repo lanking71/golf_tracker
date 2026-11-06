@@ -12,6 +12,15 @@ config/settings.json의 "detection" 항목에서 읽어온다.
 
 공을 못 찾은 경우(조명 문제, 공이 화면 밖으로 나감 등)에도
 예외를 던지지 않고 조용히 None을 반환한다.
+
+24단계 추가:
+- detect(frame, roi, prefer): 화면 전체가 아니라 검색 영역(roi) 안에서만 찾을 수 있다.
+  결과 좌표는 항상 프레임 전체 기준이다. prefer(예상 위치)를 주면 조건을 통과한 후보 중
+  그 위치에 가장 가까운 것을 고른다 (흰 컵처럼 더 둥근 다른 물체보다 '공이 있을 곳'을 우선).
+- Hue 범위가 빨강 경계(179 -> 0)를 넘을 수 있다: hsv_lower의 H가 hsv_upper의 H보다 크면
+  [H최소 ~ 179] + [0 ~ H최대] 두 구간을 함께 본다 (분홍·빨강 공).
+- 클릭으로 공 색 자동 추출: sample_ball_pixels() -> color_range_from_pixels() ->
+  evaluate_color_range() -> auto_color_range()
 """
 
 from dataclasses import dataclass
@@ -108,6 +117,38 @@ class DetectionCandidate:
     accepted: bool  # 면적·원형도 조건을 모두 통과했는지
 
 
+def blurred_hsv(frame: np.ndarray) -> np.ndarray:
+    """블러를 먼저 적용한 뒤 HSV로 바꾼다 (검출과 색 추출이 같은 값을 보도록 함께 쓴다).
+
+    인조잔디(퍼팅 매트) 표면의 잔털 노이즈를 줄이기 위해 블러를 먼저 적용한다.
+    """
+    blurred = cv2.GaussianBlur(frame, BLUR_KERNEL_SIZE, 0)
+    return cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
+
+
+def hsv_in_range(hsv: np.ndarray, hsv_lower, hsv_upper) -> np.ndarray:
+    """HSV 영상에서 범위 안 픽셀만 흰색(255)인 마스크를 만든다.
+
+    Hue가 빨강 경계를 넘는 경우: hsv_lower의 H > hsv_upper의 H 이면 (예: 170 ~ 8)
+    [170 ~ 179]와 [0 ~ 8] 두 구간을 따로 검사해서 합친다. OpenCV의 inRange는
+    한 구간만 받기 때문이다. (예전 설정처럼 H최소 <= H최대이면 한 구간 그대로)
+    """
+    h_low, h_high = int(hsv_lower[0]), int(hsv_upper[0])
+    if h_low <= h_high:
+        return cv2.inRange(hsv, np.array(hsv_lower, dtype=np.uint8), np.array(hsv_upper, dtype=np.uint8))
+    first = cv2.inRange(
+        hsv,
+        np.array([h_low, hsv_lower[1], hsv_lower[2]], dtype=np.uint8),
+        np.array([179, hsv_upper[1], hsv_upper[2]], dtype=np.uint8),
+    )
+    second = cv2.inRange(
+        hsv,
+        np.array([0, hsv_lower[1], hsv_lower[2]], dtype=np.uint8),
+        np.array([h_high, hsv_upper[1], hsv_upper[2]], dtype=np.uint8),
+    )
+    return cv2.bitwise_or(first, second)
+
+
 def build_mask(frame: np.ndarray, hsv_lower, hsv_upper) -> np.ndarray:
     """프레임과 HSV 범위로 이진 마스크(흰색=범위 안, 검은색=범위 밖)를 만든다.
 
@@ -115,14 +156,8 @@ def build_mask(frame: np.ndarray, hsv_lower, hsv_upper) -> np.ndarray:
     이 함수를 함께 사용한다. 그래야 튜닝 화면에서 흰색으로 보이는
     영역이 실제 검출에 쓰이는 마스크와 항상 똑같다.
     """
-    lower = np.array(hsv_lower, dtype=np.uint8)
-    upper = np.array(hsv_upper, dtype=np.uint8)
-
-    # 인조잔디(퍼팅 매트) 표면의 잔털 노이즈를 줄이기 위해 블러 먼저 적용
-    blurred = cv2.GaussianBlur(frame, BLUR_KERNEL_SIZE, 0)
-    hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
-
-    mask = cv2.inRange(hsv, lower, upper)
+    hsv = blurred_hsv(frame)
+    mask = hsv_in_range(hsv, hsv_lower, hsv_upper)
     kernel = np.ones(MORPH_KERNEL_SIZE, np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
@@ -151,31 +186,48 @@ class BallDetector:
         profiles = self._settings["profiles"]
         return profiles.get(name, DEFAULT_DETECTION_SETTINGS["profiles"]["practice"])
 
-    def detect(self, frame: np.ndarray) -> BallDetection | None:
+    def detect(self, frame: np.ndarray, roi=None, prefer=None) -> BallDetection | None:
         """프레임에서 공을 하나 찾는다.
+
+        roi: (x, y, 폭, 높이) - 이 사각형 안에서만 찾는다 (None이면 화면 전체).
+             폭이나 높이가 0이면 아무 데도 찾지 않는다 (None).
+             영역만 잘라서 블러·HSV 변환·마스크를 만들므로 영역이 작을수록 빠르다.
+        prefer: (x, y) - 조건을 통과한 후보가 여럿이면 이 위치에 가장 가까운 것을 고른다.
+             None이면 예전처럼 가장 원형에 가까운 것을 고른다.
+        결과 좌표는 roi를 썼더라도 항상 프레임 전체 기준이다.
 
         찾지 못했거나 처리 중 어떤 문제가 생겨도 예외를 던지지 않고
         조용히 None을 반환한다. (호출하는 UI 쪽이 죽지 않게)
         """
         try:
-            return self._detect(frame)
+            return self._detect(frame, roi, prefer)
         except Exception:
             # HSV 설정값이 잘못됐거나 프레임 형식이 예상과 달라도
             # 검출 실패로만 처리하고 프로그램은 계속 돌아가야 한다.
             return None
 
-    def _detect(self, frame: np.ndarray) -> BallDetection | None:
+    def _detect(self, frame: np.ndarray, roi=None, prefer=None) -> BallDetection | None:
         profile = self._active_profile()
+        offset = (0, 0)
+        if roi is not None:
+            x, y, w, h = (int(v) for v in roi)
+            if w <= 0 or h <= 0:
+                self.last_candidates = []
+                return None  # 찾을 곳이 없음
+            frame = frame[y : y + h, x : x + w]
+            offset = (x, y)
         mask = build_mask(frame, profile["hsv_lower"], profile["hsv_upper"])
 
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        # offset을 주면 윤곽선 좌표가 잘라낸 영역이 아니라 프레임 전체 기준으로 나온다.
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE, offset=offset)
         if self.debug_enabled:
             self.last_candidates = self._collect_candidates(contours, profile)
         if not contours:
             return None
 
-        # 3) 후보 중 면적이 적절하고 가장 원형에 가까운 것 하나만 선택
-        best_contour = self._pick_best_contour(contours, profile)
+        # 후보 중 면적·원형도 조건을 통과한 것 하나만 선택
+        # (prefer가 있으면 그 위치에 가장 가까운 것, 없으면 가장 원형에 가까운 것)
+        best_contour = self._pick_best_contour(contours, profile, prefer)
         if best_contour is None:
             return None
 
@@ -207,13 +259,14 @@ class BallDetector:
         return candidates
 
     @staticmethod
-    def _pick_best_contour(contours, profile: dict):
+    def _pick_best_contour(contours, profile: dict, prefer=None):
         min_area = profile.get("min_area", DEFAULT_MIN_AREA)
         max_area = profile.get("max_area", DEFAULT_MAX_AREA)
         min_circularity = profile.get("min_circularity", DEFAULT_MIN_CIRCULARITY)
 
         best_contour = None
         best_circularity = 0.0
+        best_distance = float("inf")
 
         for contour in contours:
             area = cv2.contourArea(contour)
@@ -229,8 +282,253 @@ class BallDetector:
             if circularity < min_circularity:
                 continue
 
-            if circularity > best_circularity:
+            if prefer is not None:
+                # 예상 위치에 가장 가까운 후보를 고른다
+                (cx, cy), _radius = cv2.minEnclosingCircle(contour)
+                distance = (cx - prefer[0]) ** 2 + (cy - prefer[1]) ** 2
+                if distance < best_distance:
+                    best_distance = distance
+                    best_contour = contour
+            elif circularity > best_circularity:
                 best_circularity = circularity
                 best_contour = contour
 
         return best_contour
+
+
+# ======================================================================
+# 24단계: 화면에서 공을 클릭해 색(HSV 범위) 자동 추출
+# ======================================================================
+# 클릭 지점 주변에서 공 픽셀을 찾을 범위(px, 처리 프레임 기준)
+SAMPLE_RADIUS_PX = 30
+# 채도(S) 중앙값이 이보다 낮으면 '흰색 계열'로 보고 Hue(색상)는 전체(0~179)를 허용한다.
+# 흰 공은 색이 거의 없어서 Hue 값이 잡음처럼 제멋대로이기 때문이다.
+LOW_SATURATION = 40
+# 클릭 지점 색과 '비슷하다'고 볼 차이 (공 모양을 얻을 때)
+#   흰색 계열: 밝기(V) 차이, 채도(S)는 클릭 지점보다 이만큼 높아도 됨
+#   색이 있는 공: Hue 차이(원형 거리), 채도·밝기 차이
+SIMILAR_V_LOW_SAT = 45
+SIMILAR_S_LOW_SAT = 35
+SIMILAR_H = 12
+SIMILAR_S = 70
+SIMILAR_V = 80
+# 범위를 만들 때 쓰는 백분위수 (양 끝 2%는 잡음으로 보고 버림)
+PERCENTILE_LOW = 2
+PERCENTILE_HIGH = 98
+# 범위에 더하는 여유값 (H, S, V). 조명 차이를 견디게 넓히는 값이다.
+# 다른 덩어리가 많이 걸리면 이 여유에 아래 배율을 차례로 곱해 줄여 가며 다시 시도한다.
+COLOR_MARGIN = (8, 40, 40)
+MARGIN_SCALES = (1.0, 0.75, 0.5, 0.25, 0.0)
+# min_area / max_area 제안 = 공 면적 x 이 배율
+SUGGEST_MIN_AREA_RATIO = 0.4
+SUGGEST_MAX_AREA_RATIO = 2.5
+# 여유를 줄이다가 공 모양이 망가지면 안 된다: 공 덩어리의 원형도가 이 값 미만이거나,
+# 면적이 기본 여유(1.0)일 때의 이 비율 미만이 되는 범위는 고르지 않는다.
+MIN_PICK_CIRCULARITY = 0.75
+MIN_PICK_AREA_KEEP = 0.6
+
+
+@dataclass
+class ColorSample:
+    """공을 한 번 클릭해서 얻은 샘플."""
+
+    point: tuple[int, int]  # 클릭한 위치 (처리 프레임 좌표)
+    pixels: np.ndarray  # 공으로 판단한 픽셀들의 HSV 값 (N x 3)
+    area: int  # 공으로 판단한 픽셀 수
+
+
+@dataclass
+class ColorRangeResult:
+    """추출한 색 범위와 시험 적용 결과."""
+
+    hsv_lower: list
+    hsv_upper: list
+    margin_scale: float  # 쓰인 여유값 배율 (1.0 = 기본 여유)
+    ball_found: bool  # 마지막으로 클릭한 위치에서 공 덩어리를 찾았는지
+    ball_area: float
+    ball_diameter: float
+    ball_circularity: float
+    other_blobs: int  # 공 말고 '공처럼 보이는' 다른 덩어리 수 (매트 위만, 매트를 모르면 화면 전체)
+    suggested_min_area: int
+    suggested_max_area: int
+
+
+def sample_ball_pixels(frame: np.ndarray, point, radius: int = SAMPLE_RADIUS_PX) -> ColorSample | None:
+    """클릭 지점 주변에서 '클릭 지점과 색·밝기가 비슷하고 이어져 있는' 영역을 공으로 보고 픽셀을 모은다.
+
+    단순히 원으로 자르면 공 바깥의 매트 픽셀이 섞여서 범위가 엉뚱하게 넓어진다.
+    그래서 클릭 지점 색과 비슷한 픽셀만 고른 마스크를 만들고, 그중 클릭 지점과
+    붙어 있는 덩어리(연결 영역) 하나만 쓴다. 클릭 지점이 영상 밖이면 None.
+    """
+    height, width = frame.shape[:2]
+    px, py = int(point[0]), int(point[1])
+    if not (0 <= px < width and 0 <= py < height):
+        return None
+    x0, y0 = max(0, px - radius), max(0, py - radius)
+    x1, y1 = min(width, px + radius + 1), min(height, py + radius + 1)
+    # 검출(build_mask)과 같은 블러를 거친 HSV 값을 봐야 범위가 실제 검출과 맞는다
+    hsv = blurred_hsv(frame[y0:y1, x0:x1]).astype(np.int32)
+    cx, cy = px - x0, py - y0
+    # 클릭 지점 3x3의 중앙값을 기준 색으로 쓴다 (한 픽셀만 보면 잡음에 흔들림)
+    seed = np.median(hsv[max(0, cy - 1) : cy + 2, max(0, cx - 1) : cx + 2].reshape(-1, 3), axis=0)
+    h, s, v = hsv[..., 0], hsv[..., 1], hsv[..., 2]
+    if seed[1] < LOW_SATURATION:
+        similar = (np.abs(v - seed[2]) <= SIMILAR_V_LOW_SAT) & (s <= seed[1] + SIMILAR_S_LOW_SAT)
+    else:
+        hue_diff = np.abs(h - seed[0])
+        hue_diff = np.minimum(hue_diff, 180 - hue_diff)  # Hue는 원형(179 다음이 0)
+        similar = (
+            (hue_diff <= SIMILAR_H) & (np.abs(s - seed[1]) <= SIMILAR_S) & (np.abs(v - seed[2]) <= SIMILAR_V)
+        )
+    mask = similar.astype(np.uint8)
+    _count, labels = cv2.connectedComponents(mask)
+    label = labels[cy, cx]
+    if label == 0:
+        return None
+    region = labels == label
+    pixels = hsv[region].astype(np.uint8)
+    return ColorSample((px, py), pixels, int(region.sum()))
+
+
+def color_range_from_pixels(pixels: np.ndarray, margin_scale: float = 1.0) -> tuple[list, list]:
+    """공 픽셀들의 HSV 분포로 범위(lower, upper)를 만든다.
+
+    각 값의 2%~98% 백분위수에 여유값(COLOR_MARGIN x margin_scale)을 더한다.
+    - 채도 중앙값이 낮으면(흰 공) Hue는 의미가 없으니 0~179 전체를 허용한다.
+    - Hue는 원형이라 공 색이 빨강 경계(0/179) 근처면 범위가 경계를 넘을 수 있다.
+      이때는 lower H > upper H로 돌려준다 (예: 172 ~ 6). hsv_in_range가 두 구간으로 처리한다.
+    """
+    h = pixels[:, 0].astype(np.float64)
+    s = pixels[:, 1].astype(np.float64)
+    v = pixels[:, 2].astype(np.float64)
+    mh, ms, mv = (m * margin_scale for m in COLOR_MARGIN)
+
+    s_low = int(max(0, np.percentile(s, PERCENTILE_LOW) - ms))
+    s_high = int(min(255, np.percentile(s, PERCENTILE_HIGH) + ms))
+    v_low = int(max(0, np.percentile(v, PERCENTILE_LOW) - mv))
+    v_high = int(min(255, np.percentile(v, PERCENTILE_HIGH) + mv))
+
+    if np.median(s) < LOW_SATURATION:
+        return [0, s_low, v_low], [179, s_high, v_high]
+
+    # Hue 원형 평균을 구해서, 평균이 90이 되도록 돌린 뒤(경계를 피함) 백분위수를 잰다.
+    angles = h * (2 * np.pi / 180)
+    mean = (np.degrees(np.arctan2(np.sin(angles).mean(), np.cos(angles).mean())) / 2) % 180
+    shifted = (h - mean + 90) % 180
+    low = np.percentile(shifted, PERCENTILE_LOW) - mh
+    high = np.percentile(shifted, PERCENTILE_HIGH) + mh
+    if high - low >= 179:
+        return [0, s_low, v_low], [179, s_high, v_high]
+    h_low = int(round(low + mean - 90)) % 180
+    h_high = int(round(high + mean - 90)) % 180
+    return [h_low, s_low, v_low], [h_high, s_high, v_high]
+
+
+def evaluate_color_range(frame: np.ndarray, lower, upper, ball_point, mat_corners=None) -> dict:
+    """추출한 범위를 프레임 전체에 시험 적용한다.
+
+    반환: ball_found, ball_area, ball_diameter, ball_circularity, other_blobs
+    - 공 덩어리: 클릭 위치를 포함하는(또는 가장 가까운, 공 반경 안) 덩어리
+    - other_blobs: 공 덩어리 말고, 실제로 공으로 잘못 잡힐 수 있는 덩어리 수.
+      즉 제안 면적 범위(공 면적의 0.4~2.5배) 안이고 원형도가 기본 기준(0.7) 이상인 것만 센다.
+      (흩어진 잔털 점이나 길쭉한 물체는 어차피 공 조건에서 걸러지므로 세지 않는다)
+      mat_corners(매트 4점)가 있으면 매트 안에 있는 것만 센다.
+    """
+    mask = build_mask(frame, lower, upper)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    ball = None
+    best_distance = float("inf")
+    for contour in contours:
+        inside = cv2.pointPolygonTest(contour, (float(ball_point[0]), float(ball_point[1])), True)
+        distance = 0.0 if inside >= 0 else -inside
+        if distance < best_distance:
+            best_distance, ball = distance, contour
+    result = {"ball_found": False, "ball_area": 0.0, "ball_diameter": 0.0, "ball_circularity": 0.0, "other_blobs": 0}
+    if ball is not None and best_distance <= SAMPLE_RADIUS_PX / 2:
+        area = cv2.contourArea(ball)
+        perimeter = cv2.arcLength(ball, True)
+        (_x, _y), radius = cv2.minEnclosingCircle(ball)
+        result.update(
+            ball_found=area > 0,
+            ball_area=float(area),
+            ball_diameter=float(2 * radius),
+            ball_circularity=float(4 * np.pi * area / (perimeter * perimeter)) if perimeter else 0.0,
+        )
+    else:
+        ball = None
+    ball_area = result["ball_area"]
+    min_other = max(10.0, SUGGEST_MIN_AREA_RATIO * ball_area)
+    max_other = SUGGEST_MAX_AREA_RATIO * ball_area if ball_area > 0 else float("inf")
+    mat = np.array(mat_corners, dtype=np.int32) if mat_corners is not None and len(mat_corners) == 4 else None
+    others = 0
+    for contour in contours:
+        if contour is ball:
+            continue
+        area = cv2.contourArea(contour)
+        if not min_other <= area <= max_other:
+            continue
+        perimeter = cv2.arcLength(contour, True)
+        if not perimeter or 4 * np.pi * area / (perimeter * perimeter) < DEFAULT_MIN_CIRCULARITY:
+            continue
+        if mat is not None:
+            (cx, cy), _r = cv2.minEnclosingCircle(contour)
+            if cv2.pointPolygonTest(mat, (float(cx), float(cy)), False) < 0:
+                continue
+        others += 1
+    result["other_blobs"] = others
+    return result
+
+
+def auto_color_range(frame: np.ndarray, samples: list, mat_corners=None) -> ColorRangeResult | None:
+    """샘플들(여러 번 클릭한 것 합침)로 범위를 만들고, 다른 덩어리가 적은 범위를 고른다.
+
+    여유값을 기본(1.0)부터 차례로 줄여 가며(MARGIN_SCALES) 시험한다.
+    - 마지막 클릭 위치에서 공이 잡히고 다른 덩어리가 0개인 첫 범위를 고른다.
+    - 그런 범위가 없으면 공이 잡히는 범위 중 다른 덩어리가 가장 적은 것을 고른다
+      (같으면 여유가 큰 쪽 = 조명 변화에 강한 쪽).
+    시험은 지금 프레임(마지막 샘플을 찍은 화면)에서 한다.
+    """
+    if not samples:
+        return None
+    pixels = np.concatenate([sample.pixels for sample in samples], axis=0)
+    point = samples[-1].point
+    best = None
+    best_key = None
+    reference_area = None  # 기본 여유(첫 단계)일 때의 공 면적
+    for scale in MARGIN_SCALES:
+        lower, upper = color_range_from_pixels(pixels, scale)
+        report = evaluate_color_range(frame, lower, upper, point, mat_corners)
+        if not report["ball_found"]:
+            continue
+        if reference_area is None:
+            reference_area = report["ball_area"]
+        elif (
+            report["ball_circularity"] < MIN_PICK_CIRCULARITY
+            or report["ball_area"] < reference_area * MIN_PICK_AREA_KEEP
+        ):
+            # 여유를 너무 줄여 공 모양이 깎임 -> 더 줄여 봐야 나빠지기만 하므로 멈춘다
+            break
+        key = (report["other_blobs"], -scale)
+        if best_key is None or key < best_key:
+            best_key, best = key, (scale, lower, upper, report)
+        if report["other_blobs"] == 0:
+            break
+    if best is None:
+        # 어떤 여유로도 공 덩어리가 안 잡힘 (공이 너무 작거나 클릭 위치가 공이 아님): 기본 여유 범위라도 돌려준다
+        lower, upper = color_range_from_pixels(pixels, MARGIN_SCALES[0])
+        report = evaluate_color_range(frame, lower, upper, point, mat_corners)
+        best = (MARGIN_SCALES[0], lower, upper, report)
+    scale, lower, upper, report = best
+    area = report["ball_area"]
+    return ColorRangeResult(
+        hsv_lower=lower,
+        hsv_upper=upper,
+        margin_scale=scale,
+        ball_found=report["ball_found"],
+        ball_area=area,
+        ball_diameter=report["ball_diameter"],
+        ball_circularity=report["ball_circularity"],
+        other_blobs=report["other_blobs"],
+        suggested_min_area=int(round(area * SUGGEST_MIN_AREA_RATIO)),
+        suggested_max_area=int(round(area * SUGGEST_MAX_AREA_RATIO)),
+    )

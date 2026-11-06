@@ -34,6 +34,8 @@ class FakeCamera:
     def __init__(self, ball=(500, 400), show_mat=True):
         self.ball = ball  # (x, y) 픽셀 좌표, None이면 공이 없는 화면
         self.show_mat = show_mat  # False면 매트가 안 보이는 화면
+        # 공과 똑같이 생긴 다른 물체(예: 흰 컵 역할)의 위치 목록. 24단계 검색 영역 테스트용
+        self.decoys: list[tuple[int, int]] = []
         self.available = True  # False로 바꾸면 카메라가 끊긴 것처럼 동작한다
         self.open_calls = 0  # open()이 불린 횟수 (재연결 시도 간격을 확인하는 데 쓴다)
         self._opened = False
@@ -55,6 +57,8 @@ class FakeCamera:
             cv2.fillPoly(frame, [np.array(MAT_CORNERS, np.int32)], MAT_COLOR_BGR)
         if self.ball is not None:
             cv2.circle(frame, self.ball, BALL_RADIUS, BALL_COLOR_BGR, -1)
+        for decoy in self.decoys:
+            cv2.circle(frame, decoy, BALL_RADIUS, BALL_COLOR_BGR, -1)
         return frame
 
     def release(self) -> None:
@@ -98,6 +102,9 @@ def make_test_settings(tmp_dir: str, **overrides) -> mock._patch:
             "mat_height_mm": 2000,
             "filter_outside_mat": True,
         },
+        # 24단계 검색 영역: 가짜 영상은 4500mm 매트가 약 900px라 1mm = 약 0.2px다 (실제 현장의
+        # 약 절반). 테스트 공은 한 프레임에 20~60px씩 크게 움직이므로 반경을 넉넉히 잡는다.
+        "search": {"enabled": True, "idle_radius_mm": 600, "track_radius_mm": 500, "lost_frames_full": 10},
         # 테스트에서는 실제 통신 포트를 열지 않는다
         "protocol": {"enabled": False, "port": 9000, "status_hz": 30},
         "storage": {"db_path": str(Path(tmp_dir) / "results.db")},

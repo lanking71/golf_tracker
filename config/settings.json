@@ -69,6 +69,12 @@
         "stop_duration": 1.0,
         "lost_duration": 2.0
     },
+    "search": {
+        "enabled": true,
+        "idle_radius_mm": 150,
+        "track_radius_mm": 120,
+        "lost_frames_full": 10
+    },
     "calibration": {
         "mat_width_mm": 3000,
         "mat_height_mm": 1000,

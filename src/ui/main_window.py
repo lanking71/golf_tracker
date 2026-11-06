@@ -73,6 +73,7 @@ TRACKING 중 매 프레임 Tracker.update_detection()을 호출해 정지·이�
 좌표 배지만 "-"로 표시한다.
 """
 
+import logging
 import time
 
 import cv2
@@ -93,6 +94,8 @@ from PySide6.QtWidgets import (
 from src.calibration import CORNER_NAMES
 from src.config import load_settings, save_settings
 from src.detector import (
+    auto_color_range,
+    sample_ball_pixels,
     DEFAULT_DETECTION_SETTINGS,
     BallDetection,
     build_mask,
@@ -192,6 +195,14 @@ MAGNIFIER_CROSS_COLOR_BGR = (0, 0, 255)  # 돋보기 가운데 십자선 (빨강
 PROPOSAL_COLOR_BGR = (255, 200, 0)
 # 드래그 중인 점 표시 색 (빨강)
 DRAG_COLOR_BGR = (0, 0, 255)
+logger = logging.getLogger("ui")
+
+# 24단계: 화면에서 공을 클릭해 색 잡기 - 안내 띠 문구
+COLOR_PICK_GUIDE_TEXT = "색 추출: 공의 가운데를 클릭하세요 (돋보기로 정확히) · 오른쪽 클릭: 취소"
+# 24단계: 검색 영역(ROI) 표시 색 (디버그 표시를 켰을 때만 그린다)
+SEARCH_AREA_COLOR_BGR = (0, 200, 255)  # 주황
+SEARCH_AREA_LOST_COLOR_BGR = (0, 0, 255)  # 공을 놓쳐 넓힌 상태는 빨강
+
 # 캘리브레이션 안내 띠 높이(px). 숨겨져 있어도 이 높이만큼 자리를 비워 둔다 (화면 크기 고정용)
 GUIDE_LABEL_HEIGHT = 64
 # 4점이 거절된 이유 코드 -> 화면에 보여줄 문구
@@ -325,6 +336,10 @@ class MainWindow(QMainWindow):
         self._drag_point: tuple[int, int] | None = None
         # 마지막으로 화면에 그린 프레임 (돋보기가 이걸 확대한다)
         self._last_drawn_frame = None
+        # 24단계: 색 추출 모드 (검출 설정 창의 "화면에서 공 클릭해 색 잡기")
+        self._pick_mode = False
+        self._pick_add = False  # True면 '추가 샘플' (이전 샘플과 합침)
+        self._color_samples: list = []
 
         # 전체 창에 QSS 스타일 적용
         self.setStyleSheet(QSS)
@@ -521,6 +536,9 @@ class MainWindow(QMainWindow):
         - 아직 4점 미만: 매트 모서리로 등록한다. 4번째 점을 찍으면 엔진이 모양을 검사해서
           괜찮으면 원근 변환 행렬을 만들어 저장하고, 이상하면 저장하지 않고 이유를 남긴다.
         """
+        if self._pick_mode:
+            self._pick_color_at(x, y)
+            return
         if self.tracker.state != TrackerState.CALIBRATING:
             return
         if len(self.calibration.corners) == 4:
@@ -550,7 +568,10 @@ class MainWindow(QMainWindow):
         self._after_calibration_edit()
 
     def _on_camera_right_clicked(self) -> None:
-        """오른쪽 클릭: 마지막으로 찍은 점을 취소한다."""
+        """오른쪽 클릭: 마지막으로 찍은 점을 취소한다 (색 추출 모드에서는 색 추출 취소)."""
+        if self._pick_mode:
+            self._cancel_color_pick()
+            return
         self._drag_index = None
         self._drag_point = None
         if self.engine.undo_last_corner():
@@ -592,6 +613,13 @@ class MainWindow(QMainWindow):
         self._calibration_buttons["이 모서리로 확정"].setVisible(has_proposal)
         self._calibration_buttons["직접 지정"].setVisible(has_proposal)
         self._calibration_buttons["다시 지정"].setVisible(calibrating)
+        if self._pick_mode:
+            # 색 추출 모드 안내가 캘리브레이션 안내보다 먼저다
+            if self.guide_label.text() != COLOR_PICK_GUIDE_TEXT:
+                self.guide_label.setText(COLOR_PICK_GUIDE_TEXT)
+            if self.guide_label.isHidden():
+                self.guide_label.show()
+            return
         if not calibrating:
             if not self.guide_label.isHidden():
                 self.guide_label.hide()
@@ -632,7 +660,8 @@ class MainWindow(QMainWindow):
         point = self._drag_point or self._hover_point
         frame = self._last_drawn_frame
         scale = self.camera_label.display_scale()
-        if self.tracker.state != TrackerState.CALIBRATING or point is None or frame is None or not scale:
+        magnifier_on = self.tracker.state == TrackerState.CALIBRATING or self._pick_mode
+        if not magnifier_on or point is None or frame is None or not scale:
             self.magnifier.hide()
             return
         # 돋보기 창 한 변이 프레임에서 몇 픽셀에 해당하는지 (화면 배율 x 확대 배율로 나눔)
@@ -767,6 +796,7 @@ class MainWindow(QMainWindow):
             self.tuning_dialog.values_changed.connect(self._on_tuning_values_changed)
             self.tuning_dialog.saved.connect(self._on_tuning_profile_saved)
             self.tuning_dialog.finished.connect(self._on_tuning_dialog_closed)
+            self.tuning_dialog.pick_requested.connect(self._start_color_pick)
         else:
             self.tuning_dialog.refresh_profiles(profiles, active_profile)
 
@@ -783,9 +813,66 @@ class MainWindow(QMainWindow):
         self.engine.detection_paused = True
 
     def _on_tuning_dialog_closed(self) -> None:
-        """튜닝 창이 닫히면 마스크 미리보기를 끄고 엔진의 검출을 다시 켠다."""
+        """튜닝 창이 닫히면 마스크 미리보기·색 추출 모드를 끄고 엔진의 검출을 다시 켠다."""
         self._preview_hsv = None
+        self._pick_mode = False
         self.engine.detection_paused = False
+        self._update_calibration_guide()
+
+    # ------------------------------------------------------------------
+    # 24단계: 화면에서 공을 클릭해 색(HSV 범위) 잡기
+    # ------------------------------------------------------------------
+    def _start_color_pick(self, add: bool) -> None:
+        """색 추출 모드로 들어간다. 카메라 화면에 마스크 대신 영상을 보여주고 공 클릭을 기다린다."""
+        self._pick_mode = True
+        self._pick_add = add
+        # 검출을 멈추고 프레임만 받는다 (튜닝 미리보기와 같음)
+        self.engine.detection_paused = True
+        if self.tuning_dialog is not None:
+            self.tuning_dialog.set_picking(True)
+        self._update_calibration_guide()
+
+    def _cancel_color_pick(self) -> None:
+        self._pick_mode = False
+        if self.tuning_dialog is not None:
+            self.tuning_dialog.set_picking(False)
+        if self._preview_hsv is None:
+            self.engine.detection_paused = False
+        self._update_calibration_guide()
+
+    def _pick_color_at(self, x: int, y: int) -> None:
+        """색 추출 모드에서 공을 클릭함: 주변 공 픽셀로 범위를 만들어 튜닝 창에 채운다 (저장은 아직)."""
+        frame = self.engine.last_raw_frame
+        self._pick_mode = False
+        self._update_calibration_guide()
+        if frame is None or self.tuning_dialog is None:
+            return
+        sample = sample_ball_pixels(frame, (x, y))
+        if sample is None:
+            self.tuning_dialog.apply_color_result(None, len(self._color_samples))
+            return
+        if not self._pick_add:
+            self._color_samples = []
+        self._color_samples.append(sample)
+        corners = self.calibration.corners if len(self.calibration.corners) == 4 else None
+        result = auto_color_range(frame, self._color_samples, corners)
+        if result is not None:
+            logger.info(
+                "공 색 추출 (샘플 %d개): HSV %s ~ %s (여유 x%g), 공 %s 면적 %.0fpx² 지름 %.1fpx 원형도 %.2f, "
+                "매트 위 다른 덩어리 %d개, 면적 제안 %d ~ %d",
+                len(self._color_samples),
+                result.hsv_lower,
+                result.hsv_upper,
+                result.margin_scale,
+                "찾음" if result.ball_found else "못 찾음",
+                result.ball_area,
+                result.ball_diameter,
+                result.ball_circularity,
+                result.other_blobs,
+                result.suggested_min_area,
+                result.suggested_max_area,
+            )
+        self.tuning_dialog.apply_color_result(result, len(self._color_samples))
 
     def _on_tuning_profile_saved(self, key: str, profile: dict) -> None:
         """'저장'을 누르면 config/settings.json에 반영하고 검출기를 새로 만든다."""
@@ -858,6 +945,16 @@ class MainWindow(QMainWindow):
             self.camera_label.set_frame_size(self._frame_size)
             self._render_trajectory_panel()
 
+        if result.paused and self._pick_mode:
+            # 색 추출 모드: 마스크 대신 실제 영상을 보여줘야 공을 보고 클릭할 수 있다
+            self.coord_label.setText("좌표: -")
+            self._update_fps()
+            self._last_drawn_frame = raw_frame
+            if self._hover_point is not None:
+                self._update_magnifier()
+            self.camera_label.setPixmap(self._frame_to_pixmap(raw_frame, self.camera_label.size()))
+            return
+
         if result.paused and self._preview_hsv is not None:
             # 튜닝 중에는 원본 대신 마스크(검출 영역이 흰색)를 보여준다.
             lower, upper = self._preview_hsv
@@ -875,6 +972,8 @@ class MainWindow(QMainWindow):
             # 격자선은 가장 먼저(맨 아래에) 그려서 공·모서리 표시를 가리지 않게 한다
             self._draw_grid(frame)
         if result.candidates is not None:
+            # 디버그 표시를 켰을 때만: 이번 프레임의 검색 영역(24단계)과 덩어리 정보
+            self._draw_search_area(frame, result.search_plan)
             self._draw_debug_candidates(frame, result.candidates)
         if result.detection is not None:
             self._draw_detection(frame, result.detection)
@@ -1027,6 +1126,24 @@ class MainWindow(QMainWindow):
                 DEBUG_FONT_THICKNESS,
                 cv2.LINE_AA,
             )
+
+    @staticmethod
+    def _draw_search_area(frame, plan) -> None:
+        """검색 영역(ROI)을 얇은 사각형 + 원으로 그린다. 전체 검색이면 왼쪽 위에 글자로만 알린다."""
+        if plan is None:
+            return
+        color = SEARCH_AREA_LOST_COLOR_BGR if plan.widened else SEARCH_AREA_COLOR_BGR
+        if plan.roi is not None:
+            x, y, w, h = plan.roi
+            if w > 0 and h > 0:
+                cv2.rectangle(frame, (x, y), (x + w - 1, y + h - 1), color, 1)
+        if plan.center is not None and plan.radius is not None:
+            center = (int(plan.center[0]), int(plan.center[1]))
+            cv2.circle(frame, center, int(plan.radius), color, 1)
+            cv2.drawMarker(frame, center, color, cv2.MARKER_CROSS, 10, 1)
+        # OpenCV 글꼴은 한글을 못 쓰므로 영문으로 표시한다:
+        # full = 전체, start = 시작점 주변, addr = 어드레스 주변, track = 예상 위치, lost = 놓쳐서 넓힘
+        cv2.putText(frame, f"ROI: {plan.reason}", (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA)
 
     def _on_grid_toggled(self, enabled: bool) -> None:
         self._show_grid = bool(enabled)

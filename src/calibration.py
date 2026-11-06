@@ -392,6 +392,36 @@ class Calibration:
         transformed = cv2.perspectiveTransform(point, self.matrix.astype(np.float32))
         return float(transformed[0][0][0]), float(transformed[0][0][1])
 
+    def real_to_pixel(self, x_mm: float, y_mm: float) -> tuple[float, float] | None:
+        """매트 위 mm 좌표를 화면 픽셀 좌표로 바꾼다 (pixel_to_real의 반대). 캘리브레이션 전이면 None."""
+        if self.matrix is None:
+            return None
+        inverse = np.linalg.inv(self.matrix)
+        point = np.array([[[x_mm, y_mm]]], dtype=np.float64)
+        transformed = cv2.perspectiveTransform(point, inverse)
+        return float(transformed[0][0][0]), float(transformed[0][0][1])
+
+    def mm_radius_to_px(self, pixel_point, radius_mm: float) -> float | None:
+        """화면의 어떤 위치 근처에서 '매트 위 radius_mm'가 몇 픽셀인지 구한다 (24단계 검색 반경용).
+
+        원근(카메라가 비스듬함) 때문에 화면 위치마다 1mm가 몇 픽셀인지 다르다. 그래서 그 위치를
+        mm로 바꾼 뒤, 상하좌우로 radius_mm만큼 떨어진 네 점을 다시 픽셀로 바꿔서 가장 먼 거리를 쓴다.
+        캘리브레이션 전이면 None (부르는 쪽이 픽셀 기본값을 쓴다).
+        """
+        if self.matrix is None:
+            return None
+        center_mm = self.pixel_to_real(pixel_point[0], pixel_point[1])
+        if center_mm is None:
+            return None
+        cx, cy = center_mm
+        r = float(radius_mm)
+        points = np.array(
+            [[[cx + r, cy], [cx - r, cy], [cx, cy + r], [cx, cy - r]]], dtype=np.float64
+        )
+        pixels = cv2.perspectiveTransform(points, np.linalg.inv(self.matrix))[0]
+        distances = np.hypot(pixels[:, 0] - pixel_point[0], pixels[:, 1] - pixel_point[1])
+        return float(distances.max())
+
     def is_inside(self, x: int, y: int) -> bool:
         """(x, y)가 캘리브레이션된 매트 영역(모서리 4점 사각형) 안에 있는지 확인한다.
 

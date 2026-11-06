@@ -183,6 +183,11 @@ class ProtocolHandler:
         logger.info("명령 거절: %s -> NG (%s)", cmd, reason)
         self._respond({"cmd": cmd, "result": "NG", "reason": reason})
 
+    @property
+    def addr_mm(self) -> tuple[float, float] | None:
+        """앱이 SET_ADDR로 정한 어드레스 위치(mm). 없으면 None. (엔진이 공 검색 영역을 정할 때 쓴다)"""
+        return self._addr_mm
+
     def on_client_connected(self, client) -> None:
         """새 앱이 접속했을 때: 인사(HELLO)와 현재 상태(STATUS)를 그 앱에만 보낸다.
 
