@@ -79,6 +79,8 @@ class SettingsDialog(QDialog):
     grid_toggled = Signal(bool)
     # 검출된 덩어리의 면적·지름을 카메라 화면에 글자로 보여줄지 (min_area/max_area 맞출 때)
     detection_debug_toggled = Signal(bool)
+    # 26단계: '자동 흐름' 체크박스를 바꿨을 때 (켬/끔)
+    auto_toggled = Signal(bool)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -231,9 +233,14 @@ class SettingsDialog(QDialog):
         self.grid_checkbox.toggled.connect(self.grid_toggled.emit)
         layout.addWidget(self.grid_checkbox)
 
-        self.debug_checkbox = QCheckBox("검출 디버그 표시 (공 면적·지름)")
+        self.debug_checkbox = QCheckBox("검출 디버그 표시 (면적·비율·고정 물체·검색 영역)")
         self.debug_checkbox.toggled.connect(self.detection_debug_toggled.emit)
         layout.addWidget(self.debug_checkbox)
+
+        # 26단계: 자동 흐름. 바꾸는 즉시 적용되고 config/settings.json의 auto.enabled에 저장된다
+        self.auto_checkbox = QCheckBox("자동 흐름 (버튼 없이 공을 시작 구역에 놓고 퍼팅)")
+        self.auto_checkbox.toggled.connect(self.auto_toggled.emit)
+        layout.addWidget(self.auto_checkbox)
 
         button_row = QHBoxLayout()
         button_row.setSpacing(12)

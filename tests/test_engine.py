@@ -144,7 +144,12 @@ class StartPositionTests(EngineTestCase):
     def test_register_start_outside_mat(self):
         self.step()
         self.engine.align_auto(4500, 2000)
+        # 26단계: 캘리브레이션 후에는 매트 영역만 찾으므로, 매트에서 멀리 떨어진 공은 아예 안 보인다
         self.step(ball=(1200, 100))  # 매트 밖
+        self.assertEqual(self.engine.register_start(), START_NO_BALL)
+        # 검색 영역 제한을 끄면 예전처럼 화면 전체를 찾아서 '매트 밖이라 무시'로 알려 준다
+        self.engine.search.enabled = False
+        self.step()
         self.assertEqual(self.engine.register_start(), START_OUTSIDE_MAT)
         self.assertTrue(self.frames[-1].outside_mat)
         self.assertIsNotNone(self.frames[-1].raw_detection)

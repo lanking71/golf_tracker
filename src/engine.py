@@ -32,6 +32,13 @@
   지켜보고, 계속 같은 자리에 있던 공 색 물체를 기억한다. 그 자리의 후보는 공으로 보지 않는다.
 - 홀인: 공이 홀컵 근처에서 사라지면 Tracker가 "홀인"으로 끝낸다. 컵 근처인지는 _hole_at이 mm로 판단.
 - 이동 기준(추적 시작·궤적 기록·점프)을 mm로: Tracker에 _mm_to_px를 넣어 준다.
+
+26단계 추가:
+- 자동 흐름 (src/auto_flow.py): 버튼 없이 "공 놓기 → 퍼팅 → 결과 → 공 다시 놓기". 판단은 AutoFlow가 하고
+  엔진은 그 결과대로 상태를 바꾸고 앱에 알린다 (_auto_step, _check_readdress).
+- 컵 테두리에 붙어 멈춘 공: 홀인 확인 중 컵 자리 덩어리가 '컵 + 공 반 개' 이상으로 커지고 컵 밖으로
+  튀어나오면 홀인이 아니라 정지로 끝낸다 (_check_ball_at_rim).
+- 캘리브레이션이 있으면 '화면 전체' 검색도 매트 영역(모서리 4점을 감싸는 사각형 + 여유)만 찾는다 (_mat_roi).
 """
 
 import logging
@@ -47,7 +54,8 @@ from src.camera import Camera
 from src.config import load_settings, save_settings
 from src.detector import DEFAULT_DETECTION_SETTINGS, BallDetection, BallDetector, ball_settings
 from src.lens import FramePreprocessor
-from src.search import SearchPlan, SearchPlanner
+from src.search import EMPTY_ROI, SearchPlan, SearchPlanner, _square_roi
+from src.auto_flow import ACTION_ARM, ACTION_DROP, ACTION_READY, AutoFlow
 from src.static_objects import (
     MIN_OBJECT_AREA_PX,
     MIN_OBJECT_AREA_RATIO,
@@ -62,7 +70,7 @@ from src.protocol_handler import ProtocolHandler
 from src.protocol_server import ProtocolServer
 from src.stats import compute_trajectory_stats
 from src.storage import Storage
-from src.tracker import HOLE_REASON, Tracker, TrackerState, TrajectoryPoint
+from src.tracker import HOLE_REASON, STOP_REASON, Tracker, TrackerState, TrajectoryPoint
 
 logger = logging.getLogger("engine")
 
@@ -82,7 +90,17 @@ DEFAULT_HOLE_SETTINGS = {
     "capture_radius_mm": 60,  # 공이 컵 중심에서 이 거리(mm) 안에서 사라지면 홀인 후보
     "confirm_duration": 0.5,  # 그 뒤 이 시간(초) 동안 다시 안 보이면 홀인 (src/tracker.py)
     "min_area_ratio": 1.3,  # 고정 물체 면적이 공 예상 면적의 이 배수 이상이면 '홀컵'으로 본다
+    # 26단계: 홀인 확인 중 컵 자리 덩어리가 '기억한 컵 면적 + 공 예상 면적 x 이 값' 이상이면 공이 붙은 것
+    "stuck_ball_area_fraction": 0.5,
 }
+# 컵에 붙은 공으로 판단하려면 홀인 확인 중 이 횟수(프레임) 이상 그렇게 보여야 한다 (한 프레임 잡음 무시)
+RIM_STUCK_MIN_FRAMES = 3
+# 매트 영역 검색: 모서리 4점을 감싸는 사각형에 더하는 여유(px). 매트 가장자리의 공이 잘리지 않게
+MAT_ROI_MARGIN_PX = 20
+# 자동 흐름: 시작 구역을 찾을 때 반경에 더하는 여유(mm)
+ZONE_SEARCH_MARGIN_MM = 50
+# 화면 안내에 '자리 고쳐 놓기' 문구를 보여줄 시간(초)
+AUTO_NOTICE_S = 3.0
 
 # 공 예상 면적을 기억해 두는 칸 크기(px). 이 칸 안에서는 같은 값을 쓴다 (처리 속도용)
 AREA_CACHE_CELL_PX = 16
@@ -146,6 +164,8 @@ class VisionEngine(QObject):
     calibration_invalidated = Signal(str)
     # 25단계: 고정 물체 수집이 시작되거나(True) 끝났을 때(False) (화면이 안내 문구를 바꾼다)
     static_scan_changed = Signal(bool)
+    # 26단계: 자동 흐름이 상태를 바꿨을 때 (자동 준비·자리 고쳐 놓기·공 집어 감 등. 화면이 버튼·배지를 다시 맞춘다)
+    auto_changed = Signal()
 
     def __init__(self, camera=None, parent=None):
         """camera를 넘기지 않으면 실제 USB 카메라를 쓴다 (테스트에서는 가짜 카메라를 넘긴다)."""
@@ -166,6 +186,13 @@ class VisionEngine(QObject):
         self.tracker.hole_finder = self._hole_at
         # 크기 판정으로 걸러진 후보 수 (상태 요약 로그용, 구간마다 비운다)
         self._stats_size_rejected = 0
+        # 26단계: 자동 흐름 (버튼 없이 공을 놓고 퍼팅). 설정은 config/settings.json의 "auto"
+        self.auto = AutoFlow(load_settings().get("auto"))
+        # 화면에 잠깐 보여줄 자동 흐름 안내 (문구, 보여주기 시작한 시각)
+        self._auto_notice: tuple[str, float] | None = None
+        # 컵 테두리에 붙은 공으로 보인 프레임 수와 그때 계산한 공 위치 (홀인 확인 중에만 쓴다)
+        self._rim_stuck_frames = 0
+        self._rim_ball_position = None
         self.storage = Storage()
         # 24단계: 공을 화면 전체가 아니라 '있을 만한 곳' 주변에서만 찾는다 (src/search.py)
         self.search = SearchPlanner(load_settings().get("search"))
@@ -401,13 +428,25 @@ class VisionEngine(QObject):
         self.search.observe((detection.x, detection.y) if detection is not None else None, now)
 
         was_armed = self.tracker.state == TrackerState.ARMED
-        if detection is not None:
+        finish_reason = None
+        if detection is None and self.tracker.lost_hole is not None:
+            # 26단계(25단계 보완): 홀인 확인 중. 공이 컵에 들어간 게 아니라 컵 테두리에 붙어 멈췄으면 정지로 끝낸다
+            finish_reason = self._check_ball_at_rim(frame, now)
+        else:
+            self._rim_stuck_frames = 0
+        if finish_reason is not None:
+            pass
+        elif detection is not None:
             # TRACKING 상태일 때만 실제로 기록된다 (Tracker가 알아서 상태를 확인한다).
             if self.tracker.add_trajectory_point(detection.x, detection.y, now):
                 self.trajectory_updated.emit()
             finish_reason = self.tracker.update_detection(detection.x, detection.y, now)
         else:
             finish_reason = self.tracker.update_detection(None, None, now)
+
+        if finish_reason is not None and self._check_readdress(finish_reason):
+            # 26단계: 퍼팅이 아니라 '자리 고쳐 놓기'였다 -> 결과(RESULT)를 보내지 않고 다시 준비했다
+            finish_reason = None
 
         if was_armed and self.tracker.state == TrackerState.TRACKING:
             # 이번 프레임에서 공이 움직여 추적이 시작됐다 (ARMED -> TRACKING).
@@ -425,6 +464,9 @@ class VisionEngine(QObject):
 
         if finish_reason is not None:
             self._finish_tracking(finish_reason)
+
+        # 26단계: 자동 흐름 (공이 놓이면 준비, 공을 집어 가면 대기 해제 등)
+        self._auto_step(detection, now)
 
         # 25단계: 고정 물체 수집 중이면 화면 전체 덩어리를 모은다 (수집 시간 동안만)
         self._feed_static_scan(frame, now)
@@ -449,7 +491,7 @@ class VisionEngine(QObject):
             radius = self.calibration.mm_radius_to_px(center, radius_mm)
             return radius if radius is not None else default_px
 
-        return self.search.plan(
+        plan = self.search.plan(
             self.tracker.state,
             self.tracker.start_position,
             addr_px,
@@ -457,6 +499,53 @@ class VisionEngine(QObject):
             now,
             to_px_radius,
         )
+
+        # 26단계 자동 흐름: 공이 놓이기를 기다릴 때(시작점 없는 READY, 결과가 나온 FINISHED)는
+        # 시작 구역 원(반경 + 여유)만 찾는다. anywhere 모드면 매트 영역 전체(아래)에서 찾는다.
+        state = self.tracker.state
+        waiting = (state == TrackerState.READY and self.tracker.start_position is None) or (
+            state == TrackerState.FINISHED
+        )
+        zone_mm = self.auto_zone_mm()
+        if self._auto_active() and waiting and zone_mm is not None and not self.auto.anywhere:
+            center = self.calibration.real_to_pixel(*zone_mm)
+            if center is not None:
+                radius_mm = self.auto.zone_radius_mm + ZONE_SEARCH_MARGIN_MM
+                radius = to_px_radius(center, radius_mm, 150)
+                roi = _square_roi(center, radius, self.frame_size)
+                plan = SearchPlan(roi if roi is not None else EMPTY_ROI, center, radius, "zone")
+
+        # 26단계(0절): '화면 전체' 검색이라도 캘리브레이션이 있으면 매트 영역만 찾는다.
+        # 매트 밖은 어차피 매트 밖 필터에서 버려지는데, 색 범위를 넓히면 바닥·벽의 잡티 덩어리가 많아져서
+        # 화면 전체를 처리하는 시간이 꽤 길었다 (FPS 30~42).
+        # (검색 영역 제한을 끄면(search.enabled = false) 예전처럼 화면 전체를 찾는다 - 비교·문제 해결용)
+        if plan.roi is None and self.search.enabled:
+            mat_roi = self._mat_roi()
+            if mat_roi is not None:
+                plan.roi = mat_roi
+                if plan.reason == "full":
+                    plan.reason = "mat"
+        return plan
+
+    def _mat_roi(self):
+        """매트 모서리 4점을 감싸는 사각형 + 여유 (x, y, 폭, 높이). 매트 밖 필터를 끄거나 캘리브레이션 전이면 None."""
+        if (
+            not self.calibration.is_calibrated()
+            or not self.calibration.filter_outside_mat
+            or len(self.calibration.corners) != 4
+            or self.frame_size is None
+        ):
+            return None
+        xs = [c[0] for c in self.calibration.corners]
+        ys = [c[1] for c in self.calibration.corners]
+        width, height = self.frame_size
+        x0 = max(0, min(xs) - MAT_ROI_MARGIN_PX)
+        y0 = max(0, min(ys) - MAT_ROI_MARGIN_PX)
+        x1 = min(width, max(xs) + MAT_ROI_MARGIN_PX)
+        y1 = min(height, max(ys) + MAT_ROI_MARGIN_PX)
+        if x1 - x0 < 2 or y1 - y0 < 2:
+            return None
+        return (int(x0), int(y0), int(x1 - x0), int(y1 - y0))
 
     # ------------------------------------------------------------------
     # 처리 조건(프레임 크기·왜곡 보정)과 캘리브레이션
@@ -600,6 +689,21 @@ class VisionEngine(QObject):
             )
         logger.info("추적 종료 (%s) - 기록된 점 %d개", reason, len(self.tracker.trajectory))
         self.protocol_handler.on_finished(reason)
+        if self._auto_active():
+            # 26단계: 다음 퍼팅은 공을 집었다가(또는 움직였다가) 시작 구역에 다시 놓아야 준비된다
+            stop = self.tracker.stop_position
+            stop_mm = self.calibration.pixel_to_real(*stop) if stop is not None else None
+            if stop_mm is not None and self._ball_in_auto_zone(stop_mm):
+                self.auto.hold_until_released(stop_mm)
+            else:
+                # 시작 구역 밖에서 끝남: 시작 구역 검색에는 그 공이 안 보이므로 바로 다음 공을 받을 수 있다
+                self.auto.hold_until_released(None)
+            if self.auto.save_results:
+                status, result_id = self.save_result()
+                if status == SAVE_OK:
+                    logger.info("자동 흐름: 결과 자동 저장 (id %s)", result_id)
+                else:
+                    logger.info("자동 흐름: 결과를 저장하지 못함 (%s)", status)
         self.tracking_finished.emit(reason)
 
     def _read_frame(self, now: float):
@@ -925,6 +1029,11 @@ class VisionEngine(QObject):
             return START_BAD_STATE
         # 25단계: 시작점에 놓인 공을 뺀 나머지 '가만히 있는 공 색 물체'를 고정 물체로 모은다
         self.start_static_scan(SCAN_AUTO, now=self._clock_hint)
+        # 26단계: 처음 한 번 등록한 시작점을 '시작 구역'으로 저장한다 (다음부터는 버튼 없이 이 구역을 쓴다)
+        if self.auto.start_zone is None:
+            start_mm = self.calibration.pixel_to_real(*self.tracker.start_position)
+            if start_mm is not None:
+                self.set_start_zone(start_mm)
         return START_OK
 
     def start_tracking(self) -> bool:
@@ -937,11 +1046,29 @@ class VisionEngine(QObject):
 
     def abort(self) -> bool:
         """'추적 중지' / 앱의 ABORT: 추적 대기(ARMED)나 추적(TRACKING)을 멈추고 READY로 돌아간다."""
-        return self.tracker.stop_tracking()
+        if not self.tracker.stop_tracking():
+            return False
+        self._hold_auto_after_button()
+        return True
 
     def reset(self) -> bool:
         """'궤적 초기화' / 앱의 RESET: 시작점과 궤적을 지우고 READY로 돌아간다 (캘리브레이션은 유지)."""
-        return self.tracker.reset_trajectory()
+        if not self.tracker.reset_trajectory():
+            return False
+        self._hold_auto_after_button()
+        return True
+
+    def _hold_auto_after_button(self) -> None:
+        """버튼(또는 앱 명령)으로 멈췄을 때: 공을 집었다가 다시 놓기 전에는 자동으로 다시 준비하지 않는다.
+
+        '버튼 동작이 우선'이라서다. 이게 없으면 '추적 중지'를 누르자마자 공이 그대로 있으니
+        1초 뒤에 자동 흐름이 다시 추적 대기로 만들어 버린다.
+        """
+        if not self.auto.enabled:
+            return
+        ball = self.last_detection
+        ball_mm = self.calibration.pixel_to_real(ball.x, ball.y) if ball is not None else None
+        self.auto.hold_until_released(ball_mm)
 
     # ------------------------------------------------------------------
     # 좌표 변환 · 통계 · 저장
@@ -1056,6 +1183,216 @@ class VisionEngine(QObject):
         save_settings(settings)
         self.reload_detector()
         return "OK"
+
+    # ------------------------------------------------------------------
+    # 26단계: 자동 흐름
+    # ------------------------------------------------------------------
+    def _auto_active(self) -> bool:
+        """자동 흐름이 지금 동작하는지 (켜져 있고 캘리브레이션이 유효해야 한다: 거리 판단을 mm로 하므로)."""
+        return self.auto.enabled and self.calibration.is_calibrated()
+
+    def auto_zone_mm(self):
+        """지금 쓰는 시작 구역 중심(mm): 앱이 SET_ADDR로 정한 어드레스가 있으면 그것, 없으면 저장된 구역."""
+        addr = self.protocol_handler.addr_mm
+        return addr if addr is not None else self.auto.start_zone
+
+    def _ball_in_auto_zone(self, ball_mm) -> bool:
+        start = self.tracker.start_position
+        start_mm = self.calibration.pixel_to_real(*start) if start is not None else None
+        return self.auto.in_zone(ball_mm, self.auto_zone_mm(), start_mm)
+
+    def set_auto_enabled(self, enabled: bool) -> None:
+        """자동 흐름을 켜거나 끄고 현장 파일에 저장한다 (설정창·앱의 AUTO 명령)."""
+        self.auto.enabled = bool(enabled)
+        self.auto.reset()
+        self._save_auto_settings()
+        logger.info("자동 흐름 %s", "켬" if enabled else "끔")
+        self.auto_changed.emit()
+        self.changed.emit()
+
+    def set_start_zone(self, zone_mm) -> None:
+        """시작 구역(mm)을 정하고 현장 파일에 저장한다. None이면 지운다."""
+        self.auto.start_zone = (float(zone_mm[0]), float(zone_mm[1])) if zone_mm is not None else None
+        self._save_auto_settings()
+        if zone_mm is None:
+            logger.info("시작 구역을 지움 - 다음 '시작 위치 등록' 때 새로 저장합니다")
+        else:
+            logger.info("시작 구역 저장: (%.0f, %.0f)mm, 반경 %.0fmm", zone_mm[0], zone_mm[1], self.auto.zone_radius_mm)
+        self.auto_changed.emit()
+
+    def _save_auto_settings(self) -> None:
+        settings = load_settings()
+        settings["auto"] = {**(settings.get("auto") or {}), **self.auto.to_settings()}
+        save_settings(settings)
+
+    def auto_guide_text(self, now: float | None = None) -> str | None:
+        """화면 안내 띠에 보여줄 자동 흐름 문구 (자동 흐름이 꺼져 있으면 None)."""
+        if not self.auto.enabled:
+            return None
+        if now is None:
+            now = time.time()
+        if self._auto_notice is not None:
+            text, since = self._auto_notice
+            if now - since < AUTO_NOTICE_S:
+                return text
+            self._auto_notice = None
+        if not self.calibration.is_calibrated():
+            return "자동 모드: 캘리브레이션을 먼저 해 주세요"
+        state = self.tracker.state
+        if state == TrackerState.ARMED:
+            return "준비 완료 - 퍼팅하세요"
+        if state == TrackerState.TRACKING:
+            return "추적 중..."
+        if state == TrackerState.FINISHED:
+            reason = self.tracker.finish_reason or "-"
+            if self.tracker.finish_hole is not None:
+                reason += f" ({self.tracker.finish_hole}번 컵)"
+            return f"결과: {reason} - 다음 퍼팅은 공을 시작 구역에 놓으세요"
+        if state == TrackerState.READY:
+            if not self.auto.can_wait_for_ball(self.auto_zone_mm()) and self.tracker.start_position is None:
+                return "시작 위치 등록을 한 번 해 주세요 (자동 모드는 그 자리를 시작 구역으로 기억합니다)"
+            return "공을 시작 구역에 놓으세요"
+        return None
+
+    def _auto_step(self, detection, now: float) -> None:
+        """매 프레임: 자동 흐름의 판단을 받아 실제로 상태를 바꾼다."""
+        if not self._auto_active():
+            return
+        ball_px = (detection.x, detection.y) if detection is not None else None
+        ball_mm = self.calibration.pixel_to_real(*ball_px) if ball_px is not None else None
+        start = self.tracker.start_position
+        start_mm = self.calibration.pixel_to_real(*start) if start is not None else None
+        holes_mm = [(h.x_mm, h.y_mm) for h in self.static_objects.holes() if h.x_mm is not None]
+        action = self.auto.step(
+            self.tracker.state,
+            True,
+            start is not None,
+            ball_px,
+            ball_mm,
+            now,
+            zone_mm=self.auto_zone_mm(),
+            start_mm=start_mm,
+            inside_mat=ball_px is not None and self.calibration.is_inside(*ball_px),
+            holes_mm=holes_mm,
+        )
+        if action is None:
+            return
+        if action.kind == ACTION_READY:
+            if self.tracker.enter_ready():
+                logger.info("자동 흐름: 저장된 캘리브레이션이 유효해서 바로 준비 상태(READY)로 갑니다")
+        elif action.kind == ACTION_ARM:
+            x, y = action.position_px
+            keep = action.keep_previous
+            if not (self.tracker.register_start_position(x, y, keep_previous=keep) and self.tracker.start_tracking(keep_previous=keep)):
+                return
+            self.search.reset()
+            logger.info(
+                "자동 흐름: 시작점 자동 등록 (%.0f, %.0f)mm -> 추적 대기(ARMED)%s",
+                action.position_mm[0],
+                action.position_mm[1],
+                " - 다음 퍼팅 준비" if keep else "",
+            )
+            self.protocol_handler.on_auto_init(action.position_mm)
+        elif action.kind == ACTION_DROP:
+            if self.tracker.reset_trajectory():
+                logger.info(
+                    "자동 흐름: 추적 대기 중 공이 %.1f초 넘게 안 보여 대기를 풀었습니다 (공을 집어 감)",
+                    self.auto.ball_gone_duration,
+                )
+        self.auto_changed.emit()
+        self.changed.emit()
+
+    def _check_readdress(self, reason: str) -> bool:
+        """방금 끝난 추적이 '자리 고쳐 놓기'면 결과를 버리고 다시 준비한다. 그랬으면 True."""
+        if not self._auto_active() or self.tracker.start_position is None:
+            return False
+        start_mm = self.calibration.pixel_to_real(*self.tracker.start_position)
+        max_distance = 0.0
+        for point in self.trajectory_to_real():
+            max_distance = max(max_distance, math.hypot(point.x - start_mm[0], point.y - start_mm[1]))
+        if not self.auto.is_readdress(
+            reason, max_distance, self.tracker.tracking_started_at, self.tracker.stop_started_at
+        ):
+            return False
+
+        stop = self.tracker.stop_position
+        stop_mm = self.calibration.pixel_to_real(*stop) if stop is not None else None
+        logger.info(
+            "자동 흐름: 자리 고쳐 놓기로 보고 퍼팅을 취소 (최대 %.0fmm 이동, 기준 %.0fmm) - 결과를 보내지 않습니다",
+            max_distance,
+            self.auto.min_putt_distance_mm,
+        )
+        self.protocol_handler.on_tracking_cancelled("READDRESS")
+        self.auto.reset()
+        if stop_mm is not None and self._ball_in_auto_zone(stop_mm):
+            # 멈춘 자리가 시작 구역 안 -> 그 자리를 새 시작점으로 바로 다시 준비
+            self.tracker.register_start_position(*stop)
+            self.tracker.start_tracking()
+            self._auto_notice = ("자리 고쳐 놓기로 보고 다시 준비합니다", self._clock_hint or time.time())
+        else:
+            self.tracker.reset_trajectory()
+            self._auto_notice = ("자리 고쳐 놓기로 보고 취소했습니다 - 공을 시작 구역에 놓으세요", self._clock_hint or time.time())
+        self.search.reset()
+        self.auto_changed.emit()
+        self.trajectory_updated.emit()
+        return True
+
+    def _check_ball_at_rim(self, frame, now: float) -> str | None:
+        """홀인 확인 중: 공이 컵 테두리에 붙어 멈춘 것인지 본다. 그렇다고 판단되면 정지로 끝내고 사유를 돌려준다.
+
+        왜 필요한가: 공과 컵 사이 간격이 약 5px보다 좁으면 블러·모폴로지 때문에 둘이 한 덩어리로 붙는다.
+        그 덩어리는 공 크기가 아니라서 공이 '사라진' 것처럼 보이고, 0.5초 뒤 홀인으로 잘못 판정됐다.
+
+        판단: 컵 자리의 덩어리를 찾아서 다음 두 가지를 모두 만족하면 '공이 붙어 있다'고 본다.
+          1) 면적 >= 기억한 컵 면적 + 공 예상 면적 x stuck_ball_area_fraction(0.5)
+             (컵 크기와 상관없이 '공 반 개 이상만큼 커졌는지'를 본다)
+          2) 덩어리의 가장 먼 점이 컵 중심에서 (컵 반경 + 공 반경 x 0.5) 넘게 떨어져 있음
+             (공이 컵 '안'으로 떨어져 컵 안이 하얗게 보이는 경우는 컵 밖으로 튀어나오지 않으므로 홀인으로 남는다)
+        판정 시점: 홀인 확인 시간(0.5초)이 끝나는 순간, 바로 앞 프레임들이 '연속으로'
+        RIM_STUCK_MIN_FRAMES(3)번 이상 그렇게 보였으면 정지로 끝낸다. 중간에 판정하지 않는 이유:
+        공이 컵에 떨어지는 순간에도 몇 프레임은 컵 밖으로 튀어나온 덩어리처럼 보일 수 있어서다.
+        (그런 경우 공이 컵 안으로 사라지면 연속 횟수가 0으로 돌아가 홀인으로 끝난다)
+
+        끝 위치: 덩어리에서 컵 중심으로부터 가장 먼 점 = 공의 바깥쪽 끝이다. 그 방향으로 (그 거리 - 공 반경)만큼
+        간 곳을 공 중심으로 본다 ('덩어리에서 컵 쪽을 뺀 바깥쪽 끝'). 계산이 안 되면 마지막으로 본 공 위치.
+        """
+        lost = self.tracker.lost_hole
+        hole_number = lost[0]
+        hole = next((h for h in self.static_objects.holes() if h.hole == hole_number), None)
+        ball_area = self._expected_ball_area(hole.x, hole.y) if hole is not None else None
+        if hole is None or not ball_area:
+            return None
+        ball_r = math.sqrt(ball_area / math.pi)
+        blob = self.detector.blob_around(frame, (hole.x, hole.y), hole.radius + ball_r * 3)
+        if blob is None:
+            self._rim_stuck_frames = 0
+            return None
+        area, points = blob
+        offsets = points.astype(float) - (hole.x, hole.y)
+        distances = np.hypot(offsets[:, 0], offsets[:, 1])
+        far_index = int(distances.argmax())
+        far = float(distances[far_index])
+        grown = area >= hole.area + ball_area * float(self.hole_settings["stuck_ball_area_fraction"])
+        sticks_out = far >= hole.radius + ball_r * 0.5
+        if not (grown and sticks_out):
+            self._rim_stuck_frames = 0  # 연속으로 보여야 한다
+            return None
+        self._rim_stuck_frames += 1
+        ux, uy = offsets[far_index] / far
+        center_distance = max(0.0, far - ball_r)
+        self._rim_ball_position = (hole.x + ux * center_distance, hole.y + uy * center_distance)
+        if self._rim_stuck_frames < RIM_STUCK_MIN_FRAMES or not self.tracker.hole_confirm_due(now):
+            return None
+        position = self._rim_ball_position or self.tracker.last_seen_position
+        self._rim_stuck_frames = 0
+        logger.info(
+            "컵 테두리에 붙어 멈춘 공 - %s번 컵 자리 덩어리 %.0fpx² (컵 %.0f + 공 %.0f), 홀인이 아니라 정지로 끝냅니다",
+            hole_number,
+            area,
+            hole.area,
+            ball_area,
+        )
+        return self.tracker.finish_at_rim(*position)
 
     # ------------------------------------------------------------------
     # 25단계: mm 기준 공 크기 · 고정 물체 · 홀인
@@ -1313,6 +1650,7 @@ class VisionEngine(QObject):
         # 검색 영역 설정도 다시 읽는다 (search.enabled 등)
         self.search = SearchPlanner(load_settings().get("search"))
         self._load_size_settings()
+        self.auto = AutoFlow(load_settings().get("auto"))
         # 핸들러는 항상 engine.calibration을 통해 접근하므로 따로 맞출 필요가 없다.
         self.calibration = Calibration()
         # 다시 불러온 캘리브레이션도 지금 처리 조건(프레임 크기·k1)에 맞는지 확인한다.

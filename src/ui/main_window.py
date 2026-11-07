@@ -279,6 +279,11 @@ class MainWindow(QMainWindow):
         self.status_label.setObjectName("status")
         top_layout.addWidget(self.status_label, 1)
 
+        # 26단계: 자동 흐름 켬/끔 배지 (설정 > 프로필/매트 설정의 '자동 흐름'으로 바꾼다)
+        self.auto_label = QLabel("자동: -")
+        self.auto_label.setObjectName("status")
+        top_layout.addWidget(self.auto_label)
+
         self.coord_label = QLabel("좌표: -")
         self.coord_label.setObjectName("status")
         top_layout.addWidget(self.coord_label)
@@ -388,8 +393,10 @@ class MainWindow(QMainWindow):
         engine.protocol_server.client_count_changed.connect(self._update_app_label)
         engine.calibration_invalidated.connect(self._update_warning_label)
         engine.static_scan_changed.connect(self._on_static_scan_changed)
+        engine.auto_changed.connect(self._refresh_after_engine_change)
 
         # 시작 상태(IDLE)에 맞게 배지 문구와 버튼 활성화 상태를 맞춘다.
+        self._update_auto_label()
         self._update_status_badge()
         self._update_button_states()
         self._update_start_point_label()
@@ -430,6 +437,10 @@ class MainWindow(QMainWindow):
 
         settings_dialog_action = settings_menu.addAction("프로필/매트 설정...")
         settings_dialog_action.triggered.connect(self._open_settings_dialog)
+
+        # 26단계: 저장된 시작 구역을 지운다 (다음 '시작 위치 등록' 때 새로 저장된다)
+        clear_zone_action = settings_menu.addAction("시작 구역 지우기")
+        clear_zone_action.triggered.connect(self._clear_start_zone)
 
         records_menu = self.menuBar().addMenu("기록")
         records_action = records_menu.addAction("기록 보기...")
@@ -657,10 +668,17 @@ class MainWindow(QMainWindow):
                 self.guide_label.show()
             return
         if not calibrating:
-            if self.engine.static_scan_active:
-                # 25단계: 고정 물체 수집 중 안내
-                if self.guide_label.text() != STATIC_SCAN_GUIDE_TEXT:
-                    self.guide_label.setText(STATIC_SCAN_GUIDE_TEXT)
+            # 25단계: 고정 물체 수집 중 안내 > 26단계: 자동 흐름 안내 순서로 보여준다.
+            # 단, 추적 대기·추적 중에는 "준비 완료 - 퍼팅하세요" 같은 자동 흐름 안내가 더 중요하다.
+            auto_text = self.engine.auto_guide_text()
+            busy = self.tracker.state in (TrackerState.ARMED, TrackerState.TRACKING)
+            if self.engine.static_scan_active and not (busy and auto_text):
+                text = STATIC_SCAN_GUIDE_TEXT
+            else:
+                text = auto_text
+            if text:
+                if self.guide_label.text() != text:
+                    self.guide_label.setText(text)
                 if self.guide_label.isHidden():
                     self.guide_label.show()
             elif not self.guide_label.isHidden():
@@ -961,10 +979,15 @@ class MainWindow(QMainWindow):
             self.settings_dialog.lens_k1_preview_finished.connect(self.engine.end_k1_preview)
             self.settings_dialog.grid_toggled.connect(self._on_grid_toggled)
             self.settings_dialog.detection_debug_toggled.connect(self.engine.set_detection_debug)
+            self.settings_dialog.auto_toggled.connect(self._on_auto_toggled)
         else:
             # 그 사이 다른 곳(HSV 튜닝 등)에서 바뀐 내용도 반영되도록 다시 불러온다.
             self.settings_dialog.reload_from_settings()
 
+        # 자동 흐름 체크박스를 지금 값으로 맞춘다 (바꾸는 동안 시그널이 나가지 않게 막는다)
+        self.settings_dialog.auto_checkbox.blockSignals(True)
+        self.settings_dialog.auto_checkbox.setChecked(self.engine.auto.enabled)
+        self.settings_dialog.auto_checkbox.blockSignals(False)
         self.settings_dialog.show()
         self.settings_dialog.raise_()
         self.settings_dialog.activateWindow()
@@ -1040,6 +1063,10 @@ class MainWindow(QMainWindow):
         elif result.outside_mat:
             # 공은 보이지만 매트 밖이라 무시된 검출은 경고색으로 표시한다.
             self._draw_outside_mat_detection(frame, result.raw_detection)
+
+        if self.engine.auto.enabled and self.calibration.is_calibrated():
+            # 26단계: 자동 모드면 시작 구역을 얇은 원으로 항상 그린다
+            self._draw_start_zone(frame)
 
         if self.tracker.start_position is not None:
             self._draw_start_point(frame, self.tracker.start_position)
@@ -1164,6 +1191,31 @@ class MainWindow(QMainWindow):
             y = round(height * i / GRID_DIVISIONS)
             cv2.line(frame, (x, 0), (x, height - 1), GRID_COLOR_BGR, GRID_THICKNESS)
             cv2.line(frame, (0, y), (width - 1, y), GRID_COLOR_BGR, GRID_THICKNESS)
+
+    def _draw_start_zone(self, frame) -> None:
+        """시작 구역(저장된 구역 또는 앱의 어드레스)을 얇은 골드 원으로 그린다."""
+        zone_mm = self.engine.auto_zone_mm()
+        if zone_mm is None:
+            return
+        center = self.calibration.real_to_pixel(*zone_mm)
+        if center is None:
+            return
+        radius = self.calibration.mm_radius_to_px(center, self.engine.auto.zone_radius_mm)
+        if not radius:
+            return
+        cv2.circle(frame, (int(round(center[0])), int(round(center[1]))), int(round(radius)), START_POINT_COLOR_BGR, 1, cv2.LINE_AA)
+
+    def _on_auto_toggled(self, enabled: bool) -> None:
+        """설정창의 '자동 흐름' 체크박스: 엔진에 바로 적용하고 저장한다."""
+        self.engine.set_auto_enabled(enabled)
+
+    def _clear_start_zone(self) -> None:
+        """메뉴 '시작 구역 지우기'."""
+        self.engine.set_start_zone(None)
+        self._show_temporary_status("시작 구역을 지웠습니다 - '시작 위치 등록'을 하면 새로 저장됩니다")
+
+    def _update_auto_label(self) -> None:
+        self.auto_label.setText("자동: 켬" if self.engine.auto.enabled else "자동: 끔")
 
     @staticmethod
     def _draw_static_objects(frame, objects: list) -> None:
@@ -1519,6 +1571,7 @@ class MainWindow(QMainWindow):
         """앱 명령 등으로 엔진 상태가 바뀌었을 때, 버튼을 눌렀을 때와 같게 화면을 갱신한다."""
         # 엔진이 시작될 때도 이 알림이 온다 -> 통신 상태 문구("포트 사용 불가" 등)도 다시 맞춘다
         self._update_app_label()
+        self._update_auto_label()
         self._update_calibration_guide()
         self._update_status_badge()
         self._update_button_states()

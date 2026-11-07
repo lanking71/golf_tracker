@@ -19,12 +19,15 @@ UI 없이도 테스트할 수 있다. 상세 규격은 docs/PROTOCOL.md 참고.
     SAVE        이번 결과를 엔진의 DB(SQLite)에 저장 (FINISHED 상태에서만)
     PROFILE     공 검출 프로필(공 색 설정) 조회·변경. 선택: name
     PING       연결 확인 (PONG으로 응답)
+    AUTO        자동 흐름 켜기/끄기 (enabled=true/false, 2.5)
 
 엔진 -> 컨트롤 (먼저 보내는 것, 접속한 모든 앱에 전송):
     HELLO       접속 직후 1회 (그 앱에만): 프로토콜 버전과 현재 상태
     STATUS      상태 변화 시 + 추적 중에는 초당 최대 status_hz번(기본 30)
     CAMERA      event=OK/LOST: 카메라 영상 수신이 시작·복구되거나 끊긴 순간 1회
     TRACK       event=START: 공이 움직여 추적이 시작된 순간 1회
+                event=CANCEL: 자리 고쳐 놓기로 퍼팅을 취소함 (RESULT 없음, 2.5)
+    INIT        event=AUTO: 자동 흐름이 시작점을 잡음 (2.5)
     ADDR        event=IN/OUT: 공이 어드레스 위치 안으로 들어오거나 나갈 때 1회
     RESULT      추적이 끝났을 때(정지/이탈/홀인) 결과 1회
 
@@ -48,7 +51,9 @@ logger = logging.getLogger("protocol")
 #      전처리(축소·왜곡 보정)가 끝난 프레임 기준임을 명시.
 # 2.4: 홀인 판정 추가 - RESULT.reason에 "HOLE_IN", RESULT.hole(홀 번호, 홀인이 아니면 null),
 #      HELLO.holes(홀컵 목록 [{id, x_mm, y_mm}]) 추가. 기존 필드는 그대로라 2.3용 컨트롤도 동작한다.
-PROTOCOL_VERSION = "2.4"
+# 2.5: 자동 흐름 - AUTO 명령, HELLO.auto/start_zone, INIT event=AUTO(자동 시작점),
+#      TRACK event=CANCEL(자리 고쳐 놓기로 퍼팅 취소) 추가.
+PROTOCOL_VERSION = "2.5"
 
 # config/settings.json의 "protocol" 항목에 없을 때 쓸 기본값
 DEFAULT_ADDR_RADIUS_MM = 100
@@ -146,6 +151,7 @@ class ProtocolHandler:
                 "PROFILE": self._cmd_profile,
                 "GET_RESULT": self._cmd_get_result,
                 "PING": self._cmd_ping,
+                "AUTO": self._cmd_auto,
             }
             handler = handlers.get(cmd) if isinstance(cmd, str) else None
 
@@ -211,8 +217,41 @@ class ProtocolHandler:
             "frame_h": frame_size[1] if frame_size else None,
             # 2.4: 홀컵 목록 (고정 물체 중 컵으로 본 것, 홀 번호 순서). 모르면 빈 목록
             "holes": self._engine.hole_list() if hasattr(self._engine, "hole_list") else [],
+            # 2.5: 자동 흐름 켜짐 여부와 저장된 시작 구역 (매트 mm, 없으면 null)
+            "auto": self._engine.auto.enabled,
+            "start_zone": self._zone_dict(),
         })
         reply(self._build_status(time.time()))
+
+    def _zone_dict(self):
+        zone = self._engine.auto.start_zone
+        if zone is None:
+            return None
+        return {"x_mm": round(zone[0], 1), "y_mm": round(zone[1], 1), "radius_mm": self._engine.auto.zone_radius_mm}
+
+    def _cmd_auto(self, message: dict) -> None:
+        """자동 흐름 켜기/끄기 (2.5). enabled가 없으면 지금 값만 알려 준다. 현장 파일에 저장된다."""
+        enabled = message.get("enabled")
+        if enabled is not None:
+            if not isinstance(enabled, bool):
+                return self._ng("AUTO", "bad_value")
+            self._engine.set_auto_enabled(enabled)
+        self._respond({"cmd": "AUTO", "result": "OK", "enabled": self._engine.auto.enabled, "start_zone": self._zone_dict()})
+
+    def on_auto_init(self, position_mm) -> None:
+        """자동 흐름이 시작점을 잡았을 때 (2.5): INIT event=AUTO를 모든 앱에 보낸다. 이어서 STATUS(ARMED)가 간다."""
+        self._send({
+            "cmd": "INIT",
+            "event": "AUTO",
+            "x": round(position_mm[0], 1),
+            "y": round(position_mm[1], 1),
+        })
+
+    def on_tracking_cancelled(self, reason: str) -> None:
+        """자리 고쳐 놓기 등으로 퍼팅을 취소했을 때 (2.5): TRACK event=CANCEL. RESULT는 보내지 않는다."""
+        self._track_t0 = None
+        self._prev_sample = None
+        self._send({"cmd": "TRACK", "event": "CANCEL", "reason": reason})
 
     def _cmd_align(self, message: dict) -> None:
         """매트를 자동 검출해 캘리브레이션한다. 크기(width_mm/height_mm)가 오면 함께 적용한다."""

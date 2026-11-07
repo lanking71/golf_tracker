@@ -146,6 +146,8 @@ class Tracker:
             TrackerState.FINISHED,
         },
         "save": {TrackerState.FINISHED},
+        # 26단계 자동 흐름: 저장된 캘리브레이션이 유효하면 대기(IDLE)에서 바로 READY로 (버튼 없이)
+        "auto_ready": {TrackerState.IDLE},
     }
 
     def __init__(self, settings: dict | None = None, hole_settings: dict | None = None):
@@ -162,6 +164,8 @@ class Tracker:
         self.finish_reason: str | None = None
         # 홀인으로 끝났을 때 그 컵의 홀 번호 (아니면 None)
         self.finish_hole: int | None = None
+        # 정지로 끝났을 때 공이 멈추기 시작한 시각 (26단계 자리 고쳐 놓기 판단용)
+        self.stop_started_at: float | None = None
 
         # 25단계: 엔진이 넣어 주는 함수들 (없으면 예전 px 기준 동작)
         # - mm_to_px(point, mm): point(px) 근처에서 매트 위 mm 거리가 몇 px인지. 캘리브레이션이 없으면 None
@@ -253,7 +257,11 @@ class Tracker:
         """'캘리브레이션' 버튼: 매트 모서리 지정을 시작한다."""
         return self._transition("calibrate", TrackerState.CALIBRATING)
 
-    def register_start_position(self, x: int, y: int) -> bool:
+    def enter_ready(self) -> bool:
+        """26단계 자동 흐름: IDLE에서 바로 READY로 간다 (캘리브레이션 버튼 생략, 시작점은 아직 없음)."""
+        return self._transition("auto_ready", TrackerState.READY)
+
+    def register_start_position(self, x: int, y: int, keep_previous: bool = False) -> bool:
         """'시작 위치 등록' 버튼: 검출된 공 좌표를 시작점(원점)으로 저장한다.
 
         공이 검출되지 않았을 때 호출하지 않는 것은(좌표를 모르니까)
@@ -270,10 +278,10 @@ class Tracker:
         if not self._transition("register_start_position", TrackerState.READY):
             return False
         self.start_position = (x, y)
-        self._clear_attempt()
+        self._clear_attempt(keep_previous)
         return True
 
-    def start_tracking(self) -> bool:
+    def start_tracking(self, keep_previous: bool = False) -> bool:
         """'추적 준비' 버튼 / 앱의 ADD 명령: ARMED(추적 대기)로 들어간다.
 
         바로 TRACKING이 되지 않는다. 공이 시작점에서 arm_move_distance 이상
@@ -283,18 +291,27 @@ class Tracker:
 
         새로운 시도를 시작하는 것이므로, 이전 시도(추적 중지 후 다시 준비한 경우)의
         궤적과 판정 타이머를 모두 정리한다.
+
+        keep_previous=True (26단계 자동 흐름의 '다음 퍼팅 준비'): 이전 퍼팅의 궤적·결과는 화면에
+        남겨 두고 타이머만 정리한다. 다음 퍼팅이 실제로 시작되는 순간(TRACK START)에
+        _update_armed가 궤적을 새로 시작하므로 그때 지워진다.
         """
         if not self._transition("start_tracking", TrackerState.ARMED):
             return False
-        self._clear_attempt()
+        self._clear_attempt(keep_previous)
         return True
 
-    def _clear_attempt(self) -> None:
-        """한 번의 시도(퍼팅)에 관한 기록·타이머를 모두 비운다. (시작점은 건드리지 않는다)"""
-        self.trajectory = []
-        self.stop_position = None
-        self.finish_reason = None
-        self.finish_hole = None
+    def _clear_attempt(self, keep_previous: bool = False) -> None:
+        """한 번의 시도(퍼팅)에 관한 기록·타이머를 모두 비운다. (시작점은 건드리지 않는다)
+
+        keep_previous=True면 화면에 보여줄 이전 결과(궤적·정지점·종료 사유·홀 번호)는 남긴다.
+        """
+        if not keep_previous:
+            self.trajectory = []
+            self.stop_position = None
+            self.finish_reason = None
+            self.finish_hole = None
+        self.stop_started_at = None
         self.tracking_started_at = None
         self._lost_hole = None
         self._consecutive_jump_count = 0
@@ -423,6 +440,9 @@ class Tracker:
 
         if self._stop_since is not None and timestamp - self._stop_since >= self._stop_duration:
             self.stop_position = (x, y)
+            # 26단계: 공이 '멈추기 시작한' 시각. 자동 흐름이 '자리 고쳐 놓기'를 판단할 때 쓴다
+            # (정지 판정은 stop_duration만큼 기다린 뒤에 나므로 끝난 시각보다 이 값이 정확하다).
+            self.stop_started_at = self._stop_since
             return self._finish_with_reason(STOP_REASON)
 
         return None
@@ -472,6 +492,38 @@ class Tracker:
         ]
         self._last_seen_position = (x, y)
         self._last_raw_position = (x, y)
+
+    @property
+    def lost_hole(self):
+        """공이 홀컵 근처에서 사라져 홀인 확인을 기다리는 중이면 (홀 번호, 컵 중심 px), 아니면 None."""
+        return self._lost_hole if self._lost_since is not None else None
+
+    @property
+    def lost_since(self) -> float | None:
+        """추적 중 공이 안 보이기 시작한 시각 (보이고 있으면 None)."""
+        return self._lost_since
+
+    def hole_confirm_due(self, now: float) -> bool:
+        """홀인 확인 시간(confirm_duration)이 지났는지. 홀인 후보가 아니면 False."""
+        return self.lost_hole is not None and now - self._lost_since >= self._hole_confirm_duration
+
+    @property
+    def last_seen_position(self):
+        """추적 중 마지막으로 공을 본 위치 (px). 없으면 None."""
+        return self._last_raw_position
+
+    def finish_at_rim(self, x: float, y: float) -> str | None:
+        """26단계(25단계 보완): 홀인 확인 중, 공이 컵 테두리에 붙어 멈춘 것으로 판단됐을 때 '정지'로 끝낸다.
+
+        공이 컵과 한 덩어리로 붙어 보여서 '사라진' 것처럼 보였을 뿐이므로, 홀인이 아니라
+        정지(STOP)이고 끝 위치는 엔진이 계산해 준 공 위치(x, y)다.
+        """
+        if self.state != TrackerState.TRACKING:
+            return None
+        self.stop_position = (int(round(x)), int(round(y)))
+        self.stop_started_at = self._lost_since
+        self.finish_hole = None
+        return self._finish_with_reason(STOP_REASON)
 
     def _finish_with_reason(self, reason: str) -> str:
         self.finish_tracking()

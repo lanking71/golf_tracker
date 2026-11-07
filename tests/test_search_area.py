@@ -206,7 +206,9 @@ class EngineSearchTests(EngineTestCase):
         self.camera.ball = None
         for _ in range(12):  # lost_frames_full(10)보다 많이 놓침
             self.step()
-        self.assertIsNone(self.last_plan().roi)
+        # '전체' 검색으로 넘어가되, 26단계부터 캘리브레이션이 있으면 매트 영역(모서리를 감싸는 사각형 + 여유)만 찾는다
+        self.assertEqual(self.last_plan().roi, self.engine._mat_roi())
+        self.assertIsNotNone(self.engine._mat_roi())
         self.assertEqual(self.last_plan().reason, "lost")
         self.assertEqual(self.engine.tracker.state, TrackerState.TRACKING)  # 0.6초 < lost_duration 2초
 

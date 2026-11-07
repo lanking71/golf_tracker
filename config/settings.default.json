@@ -13,24 +13,48 @@
         "profiles": {
             "practice": {
                 "name": "연습용 (흰 공)",
-                "hsv_lower": [0, 0, 180],
-                "hsv_upper": [180, 60, 255],
+                "hsv_lower": [
+                    0,
+                    0,
+                    180
+                ],
+                "hsv_upper": [
+                    180,
+                    60,
+                    255
+                ],
                 "min_area": 80,
                 "max_area": 600,
                 "min_circularity": 0.7
             },
             "real": {
                 "name": "실전용 (분홍 공)",
-                "hsv_lower": [140, 80, 80],
-                "hsv_upper": [170, 255, 255],
+                "hsv_lower": [
+                    140,
+                    80,
+                    80
+                ],
+                "hsv_upper": [
+                    170,
+                    255,
+                    255
+                ],
                 "min_area": 80,
                 "max_area": 600,
                 "min_circularity": 0.7
             },
             "practice_lime": {
                 "name": "연습용 (연두 공)",
-                "hsv_lower": [25, 40, 30],
-                "hsv_upper": [55, 255, 255],
+                "hsv_lower": [
+                    25,
+                    40,
+                    30
+                ],
+                "hsv_upper": [
+                    55,
+                    255,
+                    255
+                ],
                 "min_area": 80,
                 "max_area": 600,
                 "min_circularity": 0.7
@@ -70,15 +94,36 @@
         "enabled": true,
         "capture_radius_mm": 60,
         "confirm_duration": 0.5,
-        "min_area_ratio": 1.3
+        "min_area_ratio": 1.3,
+        "stuck_ball_area_fraction": 0.5
+    },
+    "auto": {
+        "enabled": true,
+        "start_zone": null,
+        "start_zone_radius_mm": 300,
+        "anywhere": false,
+        "settle_duration": 1.0,
+        "settle_tolerance_mm": 5,
+        "min_putt_distance_mm": 100,
+        "readdress_timeout": 1.5,
+        "ball_gone_duration": 3.0,
+        "save_results": true
     },
     "calibration": {
         "mat_width_mm": 3000,
         "mat_height_mm": 1000,
         "filter_outside_mat": true,
         "auto_detect": false,
-        "mat_hsv_lower": [35, 40, 40],
-        "mat_hsv_upper": [85, 255, 255]
+        "mat_hsv_lower": [
+            35,
+            40,
+            40
+        ],
+        "mat_hsv_upper": [
+            85,
+            255,
+            255
+        ]
     },
     "protocol": {
         "enabled": true,

@@ -120,6 +120,9 @@ def make_test_settings(tmp_dir: str, **overrides) -> mock._patch:
         # 24단계 검색 영역: 가짜 영상은 4500mm 매트가 약 900px라 1mm = 약 0.2px다 (실제 현장의
         # 약 절반). 테스트 공은 한 프레임에 20~60px씩 크게 움직이므로 반경을 넉넉히 잡는다.
         "search": {"enabled": True, "idle_radius_mm": 600, "track_radius_mm": 500, "lost_frames_full": 10},
+        # 26단계 자동 흐름은 기존 테스트에서는 끈다 (버튼·명령으로만 상태가 바뀌는 예전 동작을 시험).
+        # 자동 흐름은 tests/test_auto_flow.py에서 켜고 시험한다.
+        "auto": {"enabled": False},
         # 테스트에서는 실제 통신 포트를 열지 않는다
         "protocol": {"enabled": False, "port": 9000, "status_hz": 30},
         "storage": {"db_path": str(Path(tmp_dir) / "results.db")},

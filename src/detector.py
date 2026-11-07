@@ -304,6 +304,34 @@ class BallDetector:
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         return [c for c, _contour in self._evaluate_contours(contours, profile, expected_area, None)]
 
+    def blob_around(self, frame: np.ndarray, center, half_size: float):
+        """center 주변 정사각형(한 변 2 x half_size) 안에서, center를 품은(또는 가장 가까운) 공 색 덩어리를 찾는다.
+
+        26단계(25단계 보완): 홀인 확인 중 '공이 컵 테두리에 붙어서 컵과 한 덩어리로 보이는지' 보려고 쓴다.
+        반환: (면적 px², 윤곽선 점들 N x 2 배열, 프레임 좌표) 또는 None (덩어리 없음)
+        """
+        profile = self._active_profile()
+        height, width = frame.shape[:2]
+        x0 = max(0, int(center[0] - half_size))
+        y0 = max(0, int(center[1] - half_size))
+        x1 = min(width, int(center[0] + half_size) + 1)
+        y1 = min(height, int(center[1] + half_size) + 1)
+        if x1 - x0 < 2 or y1 - y0 < 2:
+            return None
+        mask = build_mask(frame[y0:y1, x0:x1], profile["hsv_lower"], profile["hsv_upper"])
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE, offset=(x0, y0))
+        best = None
+        best_distance = float("inf")
+        for contour in contours:
+            # pointPolygonTest: 안쪽이면 양수, 바깥이면 음수(테두리까지 거리)
+            inside = cv2.pointPolygonTest(contour, (float(center[0]), float(center[1])), True)
+            distance = 0.0 if inside >= 0 else -inside
+            if distance < best_distance:
+                best_distance, best = distance, contour
+        if best is None:
+            return None
+        return float(cv2.contourArea(best)), best.reshape(-1, 2)
+
     def _evaluate_contours(self, contours, profile: dict, expected_area, static_filter) -> list:
         """덩어리마다 면적·원형도·크기 비율을 재고 공 조건 통과 여부를 정한다.
 

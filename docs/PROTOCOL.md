@@ -1,4 +1,4 @@
-# 메인 컨트롤 ↔ 비전 엔진 통신 규격 (v2.4)
+# 메인 컨트롤 ↔ 비전 엔진 통신 규격 (v2.5)
 
 **메인 컨트롤(Flutter 등) 개발자에게 전달하는 문서입니다. 이 문서만 보면 연동할 수 있습니다.**
 
@@ -308,6 +308,13 @@ RESET: READY / ARMED / TRACKING / FINISHED → READY (시작점과 궤적을 지
 - 마지막 추적의 `RESULT`를 다시 보냅니다. 결과 메시지를 놓쳤거나, 접속이 끊겼다가 다시 접속했을 때 씁니다.
 - 응답: `RESULT` 메시지에 `"result":"OK"`가 더해진 형태. 결과가 없으면 `{"cmd":"RESULT","result":"NG","reason":"no_result"}`
 
+### AUTO: 자동 흐름 켜기/끄기 (2.5)
+```json
+{"cmd":"AUTO","enabled":false}
+```
+- 응답: `{"cmd":"AUTO","result":"OK","enabled":false,"start_zone":{...}|null}`. 엔진 설정 파일에 저장되어 다시 켜도 유지됩니다.
+- `enabled`를 빼면 지금 값만 알려 줍니다. `true`/`false`가 아니면 NG `bad_value`.
+
 ### PING: 연결 확인
 ```json
 {"cmd":"PING"}
@@ -318,7 +325,7 @@ RESET: READY / ARMED / TRACKING / FINISHED → READY (시작점과 궤적을 지
 
 ### HELLO: 접속 인사
 ```json
-{"cmd":"HELLO","version":"2.4","state":"IDLE","calibrated":true,"camera":"OK","profile":"practice_lime",
+{"cmd":"HELLO","version":"2.5","state":"IDLE","calibrated":true,"camera":"OK","profile":"practice_lime",
  "frame_w":1440,"frame_h":810,
  "holes":[{"id":1,"x_mm":2885.6,"y_mm":94.1},{"id":2,"x_mm":2895.0,"y_mm":486.2},{"id":3,"x_mm":2893.5,"y_mm":879.8}]}
 ```
@@ -326,6 +333,8 @@ RESET: READY / ARMED / TRACKING / FINISHED → READY (시작점과 궤적을 지
 - `version`: 프로토콜 버전. 새 명령·필드가 호환되게 추가되면 끝자리(2.2 → 2.3), 호환되지 않게 바뀌면 앞자리가 올라갑니다.
 - `calibrated`: 엔진에 저장된 캘리브레이션이 있는지. `true`이면 `ALIGN`을 `use_saved`로 보내 바로 쓸 수 있습니다.
 - `profile`: 지금 활성화된 공 검출 프로필의 `key` (`PROFILE` 명령 참고).
+- `auto` (2.5 추가): 엔진의 **자동 흐름**이 켜져 있는지 (`true`/`false`). 아래 "자동 흐름" 참고.
+- `start_zone` (2.5 추가): 저장된 시작 구역 `{"x_mm":..,"y_mm":..,"radius_mm":..}` 또는 `null`.
 - `holes` (2.4 추가): 엔진이 기억한 **홀컵 목록** (홀 번호 `id` 순서). 위치는 매트 mm 좌표(컵 중심)입니다.
   - 엔진은 공과 같은 색이면서 오래 같은 자리에 있는 물체(컵·티)를 "고정 물체"로 기억하고, 그중 공보다 확실히 큰 것(공 예상 면적의 1.3배 이상)을 홀컵으로 봅니다.
   - **홀 번호 규칙**: 매트 위쪽(y가 작은 쪽) → 아래쪽 순서로 1번부터. 같은 높이(y 차이 50mm 이내)면 왼쪽 → 오른쪽.
@@ -333,6 +342,31 @@ RESET: READY / ARMED / TRACKING / FINISHED → READY (시작점과 궤적을 지
   - 아직 모르면(캘리브레이션 전, 컵 없음) 빈 목록 `[]`, 캘리브레이션이 무효면 `x_mm`/`y_mm`이 `null`입니다.
 - `frame_w`, `frame_h` (2.3 추가): 엔진이 처리하는 화면 크기(픽셀). 카메라 원본(예: 1920x1080)을 축소·왜곡 보정한 뒤의 크기입니다(예: 0.75배면 1440x810). `ALIGN`의 `corners`는 이 크기의 화면 기준 좌표여야 합니다. 엔진이 아직 카메라 영상을 한 장도 못 받았으면 `null`입니다.
 - `calibrated`는 엔진의 처리 조건(화면 크기·왜곡 보정)이 저장된 캘리브레이션 때와 같을 때만 `true`입니다. 엔진 설정(`process_scale`, `undistort_k1`)이 바뀌면 저장된 모서리가 화면과 맞지 않으므로 `false`가 되고, `ALIGN`을 다시 해야 합니다 (`use_saved`는 `not_calibrated`로 거절).
+
+### 자동 흐름 (2.5)
+엔진이 버튼·명령 없이 "공 놓기 → 퍼팅 → 결과 → 공 다시 놓기"를 스스로 진행합니다 (기본 켜짐).
+
+| 엔진 상태 | 조건 | 엔진이 하는 일 | 컨트롤이 받는 메시지 |
+|---|---|---|---|
+| 시작 | 저장된 캘리브레이션 유효 | 바로 `READY` | `STATUS(READY)` |
+| `READY` | 시작 구역 안에 공이 1초 가만히 있음 | 시작점 등록 → `ARMED` | `INIT` `event:"AUTO"` → `STATUS(ARMED)` |
+| `ARMED` | 공이 움직임 | `TRACKING` (예전과 같음) | `TRACK START` → `STATUS` ... |
+| `TRACKING` | 100mm 미만 움직이고 1.5초 안에 멈춤 (공 자리 고쳐 놓기) | 퍼팅 취소, 다시 `ARMED`(또는 `READY`) | `TRACK` `event:"CANCEL"`, **`RESULT` 없음** |
+| `TRACKING` | 정지 / 홀인 / 이탈 | `FINISHED` + 엔진 DB에 자동 저장 | `STATUS(FINISHED)` → `RESULT` |
+| `FINISHED` | 공을 집었다가 시작 구역에 다시 놓음 | 다음 퍼팅 준비 → `ARMED` | `INIT` `event:"AUTO"` → `STATUS(ARMED)` |
+| `ARMED` | 공이 3초 넘게 안 보임 (공을 집어 감) | 시작점을 지우고 `READY` | `STATUS(READY)` |
+
+- 시작 구역: 처음 한 번 `INIT`(또는 엔진 화면의 "시작 위치 등록")을 하면 그 자리가 저장됩니다. `SET_ADDR`로 어드레스를 정하면 그 위치를 시작 구역으로 씁니다.
+- **컨트롤이 `INIT`/`ADD`/`ABORT`/`RESET`을 보내면 예전과 똑같이 처리**하고, 자동 흐름은 그 결과 상태에서 이어서 동작합니다.
+  `ABORT`·`RESET` 뒤에는 공을 집었다가 다시 놓기 전까지 자동으로 다시 준비하지 않습니다.
+- **컨트롤이 모든 단계를 직접 조종하고 싶으면 `{"cmd":"AUTO","enabled":false}`를 보내세요.** 그러면 2.4와 완전히 같게 동작합니다.
+
+```json
+{"cmd":"INIT","event":"AUTO","x":340.2,"y":512.8}
+{"cmd":"TRACK","event":"CANCEL","reason":"READDRESS"}
+```
+- `INIT` `event:"AUTO"`: 자동으로 잡은 시작점(mm). 명령 응답(`result` 필드가 있음)과 구별됩니다.
+- `TRACK` `event:"CANCEL"`: 방금 시작된 추적이 퍼팅이 아니었음. `reason`은 지금은 `"READDRESS"`(자리 고쳐 놓기)뿐입니다. 이 추적의 `RESULT`는 오지 않습니다.
 
 ### 홀컵을 공으로 잡지 않음 (25단계, 메시지 형식 변경 없음)
 엔진은 캘리브레이션이 있으면 공 크기를 mm 기준(지름 42.67mm)으로 판정해서, 공보다 큰 흰 컵을 공으로 보지 않습니다.
@@ -397,6 +431,7 @@ RESET: READY / ARMED / TRACKING / FINISHED → READY (시작점과 궤적을 지
 - `reason`: `STOP`(공이 멈춤) / `LOST`(공이 화면을 벗어남) / **`HOLE_IN`(공이 홀컵에 들어감, 2.4 추가)**. 추적이 끝나면 `STATUS(FINISHED)`가 먼저 오고 그 다음에 `RESULT`가 옵니다.
 - `hole` (2.4 추가): `HOLE_IN`이면 들어간 컵의 홀 번호(`HELLO.holes`의 `id`), 아니면 `null`.
   - 홀인 판정: 추적 중 공이 컵 중심 근처(기본 60mm 안)에서 사라지고 0.5초 동안 다시 보이지 않으면 `HOLE_IN`입니다. 그 사이 다시 보이면(컵을 스치고 나옴) 추적을 계속합니다.
+  - (2.5) 공이 컵 테두리에 바짝 붙어 멈춰서 컵과 한 덩어리로 보이는 경우는 `HOLE_IN`이 아니라 `STOP`입니다.
   - `HOLE_IN`일 때 `stop`(끝 위치)은 **컵 중심** 좌표입니다. `points`의 마지막 점은 공이 사라지기 직전 위치입니다.
   - 컵과 먼 곳에서 사라지면 예전처럼 2초 뒤 `LOST`입니다. 2.3까지의 컨트롤은 `reason`을 `STOP`/`LOST`로만 처리했다면 `HOLE_IN`을 "끝남"으로 처리하도록 추가하면 됩니다 (다른 필드는 그대로).
 - 요약값: `distance_mm`(총 이동 거리), `duration`(초), `avg_speed`·`max_speed`(mm/초), `straightness`(0~1, 1에 가까울수록 직선). 점이 2개 미만이라 통계를 못 구하면 `null`입니다.
