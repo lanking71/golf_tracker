@@ -13,3 +13,6 @@ __pycache__/
 build/
 dist/
 logs/
+
+# 25단계: 이 PC(현장)의 설정 파일은 git에 올리지 않는다 (기본값은 config/settings.default.json)
+config/settings.json

@@ -22,6 +22,8 @@ from src.config import load_settings
 from src.paths import BASE_DIR
 
 DEFAULT_DB_PATH = "data/results.db"
+# 25단계에 추가한 칸 (이름, 형식). 예전 DB에는 _init_db가 이 칸들을 덧붙인다.
+NEW_COLUMNS = [("finish_reason", "TEXT"), ("hole", "INTEGER")]
 
 
 @dataclass
@@ -41,6 +43,9 @@ class SavedResult:
     mat_width_mm: float
     mat_height_mm: float
     trajectory_mm: list = field(default_factory=list)  # [(x_mm, y_mm), ...]
+    # 25단계: 종료 사유 ("정지 감지" / "화면 이탈" / "홀인")와 홀인한 컵 번호. 예전 기록은 None
+    finish_reason: str | None = None
+    hole: int | None = None
 
 
 class Storage:
@@ -87,6 +92,12 @@ class Storage:
                 )
                 """
             )
+            # 25단계: 예전 DB(이 칸이 없는 파일)도 깨지지 않게, 없는 칸만 뒤에 덧붙인다.
+            # 예전 기록의 새 칸은 비어 있는 값(NULL)이 된다.
+            existing = {row["name"] for row in conn.execute("PRAGMA table_info(results)").fetchall()}
+            for column, column_type in NEW_COLUMNS:
+                if column not in existing:
+                    conn.execute(f"ALTER TABLE results ADD COLUMN {column} {column_type}")
 
     def save_result(
         self,
@@ -101,6 +112,8 @@ class Storage:
         mat_width_mm: float,
         mat_height_mm: float,
         trajectory_mm: list,
+        finish_reason: str | None = None,
+        hole: int | None = None,
     ) -> int:
         """결과 한 건을 저장하고, 새로 생긴 행의 id를 반환한다."""
         recorded_at = datetime.now().isoformat(timespec="seconds")
@@ -111,8 +124,9 @@ class Storage:
                     recorded_at, profile_name,
                     start_x_mm, start_y_mm, stop_x_mm, stop_y_mm,
                     total_distance_cm, duration_s, average_speed_cm, max_speed_cm,
-                    straightness, mat_width_mm, mat_height_mm, trajectory_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    straightness, mat_width_mm, mat_height_mm, trajectory_json,
+                    finish_reason, hole
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     recorded_at,
@@ -129,6 +143,8 @@ class Storage:
                     mat_width_mm,
                     mat_height_mm,
                     json.dumps(trajectory_mm),
+                    finish_reason,
+                    hole,
                 ),
             )
             return cursor.lastrowid
@@ -173,4 +189,6 @@ class Storage:
             mat_width_mm=row["mat_width_mm"],
             mat_height_mm=row["mat_height_mm"],
             trajectory_mm=trajectory,
+            finish_reason=row["finish_reason"],
+            hole=row["hole"],
         )

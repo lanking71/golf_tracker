@@ -135,7 +135,7 @@ class StaleCalibrationTests(unittest.TestCase):
         hello.clear()
         engine.protocol_handler.on_client_connected("A")
         self.assertEqual((hello[0]["frame_w"], hello[0]["frame_h"]), (1280, 720))
-        self.assertEqual(hello[0]["version"], "2.3")
+        self.assertEqual(hello[0]["version"], "2.4")
 
 
 class ScaledEngineTests(unittest.TestCase):

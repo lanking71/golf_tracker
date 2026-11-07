@@ -7,8 +7,8 @@ IDLE(대기) -> CALIBRATING(캘리브레이션 중) -> READY(시작 위치 등�
 -> TRACKING(공 이동 중) -> FINISHED(추적 완료)
 
 '추적 준비'(앱의 ADD 명령)를 누르면 바로 TRACKING이 되지 않고 ARMED가 된다.
-ARMED에서는 정지·이탈 판정을 하지 않고 공이 시작점에서 arm_move_distance(px)
-이상 움직이는 순간 자동으로 TRACKING이 된다. 그래서 퍼팅 전에 공이 오래
+ARMED에서는 정지·이탈 판정을 하지 않고 공이 시작점에서 arm_move_distance(px, 캘리브레이션이
+있으면 arm_move_distance_mm) 이상 움직이는 순간 자동으로 TRACKING이 된다. 그래서 퍼팅 전에 공이 오래
 가만히 있어도 "정지"로 오판해 추적이 끝나버리지 않는다. 추적이 시작된 시각은
 공이 마지막으로 가만히 있던 프레임(tracking_started_at)으로 기록해서, 스윙 직후의
 시작 시각이 정확하다.
@@ -45,6 +45,17 @@ TRACKING 중에는 매 프레임 update_detection()을 호출해 정지·이탈�
 - 이탈: 공 검출 실패가 lost_duration초 이상 지속되면 화면 이탈로 보고
   FINISHED로 전환한다.
 전환 사유는 finish_reason에 "정지 감지" / "화면 이탈"로 남는다.
+
+25단계 추가:
+- 홀인: 공이 홀컵(고정 물체, src/static_objects.py) 근처에서 사라진 뒤 hole.confirm_duration초
+  (기본 0.5초) 동안 다시 나타나지 않으면 "홀인"으로 끝낸다. 끝 위치(stop_position)는 컵 중심이고,
+  어느 컵인지는 finish_hole(홀 번호)에 남는다. 그 사이에 공이 다시 보이면(컵을 스치고 지나감,
+  립아웃) 추적을 계속한다. 컵과 먼 곳에서 사라지면 예전처럼 lost_duration 뒤 "화면 이탈".
+  '어느 컵 근처인지'는 엔진이 넣어 주는 hole_finder 함수가 판단한다 (mm 거리 계산은 엔진 몫).
+- 이동 기준을 mm로: arm_move_distance_mm / min_move_distance_mm / max_jump_distance_mm.
+  엔진이 mm_to_px 함수(그 위치 근처에서 mm가 몇 px인지)를 넣어 주면 mm 값을 그 위치의 px로 바꿔
+  쓰고, 캘리브레이션이 없어서 바꿀 수 없으면 예전 px 값(arm_move_distance 등)을 그대로 쓴다.
+  매트 크기·카메라 높이가 현장마다 달라도 같은 mm 값으로 같은 동작을 한다.
 """
 
 from dataclasses import dataclass
@@ -69,9 +80,18 @@ DEFAULT_LOST_DURATION = 2.0
 # tracking.arm_move_distance로 조정한다.
 DEFAULT_ARM_MOVE_DISTANCE = 8
 
+# 25단계: 이동 기준(mm). 캘리브레이션이 있으면 이 값을 쓰고, 없으면 위의 px 값을 쓴다.
+# 22단계 보고: 0.75배 화면에서 8px = 약 18mm -> 지금 동작과 비슷하게 맞춘 값이다.
+DEFAULT_ARM_MOVE_DISTANCE_MM = 20
+DEFAULT_MIN_MOVE_DISTANCE_MM = 10
+DEFAULT_MAX_JUMP_DISTANCE_MM = 500
+# 25단계: 홀인 확정 시간(초). 공이 컵 근처에서 사라진 뒤 이 시간 동안 다시 안 보이면 홀인
+DEFAULT_HOLE_CONFIRM_DURATION = 0.5
+
 # finish_reason에 남는 종료 사유 문구 (상태 배지에 그대로 표시됨)
 STOP_REASON = "정지 감지"
 LOST_REASON = "화면 이탈"
+HOLE_REASON = "홀인"
 
 
 class TrackerState(Enum):
@@ -128,7 +148,9 @@ class Tracker:
         "save": {TrackerState.FINISHED},
     }
 
-    def __init__(self, settings: dict | None = None):
+    def __init__(self, settings: dict | None = None, hole_settings: dict | None = None):
+        if hole_settings is None and settings is None:
+            hole_settings = load_settings().get("hole", {})
         self.state = TrackerState.IDLE
         # 등록된 공의 시작 위치 (x, y) - 픽셀 좌표, 없으면 None
         self.start_position: tuple[int, int] | None = None
@@ -136,8 +158,16 @@ class Tracker:
         self.trajectory: list[TrajectoryPoint] = []
         # 정지 판정으로 멈춘 위치 (x, y) - 없으면 None
         self.stop_position: tuple[int, int] | None = None
-        # FINISHED로 전환된 사유 ("정지 감지" / "화면 이탈"), 없으면 None
+        # FINISHED로 전환된 사유 ("정지 감지" / "화면 이탈" / "홀인"), 없으면 None
         self.finish_reason: str | None = None
+        # 홀인으로 끝났을 때 그 컵의 홀 번호 (아니면 None)
+        self.finish_hole: int | None = None
+
+        # 25단계: 엔진이 넣어 주는 함수들 (없으면 예전 px 기준 동작)
+        # - mm_to_px(point, mm): point(px) 근처에서 매트 위 mm 거리가 몇 px인지. 캘리브레이션이 없으면 None
+        # - hole_finder(x, y): (x, y)(px)가 어느 홀컵 근처면 (홀 번호, (컵 중심 x, y) px), 아니면 None
+        self.mm_to_px = None
+        self.hole_finder = None
 
         loaded = settings if settings is not None else load_settings().get("tracking", {})
         self._min_move_distance = loaded.get("min_move_distance", DEFAULT_MIN_MOVE_DISTANCE)
@@ -150,6 +180,14 @@ class Tracker:
         self._stop_duration = loaded.get("stop_duration", DEFAULT_STOP_DURATION)
         self._lost_duration = loaded.get("lost_duration", DEFAULT_LOST_DURATION)
         self._arm_move_distance = loaded.get("arm_move_distance", DEFAULT_ARM_MOVE_DISTANCE)
+        # 25단계: mm 기준 이동 거리 (캘리브레이션이 있을 때 위의 px 값 대신 쓴다).
+        # 설정에 null을 넣으면 mm 기준을 쓰지 않고 px 값만 쓴다.
+        self._arm_move_distance_mm = loaded.get("arm_move_distance_mm", DEFAULT_ARM_MOVE_DISTANCE_MM)
+        self._min_move_distance_mm = loaded.get("min_move_distance_mm", DEFAULT_MIN_MOVE_DISTANCE_MM)
+        self._max_jump_distance_mm = loaded.get("max_jump_distance_mm", DEFAULT_MAX_JUMP_DISTANCE_MM)
+        self._hole_confirm_duration = (hole_settings or {}).get(
+            "confirm_duration", DEFAULT_HOLE_CONFIRM_DURATION
+        )
 
         # ARMED(추적 대기)용:
         # - 공이 마지막으로 시작점 근처에 가만히 있던 프레임의 시각 (추적 시작 시각이 된다)
@@ -171,6 +209,35 @@ class Tracker:
         self._stop_since: float | None = None
         # 이탈 판정용: 공을 못 찾기 시작한 시각
         self._lost_since: float | None = None
+        # 홀인 판정용: 공이 사라진 자리가 홀컵 근처였으면 (홀 번호, 컵 중심 px), 아니면 None
+        self._lost_hole: tuple | None = None
+
+    # ------------------------------------------------------------------
+    # 25단계: mm 기준 이동 거리
+    # ------------------------------------------------------------------
+    def _distance_px(self, point, px_value: float, mm_value) -> float:
+        """이동 기준값을 이 위치(point) 근처의 px로 돌려준다.
+
+        mm 값이 있고 엔진이 mm_to_px를 넣어 줬으며 캘리브레이션이 있으면 mm를 px로 바꾼 값,
+        그렇지 않으면 설정의 px 값을 그대로 쓴다.
+        """
+        if mm_value is not None and self.mm_to_px is not None and point is not None:
+            converted = self.mm_to_px(point, float(mm_value))
+            if converted is not None:
+                return converted
+        return px_value
+
+    def arm_move_threshold(self, point) -> float:
+        """추적 시작(ARMED -> TRACKING)으로 보는 이동 거리(px). point = 기준 위치."""
+        return self._distance_px(point, self._arm_move_distance, self._arm_move_distance_mm)
+
+    def min_move_threshold(self, point) -> float:
+        """궤적에 새 점을 기록하는 최소 이동 거리(px). point = 직전 기록점."""
+        return self._distance_px(point, self._min_move_distance, self._min_move_distance_mm)
+
+    def max_jump_threshold(self, point) -> float:
+        """이 거리(px) 이상 떨어지면 오검출 의심 (궤적 패널이 선을 끊는 기준이기도 하다)."""
+        return self._distance_px(point, self.max_jump_distance, self._max_jump_distance_mm)
 
     def can(self, action: str) -> bool:
         """지금 상태에서 이 동작을 해도 되는지 확인한다. (버튼 활성화 여부에 사용)"""
@@ -227,7 +294,9 @@ class Tracker:
         self.trajectory = []
         self.stop_position = None
         self.finish_reason = None
+        self.finish_hole = None
         self.tracking_started_at = None
+        self._lost_hole = None
         self._consecutive_jump_count = 0
         self._last_seen_position = None
         self._last_raw_position = None
@@ -269,13 +338,16 @@ class Tracker:
 
         last = self.trajectory[-1]
         distance = ((x - last.x) ** 2 + (y - last.y) ** 2) ** 0.5
+        # 기준값(px)은 직전 기록점 근처에서 계산한다 (캘리브레이션이 있으면 mm 기준)
+        max_jump = self.max_jump_threshold((last.x, last.y))
+        min_move = self.min_move_threshold((last.x, last.y))
 
-        if distance >= self.max_jump_distance:
+        if distance >= max_jump:
             consistent_with_last_seen = False
             if self._last_seen_position is not None:
                 seen_x, seen_y = self._last_seen_position
                 seen_distance = ((x - seen_x) ** 2 + (y - seen_y) ** 2) ** 0.5
-                consistent_with_last_seen = seen_distance < self.max_jump_distance
+                consistent_with_last_seen = seen_distance < max_jump
 
             self._last_seen_position = (x, y)
 
@@ -286,7 +358,7 @@ class Tracker:
             # 직전 관측 좌표와 이어지거나(빠른 이동), 연속으로 계속 멀리
             # 떨어진 값이 나왔다(공을 실제로 옮김) - 둘 다 받아들인다.
             self._consecutive_jump_count = 0
-        elif distance < self._min_move_distance:
+        elif distance < min_move:
             self._last_seen_position = (x, y)
             return False
         else:
@@ -303,7 +375,7 @@ class Tracker:
         - ARMED: 공이 시작점에서 arm_move_distance 이상 움직이면 TRACKING으로 바꾼다
           (이때는 None을 반환한다. 시작됐는지는 state나 tracking_started_at으로 안다).
         - TRACKING: 조건을 만족해 FINISHED로 전환됐으면 종료 사유
-          (STOP_REASON/LOST_REASON)를 반환하고, 아니면 내부 타이머만 갱신하고
+          (STOP_REASON/LOST_REASON/HOLE_REASON)를 반환하고, 아니면 내부 타이머만 갱신하고
           None을 반환한다.
         그 밖의 상태에서는 아무 것도 하지 않는다.
         """
@@ -317,12 +389,25 @@ class Tracker:
             # 공을 못 찾음 -> 이탈 타이머 시작/유지
             if self._lost_since is None:
                 self._lost_since = timestamp
-            elif timestamp - self._lost_since >= self._lost_duration:
+                # 사라진 자리(마지막으로 본 위치)가 홀컵 근처인지 이때 한 번만 확인한다
+                self._lost_hole = None
+                if self.hole_finder is not None and self._last_raw_position is not None:
+                    self._lost_hole = self.hole_finder(*self._last_raw_position)
+                return None
+            lost_for = timestamp - self._lost_since
+            if self._lost_hole is not None and lost_for >= self._hole_confirm_duration:
+                # 컵 근처에서 사라진 뒤 다시 안 나타남 -> 홀인. 끝 위치는 컵 중심
+                hole_number, hole_center = self._lost_hole
+                self.stop_position = (int(round(hole_center[0])), int(round(hole_center[1])))
+                self.finish_hole = hole_number
+                return self._finish_with_reason(HOLE_REASON)
+            if lost_for >= self._lost_duration:
                 return self._finish_with_reason(LOST_REASON)
             return None
 
-        # 공을 다시 찾았으면 이탈 타이머는 리셋
+        # 공을 다시 찾았으면 이탈 타이머는 리셋 (컵을 스치고 다시 나타난 경우도 여기서 추적을 이어 간다)
         self._lost_since = None
+        self._lost_hole = None
 
         if self._last_raw_position is not None:
             prev_x, prev_y = self._last_raw_position
@@ -361,7 +446,7 @@ class Tracker:
             reference = self._arm_reference
 
         distance = ((x - reference[0]) ** 2 + (y - reference[1]) ** 2) ** 0.5
-        if distance < self._arm_move_distance:
+        if distance < self.arm_move_threshold(reference):
             self._armed_still_time = timestamp
             return
 
@@ -373,8 +458,10 @@ class Tracker:
         self.tracking_started_at = started_at
         self.stop_position = None
         self.finish_reason = None
+        self.finish_hole = None
         self._stop_since = None
         self._lost_since = None
+        self._lost_hole = None
         self._consecutive_jump_count = 0
         # 궤적은 '출발 위치(가만히 있던 마지막 시각)'와 '지금 위치' 두 점으로 시작한다.
         # (이번 프레임의 add_trajectory_point는 ARMED였을 때 불려서 기록되지 않았으므로

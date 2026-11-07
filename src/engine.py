@@ -23,9 +23,19 @@
 프로토콜 ALIGN corners)는 '전처리가 끝난 프레임' 기준이다. 처리 프레임 크기나
 왜곡 보정 값(k1)이 바뀌면 예전에 찍은 모서리는 맞지 않으므로, 엔진이 캘리브레이션을
 '안 된 상태'로 돌리고 로그·화면에 다시 하라고 알린다 (_check_processing_changed).
+
+25단계 추가:
+- 공 크기를 mm 기준으로 판정한다: 캘리브레이션으로 '그 위치에서 공이 보여야 할 면적'을 계산해
+  검출기에 넘긴다 (_expected_ball_area). 흰 홀컵(공의 약 2배)은 크기로 걸러진다.
+- 고정 물체(컵·티) 기억 (src/static_objects.py): 캘리브레이션 직후·시작점 등록 직후·엔진 시작
+  (저장된 값이 없거나 무효일 때)·'고정 물체 다시 찾기' 버튼에서 scan_duration초 동안 화면 전체를
+  지켜보고, 계속 같은 자리에 있던 공 색 물체를 기억한다. 그 자리의 후보는 공으로 보지 않는다.
+- 홀인: 공이 홀컵 근처에서 사라지면 Tracker가 "홀인"으로 끝낸다. 컵 근처인지는 _hole_at이 mm로 판단.
+- 이동 기준(추적 시작·궤적 기록·점프)을 mm로: Tracker에 _mm_to_px를 넣어 준다.
 """
 
 import logging
+import math
 import time
 from dataclasses import dataclass
 
@@ -35,14 +45,24 @@ from PySide6.QtCore import QObject, QTimer, Signal
 from src.calibration import Calibration, check_corners, detect_mat_corners
 from src.camera import Camera
 from src.config import load_settings, save_settings
-from src.detector import DEFAULT_DETECTION_SETTINGS, BallDetection, BallDetector
+from src.detector import DEFAULT_DETECTION_SETTINGS, BallDetection, BallDetector, ball_settings
 from src.lens import FramePreprocessor
 from src.search import SearchPlan, SearchPlanner
+from src.static_objects import (
+    MIN_OBJECT_AREA_PX,
+    MIN_OBJECT_AREA_RATIO,
+    SCAN_AUTO,
+    SCAN_MANUAL,
+    StaticObjectCollector,
+    StaticObjectMap,
+    number_holes,
+    static_settings,
+)
 from src.protocol_handler import ProtocolHandler
 from src.protocol_server import ProtocolServer
 from src.stats import compute_trajectory_stats
 from src.storage import Storage
-from src.tracker import Tracker, TrackerState, TrajectoryPoint
+from src.tracker import HOLE_REASON, Tracker, TrackerState, TrajectoryPoint
 
 logger = logging.getLogger("engine")
 
@@ -55,6 +75,14 @@ CAMERA_RETRY_INTERVAL_S = 1.0
 ERROR_LOG_INTERVAL_S = 5.0
 # 상태 요약(FPS·처리 시간)을 로그에 남기는 기본 간격(초). 0이면 남기지 않는다.
 DEFAULT_STATS_INTERVAL_S = 10
+
+# 25단계: 홀인 판정 기본값 (config/settings.json의 "hole" 항목에 값이 없을 때)
+DEFAULT_HOLE_SETTINGS = {
+    "enabled": True,
+    "capture_radius_mm": 60,  # 공이 컵 중심에서 이 거리(mm) 안에서 사라지면 홀인 후보
+    "confirm_duration": 0.5,  # 그 뒤 이 시간(초) 동안 다시 안 보이면 홀인 (src/tracker.py)
+    "min_area_ratio": 1.3,  # 고정 물체 면적이 공 예상 면적의 이 배수 이상이면 '홀컵'으로 본다
+}
 
 # 처리 프레임 크기·왜곡 보정이 바뀌어 저장된 캘리브레이션을 쓸 수 없을 때 알리는 문구
 CALIBRATION_STALE_MESSAGE = "해상도/왜곡 보정이 바뀌어 캘리브레이션을 다시 해야 합니다"
@@ -113,6 +141,8 @@ class VisionEngine(QObject):
     tracking_finished = Signal(str)
     # 처리 조건이 바뀌어 저장된 캘리브레이션이 무효가 됐을 때 (알림 문구를 함께 전달)
     calibration_invalidated = Signal(str)
+    # 25단계: 고정 물체 수집이 시작되거나(True) 끝났을 때(False) (화면이 안내 문구를 바꾼다)
+    static_scan_changed = Signal(bool)
 
     def __init__(self, camera=None, parent=None):
         """camera를 넘기지 않으면 실제 USB 카메라를 쓴다 (테스트에서는 가짜 카메라를 넘긴다)."""
@@ -126,6 +156,13 @@ class VisionEngine(QObject):
         self.detector = BallDetector()
         self.tracker = Tracker()
         self.calibration = Calibration()
+        # 25단계: mm 기준 공 크기·홀인·고정 물체 설정
+        self._load_size_settings()
+        # Tracker는 캘리브레이션을 모르므로, mm -> px 변환과 '컵 근처인지' 판단을 엔진이 넣어 준다
+        self.tracker.mm_to_px = self._mm_to_px
+        self.tracker.hole_finder = self._hole_at
+        # 크기 판정으로 걸러진 후보 수 (상태 요약 로그용, 구간마다 비운다)
+        self._stats_size_rejected = 0
         self.storage = Storage()
         # 24단계: 공을 화면 전체가 아니라 '있을 만한 곳' 주변에서만 찾는다 (src/search.py)
         self.search = SearchPlanner(load_settings().get("search"))
@@ -215,6 +252,7 @@ class VisionEngine(QObject):
         # 시작하자마자 k1·처리 조건 기록 여부만이라도 먼저 검사한다 (예전 설정 파일은 여기서
         # 무효 처리된다). 프레임 크기는 첫 프레임을 받은 뒤 _check_processing_changed에서 검사한다.
         self._validate_calibration()
+        self._validate_static_objects()
         # 저장된 모서리 모양과 매트 크기의 비율이 크게 다르면(크기 오타) 경고를 남긴다.
         self._update_calibration_notice()
 
@@ -275,6 +313,7 @@ class VisionEngine(QObject):
         """
         if now is None:
             now = time.time()
+        self._clock_hint = now
         processed = False
         try:
             processed = self._process_frame(now)
@@ -323,7 +362,14 @@ class VisionEngine(QObject):
         plan = self._plan_search(now)
         self.detector.debug_enabled = self.detection_debug
         detect_started = time.perf_counter()
-        raw_detection = self.detector.detect(frame, roi=plan.roi, prefer=plan.center)
+        raw_detection = self.detector.detect(
+            frame,
+            roi=plan.roi,
+            prefer=plan.center,
+            expected_area=self._expected_ball_area if self.calibration.is_calibrated() else None,
+            static_filter=self._static_filter if self.static_objects.objects else None,
+        )
+        self._stats_size_rejected += self.detector.last_size_rejected
         self._stats_detect_total += time.perf_counter() - detect_started
         self._stats_detect_frames += 1
         self._stats_roi_ratio_total += _roi_ratio(plan.roi, self.frame_size)
@@ -364,6 +410,9 @@ class VisionEngine(QObject):
             # 이번 프레임에서 공이 움직여 추적이 시작됐다 (ARMED -> TRACKING).
             # 앱에는 STATUS(TRACKING)보다 먼저 TRACK START 이벤트를 보낸다.
             logger.info("추적 시작 (시작 위치에서 공이 움직임)")
+            if self.static_collector.active:
+                # 공이 움직이는 중에는 '가만히 있는 물체'를 제대로 모을 수 없다 -> 수집 취소 (이전 목록 유지)
+                self._cancel_static_scan("추적 시작")
             self.protocol_handler.on_tracking_started(self.tracker.tracking_started_at)
             self.tracking_started.emit()
             self.trajectory_updated.emit()
@@ -373,6 +422,9 @@ class VisionEngine(QObject):
 
         if finish_reason is not None:
             self._finish_tracking(finish_reason)
+
+        # 25단계: 고정 물체 수집 중이면 화면 전체 덩어리를 모은다 (수집 시간 동안만)
+        self._feed_static_scan(frame, now)
 
         candidates = list(self.detector.last_candidates) if self.detection_debug else None
         self.frame_processed.emit(
@@ -422,7 +474,14 @@ class VisionEngine(QObject):
         self._checked_processing = key
         if first_check:
             self._validate_calibration()
+            self._validate_static_objects()
+            if not self.static_objects.objects and not self._static_checked_once:
+                # 저장된 고정 물체가 없거나 무효면, 캘리브레이션이 있을 때 한 번 자동으로 모은다
+                self._static_checked_once = True
+                if self.calibration.is_calibrated():
+                    self.start_static_scan(SCAN_AUTO, now=self._clock_hint)
             return
+        self._validate_static_objects()
 
         if not self._k1_previewing:
             # 슬라이더를 움직이는 동안에는 값마다 로그가 쌓이지 않게 남기지 않는다
@@ -492,6 +551,9 @@ class VisionEngine(QObject):
         self.calibration.save()
         self.calibration_warning = None
         self._update_calibration_notice()
+        # 25단계: 캘리브레이션 직후 고정 물체(컵 등)를 자동으로 모은다. 매트(컵 위치의 mm 좌표)가
+        # 바뀌었을 수 있기 때문이다. 공이 매트 위에 있을 수 있으니 공 크기 덩어리는 기억하지 않는다.
+        self.start_static_scan(SCAN_AUTO, now=self._clock_hint)
 
     def _update_calibration_notice(self) -> None:
         """찍은 4점 모양과 매트 크기의 비율이 크게 다르면 calibration_notice에 경고를 남긴다 (저장은 막지 않음)."""
@@ -524,7 +586,15 @@ class VisionEngine(QObject):
             self.detector.last_candidates = []
 
     def _finish_tracking(self, reason: str) -> None:
-        """정지·이탈로 추적이 끝났을 때: 결과를 앱에 보내고 화면에 알린다."""
+        """정지·이탈·홀인으로 추적이 끝났을 때: 결과를 앱에 보내고 화면에 알린다."""
+        if reason == HOLE_REASON:
+            last = self.tracker._last_raw_position
+            last_mm = self.calibration.pixel_to_real(*last) if last is not None else None
+            logger.info(
+                "홀인 판정 - %s번 컵, 공이 사라진 위치 %s",
+                self.tracker.finish_hole,
+                f"({last_mm[0]:.0f}, {last_mm[1]:.0f})mm" if last_mm else f"{last}px",
+            )
         logger.info("추적 종료 (%s) - 기록된 점 %d개", reason, len(self.tracker.trajectory))
         self.protocol_handler.on_finished(reason)
         self.tracking_finished.emit(reason)
@@ -611,13 +681,15 @@ class VisionEngine(QObject):
                 self._stats_roi_ratio_total / self._stats_detect_frames * 100 if self._stats_detect_frames else 0.0
             ),
             "errors": self.error_count,
+            # 25단계: 크기 판정(mm 기준 공 크기 등)으로 걸러진 후보 수 (컵 등)
+            "size_rejected": self._stats_size_rejected,
         }
         frame_text = f"{self.frame_size[0]}x{self.frame_size[1]}" if self.frame_size else "-"
         logger.info(
             "상태 요약 - FPS %.1f, 처리 시간(프레임을 받은 뒤 전처리~전송) 평균 %.1fms 최대 %.1fms "
             "(그중 전처리 평균 %.1fms, 공 검출 평균 %.1fms, 검색 영역 평균 화면의 %.0f%%%s), "
             "처리 프레임 %s (scale %.2f, k1 %.2f), "
-            "카메라 %s, 접속 %d대, 상태 %s, 오류 %d번",
+            "카메라 %s, 접속 %d대, 상태 %s, 오류 %d번, 크기로 걸러진 후보 %d개, 고정 물체 %d개",
             summary["fps"],
             summary["avg_ms"],
             summary["max_ms"],
@@ -632,8 +704,11 @@ class VisionEngine(QObject):
             self.protocol_server.client_count(),
             self.tracker.state.name,
             self.error_count,
+            self._stats_size_rejected,
+            len(self.static_objects.objects),
         )
         self._stats_since = time.perf_counter()
+        self._stats_size_rejected = 0
         self._stats_frames = 0
         self._stats_proc_total = 0.0
         self._stats_proc_max = 0.0
@@ -845,6 +920,8 @@ class VisionEngine(QObject):
             return START_OUTSIDE_MAT if self.last_detection_outside_mat else START_NO_BALL
         if not self.tracker.register_start_position(self.last_detection.x, self.last_detection.y):
             return START_BAD_STATE
+        # 25단계: 시작점에 놓인 공을 뺀 나머지 '가만히 있는 공 색 물체'를 고정 물체로 모은다
+        self.start_static_scan(SCAN_AUTO, now=self._clock_hint)
         return START_OK
 
     def start_tracking(self) -> bool:
@@ -933,6 +1010,8 @@ class VisionEngine(QObject):
             mat_width_mm=self.calibration.mat_width_mm,
             mat_height_mm=self.calibration.mat_height_mm,
             trajectory_mm=[(p.x, p.y) for p in real_trajectory],
+            finish_reason=self.tracker.finish_reason,
+            hole=self.tracker.finish_hole,
         )
         return SAVE_OK, result_id
 
@@ -976,6 +1055,202 @@ class VisionEngine(QObject):
         return "OK"
 
     # ------------------------------------------------------------------
+    # 25단계: mm 기준 공 크기 · 고정 물체 · 홀인
+    # ------------------------------------------------------------------
+    def _load_size_settings(self) -> None:
+        """ball / hole / static 설정과 저장된 고정 물체 목록을 불러온다."""
+        settings = load_settings()
+        self.ball = ball_settings(settings.get("ball"))
+        self.hole_settings = {**DEFAULT_HOLE_SETTINGS, **(settings.get("hole") or {})}
+        self.static_config = static_settings(settings.get("static"))
+        self.static_objects = StaticObjectMap.from_settings(
+            settings.get("static_objects"), self.static_config["rim_accept_ratio"]
+        )
+        # 저장 파일에 있던 목록 (처리 조건이 다시 맞으면 되살리려고 따로 기억해 둔다)
+        self._saved_static_objects = self.static_objects
+        self.static_collector = StaticObjectCollector(
+            self.static_config["scan_duration"], self.static_config["still_tolerance_px"]
+        )
+        # 엔진 시작 후 첫 프레임에서 '저장된 고정 물체가 없으면 자동 수집'을 한 번만 하기 위한 표시
+        self._static_checked_once = getattr(self, "_static_checked_once", False)
+        # 지금 처리 중인 프레임 시각 (수집 시작 시각으로 쓴다. 프레임 처리 밖에서 불리면 현재 시각)
+        self._clock_hint = getattr(self, "_clock_hint", None)
+
+    def _expected_ball_area(self, x: float, y: float) -> float | None:
+        """(x, y) 위치에서 공이 보여야 할 면적(px²). 캘리브레이션이 없으면 None (픽셀 기준 판정)."""
+        return self.calibration.expected_ball_area_px((x, y), self.ball["diameter_mm"])
+
+    def _ball_radius_px(self, x: float, y: float) -> float | None:
+        """(x, y) 위치에서 공 반경(px). 예상 면적에서 거꾸로 구한다 (넓이 = 원주율 x 반경²)."""
+        area = self._expected_ball_area(x, y) if self.calibration.is_calibrated() else None
+        return math.sqrt(area / math.pi) if area else None
+
+    def _static_filter(self, x: float, y: float, ball_ok: bool) -> bool:
+        """검출기가 후보마다 묻는다: 고정 물체 자리라서 공으로 보면 안 되는가?"""
+        return self.static_objects.is_static_candidate(x, y, ball_ok, self._ball_radius_px(x, y))
+
+    def _mm_to_px(self, point, mm: float) -> float | None:
+        """Tracker용: point(px) 근처에서 매트 위 mm 거리가 몇 px인지 (캘리브레이션 없으면 None)."""
+        return self.calibration.mm_radius_to_px(point, mm)
+
+    def _hole_at(self, x: float, y: float):
+        """Tracker용: 공이 (x, y)(px)에서 사라졌을 때, 그 자리가 홀컵 근처면 (홀 번호, 컵 중심 px).
+
+        '근처' = 컵 중심에서 capture_radius_mm(기본 60mm) 안. 다만 컵이 크게 보이는 현장(컵 반경 +
+        공 반경이 60mm보다 큼)에서는 공이 컵 테두리에 닿는 거리까지 넓혀 준다.
+        캘리브레이션이 없거나 홀인 판정이 꺼져 있으면 None (예전처럼 '화면 이탈'로 끝난다).
+        """
+        if not self.hole_settings.get("enabled", True) or not self.calibration.is_calibrated():
+            return None
+        point_mm = self.calibration.pixel_to_real(x, y)
+        if point_mm is None:
+            return None
+        best = None
+        best_distance = float("inf")
+        for hole in self.static_objects.holes():
+            hole_mm = self.calibration.pixel_to_real(hole.x, hole.y)
+            px_per_mm = (self.calibration.mm_radius_to_px((hole.x, hole.y), 100.0) or 0) / 100.0
+            if hole_mm is None or px_per_mm <= 0:
+                continue
+            hole_radius_mm = hole.radius / px_per_mm
+            capture = max(
+                float(self.hole_settings["capture_radius_mm"]), hole_radius_mm + self.ball["diameter_mm"] / 2
+            )
+            distance = math.hypot(point_mm[0] - hole_mm[0], point_mm[1] - hole_mm[1])
+            if distance <= capture and distance < best_distance:
+                best_distance, best = distance, (hole.hole, (hole.x, hole.y))
+        return best
+
+    def hole_list(self) -> list[dict]:
+        """홀컵 목록 [{id, x_mm, y_mm}] (프로토콜 HELLO.holes용). 캘리브레이션 전이면 mm는 null."""
+        result = []
+        for hole in self.static_objects.holes():
+            mm = self.calibration.pixel_to_real(hole.x, hole.y)
+            result.append({
+                "id": hole.hole,
+                "x_mm": round(mm[0], 1) if mm else None,
+                "y_mm": round(mm[1], 1) if mm else None,
+            })
+        return result
+
+    def _validate_static_objects(self) -> None:
+        """저장된 고정 물체가 지금 처리 조건(프레임 크기·k1)에서 모은 것인지 확인한다.
+
+        다르면(해상도·왜곡 보정이 바뀜) 화면 좌표가 맞지 않으므로 쓰지 않는다 (파일의 값은 남겨 둔다:
+        조건을 되돌리면 다시 쓸 수 있게).
+        """
+        saved = self._saved_static_objects
+        valid = saved.matches_processing(self.frame_size, self.preprocessor.undistort_k1)
+        if valid:
+            if self.static_objects is not saved:
+                self.static_objects = saved
+                logger.info("저장된 고정 물체 %d개를 다시 사용합니다", len(saved.objects))
+            return
+        if saved.objects and self.static_objects.objects:
+            logger.warning(
+                "처리 조건(해상도/왜곡 보정)이 바뀌어 저장된 고정 물체 %d개를 쓰지 않습니다 - "
+                "'고정 물체 다시 찾기'를 하세요",
+                len(saved.objects),
+            )
+        self.static_objects = StaticObjectMap(rim_accept_ratio=self.static_config["rim_accept_ratio"])
+
+    @property
+    def static_scan_active(self) -> bool:
+        """고정 물체를 모으는 중인지 (화면 안내용)."""
+        return self.static_collector.active
+
+    def rescan_static_objects(self) -> bool:
+        """'고정 물체 다시 찾기' 버튼: 공을 치운 상태에서 고정 물체를 다시 모은다.
+
+        추적 대기·추적 중에는 할 수 없다 (False). 이 수집은 공 크기 덩어리도 모두 기억하므로
+        반드시 공을 매트에서 치우고 눌러야 한다 (시작점이 등록돼 있으면 그 자리는 뺀다).
+        """
+        if self.tracker.state in (TrackerState.ARMED, TrackerState.TRACKING):
+            return False
+        return self.start_static_scan(SCAN_MANUAL, now=self._clock_hint)
+
+    def start_static_scan(self, kind: str, now: float | None = None) -> bool:
+        """고정 물체 수집을 시작한다 (scan_duration초 뒤 자동으로 끝나고 저장된다)."""
+        if not self.static_config.get("enabled", True):
+            return False
+        if now is None:
+            now = time.time()
+        exclude = [self.tracker.start_position] if self.tracker.start_position is not None else []
+        self.static_collector.start(now, kind, exclude)
+        logger.info(
+            "고정 물체 수집 시작 (%s, %.1f초)%s",
+            "수동" if kind == SCAN_MANUAL else "자동",
+            self.static_collector.duration,
+            " - 시작점의 공은 뺍니다" if exclude else "",
+        )
+        self.static_scan_changed.emit(True)
+        return True
+
+    def _cancel_static_scan(self, why: str) -> None:
+        self.static_collector.cancel()
+        logger.info("고정 물체 수집 취소 (%s) - 이전 목록을 그대로 씁니다", why)
+        self.static_scan_changed.emit(False)
+
+    def _feed_static_scan(self, frame, now: float) -> None:
+        """수집 중이면 이번 프레임의 화면 전체 덩어리를 넣고, 시간이 다 되면 결과를 저장한다."""
+        collector = self.static_collector
+        if not collector.active:
+            return
+        calibrated = self.calibration.is_calibrated()
+        expected_fn = self._expected_ball_area if calibrated else None
+        blobs = self.detector.find_blobs(frame, expected_fn)
+        center_area = None
+        if calibrated and self.frame_size is not None:
+            center_area = self._expected_ball_area(self.frame_size[0] / 2, self.frame_size[1] / 2)
+        min_area = center_area * MIN_OBJECT_AREA_RATIO if center_area else MIN_OBJECT_AREA_PX
+        inside = self.calibration.is_inside if self.calibration.filter_outside_mat else None
+        collector.feed(blobs, now, min_area, inside)
+        if collector.done(now):
+            self._finish_static_scan()
+
+    def _finish_static_scan(self) -> None:
+        objects = self.static_collector.finish(self._ball_radius_px)
+        if objects is None:
+            logger.warning("고정 물체 수집 실패 - 수집 중 받은 프레임이 너무 적습니다 (이전 목록 유지)")
+            self.static_scan_changed.emit(False)
+            return
+        calibrated = self.calibration.is_calibrated()
+        number_holes(
+            objects,
+            self._expected_ball_area if calibrated else (lambda _x, _y: None),
+            self.calibration.pixel_to_real,
+            float(self.hole_settings["min_area_ratio"]),
+        )
+        new_map = StaticObjectMap(
+            objects,
+            self.frame_size,
+            self.preprocessor.undistort_k1,
+            self.static_config["rim_accept_ratio"],
+        )
+        self.static_objects = new_map
+        self._saved_static_objects = new_map
+        settings = load_settings()
+        settings["static_objects"] = new_map.to_settings()
+        save_settings(settings)
+
+        holes = new_map.holes()
+        logger.info("고정 물체 수집 완료 - %d개 (그중 홀컵 %d개)", len(objects), len(holes))
+        for obj in objects:
+            expected = self._expected_ball_area(obj.x, obj.y) if calibrated else None
+            logger.info(
+                "  고정 물체%s: 위치 (%.0f, %.0f)px%s, 반경 %.1fpx, 면적 %.0fpx²%s",
+                f" (홀 {obj.hole}번)" if obj.hole is not None else "",
+                obj.x,
+                obj.y,
+                f" = ({obj.x_mm:.0f}, {obj.y_mm:.0f})mm" if obj.x_mm is not None else "",
+                obj.radius,
+                obj.area,
+                f" (공 예상 면적의 x{obj.area / expected:.2f})" if expected else "",
+            )
+        self.static_scan_changed.emit(False)
+        self.changed.emit()
+
+    # ------------------------------------------------------------------
     # 설정 다시 불러오기
     # ------------------------------------------------------------------
     def reload_detector(self) -> None:
@@ -988,6 +1263,7 @@ class VisionEngine(QObject):
         self.reload_detector()
         # 검색 영역 설정도 다시 읽는다 (search.enabled 등)
         self.search = SearchPlanner(load_settings().get("search"))
+        self._load_size_settings()
         # 핸들러는 항상 engine.calibration을 통해 접근하므로 따로 맞출 필요가 없다.
         self.calibration = Calibration()
         # 다시 불러온 캘리브레이션도 지금 처리 조건(프레임 크기·k1)에 맞는지 확인한다.

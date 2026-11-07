@@ -1,0 +1,92 @@
+{
+    "camera": {
+        "width": 1920,
+        "height": 1080,
+        "fps": 0,
+        "use_mjpg": true,
+        "rotate": 0,
+        "process_scale": 0.75,
+        "undistort_k1": 0.0
+    },
+    "detection": {
+        "active_profile": "practice",
+        "profiles": {
+            "practice": {
+                "name": "연습용 (흰 공)",
+                "hsv_lower": [0, 0, 180],
+                "hsv_upper": [180, 60, 255],
+                "min_area": 80,
+                "max_area": 600,
+                "min_circularity": 0.7
+            },
+            "real": {
+                "name": "실전용 (분홍 공)",
+                "hsv_lower": [140, 80, 80],
+                "hsv_upper": [170, 255, 255],
+                "min_area": 80,
+                "max_area": 600,
+                "min_circularity": 0.7
+            },
+            "practice_lime": {
+                "name": "연습용 (연두 공)",
+                "hsv_lower": [25, 40, 30],
+                "hsv_upper": [55, 255, 255],
+                "min_area": 80,
+                "max_area": 600,
+                "min_circularity": 0.7
+            }
+        }
+    },
+    "ball": {
+        "diameter_mm": 42.67,
+        "area_ratio_min": 0.6,
+        "area_ratio_max": 1.3
+    },
+    "tracking": {
+        "min_move_distance": 6,
+        "max_jump_distance": 200,
+        "arm_move_distance": 8,
+        "min_move_distance_mm": 10,
+        "max_jump_distance_mm": 500,
+        "arm_move_distance_mm": 20,
+        "max_consecutive_jumps": 10,
+        "stop_threshold": 3,
+        "stop_duration": 1.0,
+        "lost_duration": 2.0
+    },
+    "search": {
+        "enabled": true,
+        "idle_radius_mm": 150,
+        "track_radius_mm": 120,
+        "lost_frames_full": 10
+    },
+    "static": {
+        "enabled": true,
+        "scan_duration": 3.0,
+        "still_tolerance_px": 3,
+        "rim_accept_ratio": 0.8
+    },
+    "hole": {
+        "enabled": true,
+        "capture_radius_mm": 60,
+        "confirm_duration": 0.5,
+        "min_area_ratio": 1.3
+    },
+    "calibration": {
+        "mat_width_mm": 3000,
+        "mat_height_mm": 1000,
+        "filter_outside_mat": true,
+        "auto_detect": false,
+        "mat_hsv_lower": [35, 40, 40],
+        "mat_hsv_upper": [85, 255, 255]
+    },
+    "protocol": {
+        "enabled": true,
+        "port": 9000,
+        "addr_radius_mm": 100,
+        "status_hz": 30
+    },
+    "storage": {
+        "db_path": "data/results.db"
+    }
+}

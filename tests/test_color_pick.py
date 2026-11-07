@@ -126,8 +126,10 @@ class ColorPickTests(unittest.TestCase):
 
     def test_suggested_area_limits(self):
         result = self.pick(WHITE)
-        self.assertAlmostEqual(result.suggested_min_area, result.ball_area * 0.4, delta=1)
-        self.assertAlmostEqual(result.suggested_max_area, result.ball_area * 2.5, delta=1)
+        # 25단계: 0.4~2.5배 -> 0.6~1.3배 (홀컵 약 1.4~2.1배는 통과시키지 않는다)
+        self.assertAlmostEqual(result.suggested_min_area, result.ball_area * 0.6, delta=1)
+        self.assertAlmostEqual(result.suggested_max_area, result.ball_area * 1.3, delta=1)
+        self.assertIsNone(result.area_warning)  # 캘리브레이션 정보(예상 면적)를 안 주면 경고도 없음
         self.assertGreater(result.ball_circularity, 0.7)
         self.assertAlmostEqual(result.ball_diameter, 2 * RADIUS, delta=5)
 

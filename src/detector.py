@@ -21,6 +21,15 @@ config/settings.json의 "detection" 항목에서 읽어온다.
   [H최소 ~ 179] + [0 ~ H최대] 두 구간을 함께 본다 (분홍·빨강 공).
 - 클릭으로 공 색 자동 추출: sample_ball_pixels() -> color_range_from_pixels() ->
   evaluate_color_range() -> auto_color_range()
+
+25단계 추가 (mm 기준 공 크기):
+- 캘리브레이션이 있으면 공 크기를 '픽셀 면적(min_area/max_area)'이 아니라 '그 위치에서 공이
+  보여야 할 크기(예상 면적)' 대비 비율로 판정한다. 공 지름(ball.diameter_mm, 기본 42.67mm)을
+  캘리브레이션으로 픽셀 면적으로 바꾼 값이 예상 면적이고, 덩어리 면적이 그 0.6~1.3배
+  (ball.area_ratio_min ~ area_ratio_max)여야 공으로 본다. 흰 홀컵(공의 약 1.4~2.1배)은 여기서 걸러진다.
+  매트 크기·카메라 높이가 현장마다 달라도 픽셀 기준값을 다시 맞출 필요가 없다.
+- 캘리브레이션이 없으면 예전처럼 프로필의 min_area/max_area(픽셀)를 쓴다.
+- detect()에 static_filter를 주면, 고정 물체(컵·티, src/static_objects.py) 자리의 후보를 뺀다.
 """
 
 from dataclasses import dataclass
@@ -88,6 +97,29 @@ MORPH_KERNEL_SIZE = (5, 5)
 DEBUG_CANDIDATE_MIN_AREA = 10
 DEBUG_CANDIDATE_LIMIT = 5
 
+# 25단계: mm 기준 공 크기. config/settings.json의 "ball" 항목에 값이 없을 때 쓰는 기본값.
+# 현장 측정(0.75배 화면 1440x810, k1 -0.50, 3000x1000 매트): 그 위치의 공 예상 면적은 약 215~218px².
+#   - 공: 186~207px² -> x0.86~0.96 (블러·임계값 때문에 테두리가 조금 깎여 예상보다 약간 작게 잡힌다)
+#   - 가운데 컵: 416~464px² -> x1.9~2.1
+#   - 위·아래 컵(조금 어둡게 보임): 312~374px² -> x1.44~1.71  <- 프레임에 따라 1.5 아래로 내려온다!
+# 그래서 지침의 제안값(0.6~1.5)으로는 위·아래 컵이 가끔 공 크기로 통과했다. 상한을 1.3으로 낮춰
+# 공(최대 약 x0.96)과 컵(최소 약 x1.44) 사이에 둔다. 하한 0.6은 공이 조금 작게 잡히는 것을 감안한 여유.
+DEFAULT_BALL_SETTINGS = {
+    "diameter_mm": 42.67,  # 골프공 규격 지름(mm)
+    "area_ratio_min": 0.6,  # 예상 면적 대비 최소 비율
+    "area_ratio_max": 1.3,  # 예상 면적 대비 최대 비율 (컵 x1.44~2.1은 걸러짐)
+}
+
+# 후보가 공이 아니라고 본 이유 (디버그 표시 색을 정할 때 쓴다)
+REJECT_SIZE = "size"  # 면적이 공 크기와 맞지 않음 (주황)
+REJECT_SHAPE = "shape"  # 원형도가 낮음 (찌그러짐)
+REJECT_STATIC = "static"  # 고정 물체(컵·티) 자리 (파랑)
+
+
+def ball_settings(loaded: dict | None) -> dict:
+    """설정 파일의 ball 항목과 기본값을 합친다 (값이 없어도 동작하게)."""
+    return {**DEFAULT_BALL_SETTINGS, **(loaded or {})}
+
 
 @dataclass
 class BallDetection:
@@ -114,7 +146,11 @@ class DetectionCandidate:
     area: float
     diameter: float  # 최소 외접원의 지름(픽셀)
     circularity: float
-    accepted: bool  # 면적·원형도 조건을 모두 통과했는지
+    accepted: bool  # 면적·원형도(+ 고정 물체 아님) 조건을 모두 통과했는지
+    # 25단계: 예상 면적 대비 비율 (예: 1.02, 2.10). 캘리브레이션이 없으면 None (픽셀 기준 판정)
+    area_ratio: float | None = None
+    # 공이 아니라고 본 이유: None(통과) / REJECT_SIZE / REJECT_SHAPE / REJECT_STATIC
+    reject: str | None = None
 
 
 def blurred_hsv(frame: np.ndarray) -> np.ndarray:
@@ -167,7 +203,7 @@ def build_mask(frame: np.ndarray, hsv_lower, hsv_upper) -> np.ndarray:
 class BallDetector:
     """HSV 범위로 프레임에서 공 후보를 찾고, 가장 그럴듯한 것 하나를 고르는 클래스."""
 
-    def __init__(self, settings: dict | None = None):
+    def __init__(self, settings: dict | None = None, ball: dict | None = None):
         loaded = settings if settings is not None else load_settings().get("detection", {})
         merged = {**DEFAULT_DETECTION_SETTINGS, **loaded}
         # profiles도 일부 프로필만 커스텀됐을 수 있으니 기본값과 합쳐준다.
@@ -176,17 +212,22 @@ class BallDetector:
             **merged.get("profiles", {}),
         }
         self._settings = merged
+        # 25단계: mm 기준 공 크기 설정 (공 지름, 예상 면적 대비 비율 범위)
+        self.ball = ball_settings(ball if ball is not None else load_settings().get("ball"))
         # debug_enabled가 True면 detect()할 때마다 덩어리 목록(last_candidates)을 남긴다.
-        # 원형도 계산이 덩어리마다 들어가므로 평소(False)에는 하지 않는다.
         self.debug_enabled = False
         self.last_candidates: list[DetectionCandidate] = []
+        # 마지막 detect()에서 크기 때문에 걸러진 후보 수 (컵 등. 상태 요약 로그용)
+        self.last_size_rejected = 0
 
     def _active_profile(self) -> dict:
         name = self._settings.get("active_profile", "practice")
         profiles = self._settings["profiles"]
         return profiles.get(name, DEFAULT_DETECTION_SETTINGS["profiles"]["practice"])
 
-    def detect(self, frame: np.ndarray, roi=None, prefer=None) -> BallDetection | None:
+    def detect(
+        self, frame: np.ndarray, roi=None, prefer=None, expected_area=None, static_filter=None
+    ) -> BallDetection | None:
         """프레임에서 공을 하나 찾는다.
 
         roi: (x, y, 폭, 높이) - 이 사각형 안에서만 찾는다 (None이면 화면 전체).
@@ -194,20 +235,25 @@ class BallDetector:
              영역만 잘라서 블러·HSV 변환·마스크를 만들므로 영역이 작을수록 빠르다.
         prefer: (x, y) - 조건을 통과한 후보가 여럿이면 이 위치에 가장 가까운 것을 고른다.
              None이면 예전처럼 가장 원형에 가까운 것을 고른다.
+        expected_area: (x, y) -> 그 위치에서 공의 예상 면적(px²) 또는 None 을 돌려주는 함수 (25단계).
+             값이 나오면 면적을 '예상 면적의 area_ratio_min~max배'로 판정하고, None이면(캘리브레이션
+             없음) 프로필의 min_area/max_area(픽셀)로 판정한다.
+        static_filter: (x, y, 공조건통과여부) -> True면 '고정 물체(컵·티) 자리'라 공 후보에서 뺀다 (25단계).
         결과 좌표는 roi를 썼더라도 항상 프레임 전체 기준이다.
 
         찾지 못했거나 처리 중 어떤 문제가 생겨도 예외를 던지지 않고
         조용히 None을 반환한다. (호출하는 UI 쪽이 죽지 않게)
         """
         try:
-            return self._detect(frame, roi, prefer)
+            return self._detect(frame, roi, prefer, expected_area, static_filter)
         except Exception:
             # HSV 설정값이 잘못됐거나 프레임 형식이 예상과 달라도
             # 검출 실패로만 처리하고 프로그램은 계속 돌아가야 한다.
             return None
 
-    def _detect(self, frame: np.ndarray, roi=None, prefer=None) -> BallDetection | None:
+    def _detect(self, frame: np.ndarray, roi, prefer, expected_area, static_filter) -> BallDetection | None:
         profile = self._active_profile()
+        self.last_size_rejected = 0
         offset = (0, 0)
         if roi is not None:
             x, y, w, h = (int(v) for v in roi)
@@ -220,80 +266,93 @@ class BallDetector:
 
         # offset을 주면 윤곽선 좌표가 잘라낸 영역이 아니라 프레임 전체 기준으로 나온다.
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE, offset=offset)
+        evaluated = self._evaluate_contours(contours, profile, expected_area, static_filter)
+        # 크기 때문에 걸러진 후보 수 (모양은 공 같았는데 너무 크거나 작음 = 컵 등). 상태 요약 로그용
+        self.last_size_rejected = sum(1 for c, _contour in evaluated if c.reject == REJECT_SIZE)
         if self.debug_enabled:
-            self.last_candidates = self._collect_candidates(contours, profile)
-        if not contours:
-            return None
+            # 디버그 표시용: 큰 덩어리부터 몇 개만 남긴다
+            shown = [c for c, _contour in evaluated if c.area >= DEBUG_CANDIDATE_MIN_AREA]
+            shown.sort(key=lambda c: c.area, reverse=True)
+            self.last_candidates = shown[:DEBUG_CANDIDATE_LIMIT]
 
-        # 후보 중 면적·원형도 조건을 통과한 것 하나만 선택
+        # 조건을 모두 통과한 후보 중 하나만 고른다
         # (prefer가 있으면 그 위치에 가장 가까운 것, 없으면 가장 원형에 가까운 것)
-        best_contour = self._pick_best_contour(contours, profile, prefer)
-        if best_contour is None:
+        best = None
+        best_key = None
+        for candidate, contour in evaluated:
+            if not candidate.accepted:
+                continue
+            if prefer is not None:
+                key = (candidate.x - prefer[0]) ** 2 + (candidate.y - prefer[1]) ** 2
+            else:
+                key = -candidate.circularity
+            if best_key is None or key < best_key:
+                best_key, best = key, (candidate, contour)
+        if best is None:
             return None
+        _candidate, contour = best
+        (cx, cy), radius = cv2.minEnclosingCircle(contour)
+        return BallDetection(x=int(cx), y=int(cy), radius=int(radius), area=float(cv2.contourArea(contour)))
 
-        (x, y), radius = cv2.minEnclosingCircle(best_contour)
-        return BallDetection(
-            x=int(x), y=int(y), radius=int(radius), area=float(cv2.contourArea(best_contour))
-        )
+    def find_blobs(self, frame: np.ndarray, expected_area=None) -> list[DetectionCandidate]:
+        """화면 전체에서 공 색 범위에 맞는 덩어리를 모두 돌려준다 (고정 물체 수집용, 25단계).
 
-    @staticmethod
-    def _collect_candidates(contours, profile: dict) -> list[DetectionCandidate]:
-        """디버그 표시용: 큰 덩어리 몇 개의 면적·지름·원형도와 통과 여부를 모은다."""
+        고정 물체 제외(static_filter)는 하지 않는다. 각 덩어리에 크기·모양 판정 결과가 함께 들어 있다.
+        """
+        profile = self._active_profile()
+        mask = build_mask(frame, profile["hsv_lower"], profile["hsv_upper"])
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        return [c for c, _contour in self._evaluate_contours(contours, profile, expected_area, None)]
+
+    def _evaluate_contours(self, contours, profile: dict, expected_area, static_filter) -> list:
+        """덩어리마다 면적·원형도·크기 비율을 재고 공 조건 통과 여부를 정한다.
+
+        반환: [(DetectionCandidate, contour), ...]
+        판정 순서:
+          1) 크기: 예상 면적이 있으면(캘리브레이션 있음) 비율이 area_ratio_min~max 안이어야 한다.
+             없으면 프로필의 min_area~max_area(픽셀) 안이어야 한다.
+          2) 모양: 원형도가 min_circularity 이상이어야 한다.
+          3) 고정 물체: static_filter가 True를 돌려주면(컵·티 자리) 뺀다.
+        """
         min_area = profile.get("min_area", DEFAULT_MIN_AREA)
         max_area = profile.get("max_area", DEFAULT_MAX_AREA)
         min_circularity = profile.get("min_circularity", DEFAULT_MIN_CIRCULARITY)
+        ratio_min = float(self.ball["area_ratio_min"])
+        ratio_max = float(self.ball["area_ratio_max"])
+        # 이보다 작은 덩어리는 잔털 잡티라 계산할 필요도 없다 (min_area가 더 작게 설정됐으면 그 값)
+        smallest = min(DEBUG_CANDIDATE_MIN_AREA, min_area)
 
-        sized = [(cv2.contourArea(c), c) for c in contours]
-        sized = [item for item in sized if item[0] >= DEBUG_CANDIDATE_MIN_AREA]
-        sized.sort(key=lambda item: item[0], reverse=True)
-
-        candidates = []
-        for area, contour in sized[:DEBUG_CANDIDATE_LIMIT]:
+        evaluated = []
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if area < smallest:
+                continue
             perimeter = cv2.arcLength(contour, True)
             circularity = 4 * np.pi * area / (perimeter * perimeter) if perimeter else 0.0
             (x, y), radius = cv2.minEnclosingCircle(contour)
-            accepted = min_area <= area <= max_area and circularity >= min_circularity
-            candidates.append(
-                DetectionCandidate(int(x), int(y), float(area), 2 * radius, float(circularity), accepted)
+
+            expected = expected_area(x, y) if expected_area is not None else None
+            if expected:
+                ratio = area / expected
+                size_ok = ratio_min <= ratio <= ratio_max
+            else:
+                ratio = None
+                size_ok = min_area <= area <= max_area
+            shape_ok = circularity >= min_circularity
+
+            reject = None
+            if not size_ok:
+                reject = REJECT_SIZE
+            elif not shape_ok:
+                reject = REJECT_SHAPE
+            if static_filter is not None and static_filter(x, y, reject is None):
+                # 고정 물체 자리. 크기 때문에 이미 걸러졌어도 '컵'이라는 걸 보여주려고 static으로 표시한다
+                reject = REJECT_STATIC
+            candidate = DetectionCandidate(
+                int(x), int(y), float(area), 2 * radius, float(circularity), reject is None, ratio, reject
             )
-        return candidates
-
-    @staticmethod
-    def _pick_best_contour(contours, profile: dict, prefer=None):
-        min_area = profile.get("min_area", DEFAULT_MIN_AREA)
-        max_area = profile.get("max_area", DEFAULT_MAX_AREA)
-        min_circularity = profile.get("min_circularity", DEFAULT_MIN_CIRCULARITY)
-
-        best_contour = None
-        best_circularity = 0.0
-        best_distance = float("inf")
-
-        for contour in contours:
-            area = cv2.contourArea(contour)
-            if area < min_area or area > max_area:
-                continue
-
-            perimeter = cv2.arcLength(contour, True)
-            if perimeter == 0:
-                continue
-
-            # 원형도: 완전한 원이면 1.0, 찌그러질수록 작아진다.
-            circularity = 4 * np.pi * area / (perimeter * perimeter)
-            if circularity < min_circularity:
-                continue
-
-            if prefer is not None:
-                # 예상 위치에 가장 가까운 후보를 고른다
-                (cx, cy), _radius = cv2.minEnclosingCircle(contour)
-                distance = (cx - prefer[0]) ** 2 + (cy - prefer[1]) ** 2
-                if distance < best_distance:
-                    best_distance = distance
-                    best_contour = contour
-            elif circularity > best_circularity:
-                best_circularity = circularity
-                best_contour = contour
-
-        return best_contour
+            evaluated.append((candidate, contour))
+        return evaluated
 
 
 # ======================================================================
@@ -319,9 +378,11 @@ PERCENTILE_HIGH = 98
 # 다른 덩어리가 많이 걸리면 이 여유에 아래 배율을 차례로 곱해 줄여 가며 다시 시도한다.
 COLOR_MARGIN = (8, 40, 40)
 MARGIN_SCALES = (1.0, 0.75, 0.5, 0.25, 0.0)
-# min_area / max_area 제안 = 공 면적 x 이 배율
-SUGGEST_MIN_AREA_RATIO = 0.4
-SUGGEST_MAX_AREA_RATIO = 2.5
+# min_area / max_area 제안 = 공 면적 x 이 배율.
+# 25단계: 24단계의 0.4~2.5배는 홀컵(공의 약 1.4~2.1배)까지 통과시켜서 0.6~1.3배로 좁혔다
+# (mm 기준 판정의 ball.area_ratio_min/max 기본값과 같다. 1.3인 이유는 DEFAULT_BALL_SETTINGS 참고).
+SUGGEST_MIN_AREA_RATIO = 0.6
+SUGGEST_MAX_AREA_RATIO = 1.3
 # 여유를 줄이다가 공 모양이 망가지면 안 된다: 공 덩어리의 원형도가 이 값 미만이거나,
 # 면적이 기본 여유(1.0)일 때의 이 비율 미만이 되는 범위는 고르지 않는다.
 MIN_PICK_CIRCULARITY = 0.75
@@ -351,6 +412,12 @@ class ColorRangeResult:
     other_blobs: int  # 공 말고 '공처럼 보이는' 다른 덩어리 수 (매트 위만, 매트를 모르면 화면 전체)
     suggested_min_area: int
     suggested_max_area: int
+    # 25단계: 캘리브레이션으로 계산한 그 위치의 공 예상 면적(px²)과, 측정 면적 / 예상 면적.
+    # 캘리브레이션이 없으면 None. 비율이 0.6~1.3을 벗어나면 area_warning에 경고 문구가 들어간다
+    # (공 지름 설정이 틀렸거나, 공이 아닌 곳을 찍었거나, 색 범위가 공을 덜/더 잡는 경우).
+    expected_area: float | None = None
+    area_ratio: float | None = None
+    area_warning: str | None = None
 
 
 def sample_ball_pixels(frame: np.ndarray, point, radius: int = SAMPLE_RADIUS_PX) -> ColorSample | None:
@@ -430,7 +497,7 @@ def evaluate_color_range(frame: np.ndarray, lower, upper, ball_point, mat_corner
     반환: ball_found, ball_area, ball_diameter, ball_circularity, other_blobs
     - 공 덩어리: 클릭 위치를 포함하는(또는 가장 가까운, 공 반경 안) 덩어리
     - other_blobs: 공 덩어리 말고, 실제로 공으로 잘못 잡힐 수 있는 덩어리 수.
-      즉 제안 면적 범위(공 면적의 0.4~2.5배) 안이고 원형도가 기본 기준(0.7) 이상인 것만 센다.
+      즉 제안 면적 범위(공 면적의 0.6~1.3배) 안이고 원형도가 기본 기준(0.7) 이상인 것만 센다.
       (흩어진 잔털 점이나 길쭉한 물체는 어차피 공 조건에서 걸러지므로 세지 않는다)
       mat_corners(매트 4점)가 있으면 매트 안에 있는 것만 센다.
     """
@@ -479,7 +546,9 @@ def evaluate_color_range(frame: np.ndarray, lower, upper, ball_point, mat_corner
     return result
 
 
-def auto_color_range(frame: np.ndarray, samples: list, mat_corners=None) -> ColorRangeResult | None:
+def auto_color_range(
+    frame: np.ndarray, samples: list, mat_corners=None, expected_area: float | None = None
+) -> ColorRangeResult | None:
     """샘플들(여러 번 클릭한 것 합침)로 범위를 만들고, 다른 덩어리가 적은 범위를 고른다.
 
     여유값을 기본(1.0)부터 차례로 줄여 가며(MARGIN_SCALES) 시험한다.
@@ -487,6 +556,8 @@ def auto_color_range(frame: np.ndarray, samples: list, mat_corners=None) -> Colo
     - 그런 범위가 없으면 공이 잡히는 범위 중 다른 덩어리가 가장 적은 것을 고른다
       (같으면 여유가 큰 쪽 = 조명 변화에 강한 쪽).
     시험은 지금 프레임(마지막 샘플을 찍은 화면)에서 한다.
+    expected_area: 마지막 클릭 위치에서 공의 예상 면적(px², 캘리브레이션으로 계산). 주면 측정 면적과
+        비교해서 차이가 크면(0.6~1.3배 밖) 경고 문구를 남긴다 (25단계).
     """
     if not samples:
         return None
@@ -520,6 +591,15 @@ def auto_color_range(frame: np.ndarray, samples: list, mat_corners=None) -> Colo
         best = (MARGIN_SCALES[0], lower, upper, report)
     scale, lower, upper, report = best
     area = report["ball_area"]
+    ratio = None
+    warning = None
+    if expected_area and area > 0:
+        ratio = area / expected_area
+        if not SUGGEST_MIN_AREA_RATIO <= ratio <= SUGGEST_MAX_AREA_RATIO:
+            warning = (
+                f"잡힌 공 면적({area:.0f}px²)이 캘리브레이션으로 계산한 공 크기({expected_area:.0f}px²)의 "
+                f"x{ratio:.2f}입니다. 공을 정확히 찍었는지, 매트 크기·공 지름 설정이 맞는지 확인하세요."
+            )
     return ColorRangeResult(
         hsv_lower=lower,
         hsv_upper=upper,
@@ -531,4 +611,7 @@ def auto_color_range(frame: np.ndarray, samples: list, mat_corners=None) -> Colo
         other_blobs=report["other_blobs"],
         suggested_min_area=int(round(area * SUGGEST_MIN_AREA_RATIO)),
         suggested_max_area=int(round(area * SUGGEST_MAX_AREA_RATIO)),
+        expected_area=expected_area,
+        area_ratio=ratio,
+        area_warning=warning,
     )

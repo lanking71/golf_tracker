@@ -191,8 +191,15 @@ class TuningDialog(QDialog):
             f" (여유 x{result.margin_scale:g})\n"
             f"공 {found_text}: 면적 {result.ball_area:.0f}px², 지름 {result.ball_diameter:.1f}px, "
             f"원형도 {result.ball_circularity:.2f} · 매트 위 다른 덩어리 {result.other_blobs}개\n"
-            f"면적 제안: min_area {result.suggested_min_area} / max_area {result.suggested_max_area}\n"
-            "카메라 화면의 마스크(흰색 = 공으로 보는 곳)를 확인한 뒤 저장하세요."
+            f"면적 제안: min_area {result.suggested_min_area} / max_area {result.suggested_max_area}"
+            " (캘리브레이션 전에만 쓰임)\n"
+            + (
+                f"공 예상 면적(캘리브레이션 기준) {result.expected_area:.0f}px² 대비 x{result.area_ratio:.2f}\n"
+                if result.area_ratio is not None
+                else ""
+            )
+            + (f"주의: {result.area_warning}\n" if result.area_warning else "")
+            + "카메라 화면의 마스크(흰색 = 공으로 보는 곳)를 확인한 뒤 저장하세요."
         )
         self.set_picking(False)
 

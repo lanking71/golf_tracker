@@ -224,9 +224,22 @@ GRID_DIVISIONS = 10
 GRID_COLOR_BGR = (255, 255, 0)  # 하늘색 (매트 녹색·공 색과 잘 구분됨)
 GRID_THICKNESS = 1
 
-# 검출 디버그 표시 (덩어리 면적·지름 글자). 통과한 덩어리는 흰색, 걸러진 덩어리는 주황색
+# 검출 디버그 표시 (덩어리 면적·지름 글자).
+#   흰색 = 공 조건 통과, 주황 = 크기 때문에 걸러짐 (컵 등), 분홍 = 모양(원형도) 때문에 걸러짐,
+#   하늘색 = 고정 물체(컵·티) 자리라 뺌
 DEBUG_ACCEPTED_COLOR_BGR = (255, 255, 255)
 DEBUG_REJECTED_COLOR_BGR = (0, 165, 255)
+DEBUG_SHAPE_REJECTED_COLOR_BGR = (203, 102, 255)
+DEBUG_STATIC_REJECTED_COLOR_BGR = (255, 200, 120)
+# 25단계: 고정 물체(컵·티)를 그리는 파란 원 (디버그 표시를 켰을 때)
+STATIC_OBJECT_COLOR_BGR = (255, 80, 0)
+# 고정 물체 수집 중 안내 문구
+STATIC_SCAN_GUIDE_TEXT = (
+    "고정 물체(컵·티)를 찾는 중입니다 (약 3초) - 공과 손을 움직이지 마세요. "
+    "'고정 물체 다시 찾기'는 공을 매트에서 치운 뒤 누르세요."
+)
+STATIC_SCAN_BUTTON_TEXT = "고정 물체 다시 찾기"
+STATIC_SCANNING_BUTTON_TEXT = "고정 물체 찾는 중..."
 DEBUG_FONT_SCALE = 0.5
 DEBUG_FONT_THICKNESS = 1
 
@@ -374,6 +387,7 @@ class MainWindow(QMainWindow):
         engine.tracking_finished.connect(self._on_tracking_finished)
         engine.protocol_server.client_count_changed.connect(self._update_app_label)
         engine.calibration_invalidated.connect(self._update_warning_label)
+        engine.static_scan_changed.connect(self._on_static_scan_changed)
 
         # 시작 상태(IDLE)에 맞게 배지 문구와 버튼 활성화 상태를 맞춘다.
         self._update_status_badge()
@@ -494,6 +508,12 @@ class MainWindow(QMainWindow):
             self._calibration_buttons[name] = button
         self._calibration_buttons["이 모서리로 확정"].setObjectName("primary")
 
+        # 25단계: 고정 물체(컵·티) 다시 찾기. 공을 치운 상태에서 누르면 약 3초 동안 다시 모은다.
+        # (상태 전환 버튼이 아니라서 BUTTON_ACTIONS와 따로 둔다)
+        self.static_scan_button = QPushButton(STATIC_SCAN_BUTTON_TEXT)
+        self.static_scan_button.clicked.connect(self._rescan_static_objects)
+        layout.addWidget(self.static_scan_button)
+
         # 버튼들을 위쪽으로 붙이고 아래는 빈 공간으로 남김
         layout.addStretch(1)
         return layout
@@ -595,6 +615,21 @@ class MainWindow(QMainWindow):
         self.engine.reject_calibration_proposal()
         self._after_calibration_edit()
 
+    def _rescan_static_objects(self) -> None:
+        """'고정 물체 다시 찾기': 엔진이 약 3초 동안 가만히 있는 공 색 물체(컵·티)를 다시 모은다."""
+        if not self.engine.rescan_static_objects():
+            self._show_temporary_status("추적 대기·추적 중에는 고정 물체를 다시 찾을 수 없습니다")
+
+    def _on_static_scan_changed(self, active: bool) -> None:
+        """고정 물체 수집이 시작되거나 끝났을 때: 버튼 글자와 안내 띠를 바꾼다."""
+        self.static_scan_button.setText(STATIC_SCANNING_BUTTON_TEXT if active else STATIC_SCAN_BUTTON_TEXT)
+        self.static_scan_button.setEnabled(not active)
+        self._update_calibration_guide()
+        if not active:
+            count = len(self.engine.static_objects.objects)
+            holes = len(self.engine.static_objects.holes())
+            self._show_temporary_status(f"고정 물체 {count}개 (홀컵 {holes}개)")
+
     def _restart_calibration(self) -> None:
         """'다시 지정': 찍은 점을 모두 지우고 처음부터 (캘리브레이션 버튼과 같음)."""
         self._on_button_clicked("캘리브레이션")
@@ -621,7 +656,13 @@ class MainWindow(QMainWindow):
                 self.guide_label.show()
             return
         if not calibrating:
-            if not self.guide_label.isHidden():
+            if self.engine.static_scan_active:
+                # 25단계: 고정 물체 수집 중 안내
+                if self.guide_label.text() != STATIC_SCAN_GUIDE_TEXT:
+                    self.guide_label.setText(STATIC_SCAN_GUIDE_TEXT)
+                if self.guide_label.isHidden():
+                    self.guide_label.show()
+            elif not self.guide_label.isHidden():
                 self.guide_label.hide()
             self.magnifier.hide()
             return
@@ -741,7 +782,10 @@ class MainWindow(QMainWindow):
         """
         text = f"상태: {self.tracker.state.value}"
         if self.tracker.state == TrackerState.FINISHED and self.tracker.finish_reason:
-            text += f" ({self.tracker.finish_reason})"
+            if self.tracker.finish_hole is not None:
+                text += f" ({self.tracker.finish_reason} - {self.tracker.finish_hole}번 컵)"
+            else:
+                text += f" ({self.tracker.finish_reason})"
         elif self.tracker.state == TrackerState.CALIBRATING:
             count = len(self.calibration.corners)
             if count < 4:
@@ -855,7 +899,11 @@ class MainWindow(QMainWindow):
             self._color_samples = []
         self._color_samples.append(sample)
         corners = self.calibration.corners if len(self.calibration.corners) == 4 else None
-        result = auto_color_range(frame, self._color_samples, corners)
+        # 25단계: 캘리브레이션이 있으면 그 위치의 공 예상 면적과 비교해서 차이가 크면 경고한다
+        expected = None
+        if self.calibration.is_calibrated():
+            expected = self.calibration.expected_ball_area_px((x, y), self.engine.ball["diameter_mm"])
+        result = auto_color_range(frame, self._color_samples, corners, expected)
         if result is not None:
             logger.info(
                 "공 색 추출 (샘플 %d개): HSV %s ~ %s (여유 x%g), 공 %s 면적 %.0fpx² 지름 %.1fpx 원형도 %.2f, "
@@ -872,6 +920,13 @@ class MainWindow(QMainWindow):
                 result.suggested_min_area,
                 result.suggested_max_area,
             )
+            if result.area_ratio is not None:
+                logger.info(
+                    "  공 예상 면적 %.0fpx² 대비 x%.2f%s",
+                    result.expected_area,
+                    result.area_ratio,
+                    " - " + result.area_warning if result.area_warning else "",
+                )
         self.tuning_dialog.apply_color_result(result, len(self._color_samples))
 
     def _on_tuning_profile_saved(self, key: str, profile: dict) -> None:
@@ -972,7 +1027,9 @@ class MainWindow(QMainWindow):
             # 격자선은 가장 먼저(맨 아래에) 그려서 공·모서리 표시를 가리지 않게 한다
             self._draw_grid(frame)
         if result.candidates is not None:
-            # 디버그 표시를 켰을 때만: 이번 프레임의 검색 영역(24단계)과 덩어리 정보
+            # 디버그 표시를 켰을 때만: 이번 프레임의 검색 영역(24단계)과 덩어리 정보,
+            # 고정 물체(25단계, 파란 원)
+            self._draw_static_objects(frame, self.engine.static_objects.objects)
             self._draw_search_area(frame, result.search_plan)
             self._draw_debug_candidates(frame, result.candidates)
         if result.detection is not None:
@@ -1106,16 +1163,45 @@ class MainWindow(QMainWindow):
             cv2.line(frame, (0, y), (width - 1, y), GRID_COLOR_BGR, GRID_THICKNESS)
 
     @staticmethod
+    def _draw_static_objects(frame, objects: list) -> None:
+        """고정 물체(컵·티)를 파란 원으로 그린다. 홀컵이면 옆에 H1, H2...처럼 홀 번호를 쓴다."""
+        for obj in objects:
+            center = (int(round(obj.x)), int(round(obj.y)))
+            cv2.circle(frame, center, max(2, int(round(obj.radius))), STATIC_OBJECT_COLOR_BGR, 2)
+            if obj.hole is not None:
+                cv2.putText(
+                    frame,
+                    f"H{obj.hole}",
+                    (center[0] - 10, center[1] - int(obj.radius) - 6),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    STATIC_OBJECT_COLOR_BGR,
+                    2,
+                    cv2.LINE_AA,
+                )
+
+    @staticmethod
     def _draw_debug_candidates(frame, candidates: list) -> None:
         """검출 디버그: 색 범위에 맞은 덩어리마다 면적(px²)·지름(px)·원형도를 글자로 쓴다.
 
-        흰 글자 = 공 조건(면적·원형도)을 통과한 덩어리, 주황 글자 = 걸러진 덩어리.
-        공이 주황색으로 나오면 min_area/max_area/min_circularity를 이 숫자에 맞게 고치면 된다.
+        흰 글자 = 공 조건을 통과한 덩어리, 주황 = 크기 때문에 걸러짐, 분홍 = 모양 때문에 걸러짐,
+        하늘색 = 고정 물체 자리라 뺌.
+        25단계: 캘리브레이션이 있으면 '예상 대비 면적 비율'(예: x1.02, 컵은 x2.10)도 함께 쓴다.
+        공이 x1.0 근처면 정상이다. 공인데 주황이면 ball.area_ratio_min/max(또는 캘리브레이션 전이면
+        min_area/max_area)를 이 숫자에 맞게 고치면 된다.
         """
+        colors = {
+            None: DEBUG_ACCEPTED_COLOR_BGR,
+            "size": DEBUG_REJECTED_COLOR_BGR,
+            "shape": DEBUG_SHAPE_REJECTED_COLOR_BGR,
+            "static": DEBUG_STATIC_REJECTED_COLOR_BGR,
+        }
         for c in candidates:
-            color = DEBUG_ACCEPTED_COLOR_BGR if c.accepted else DEBUG_REJECTED_COLOR_BGR
+            color = colors.get(c.reject, DEBUG_REJECTED_COLOR_BGR)
             cv2.circle(frame, (c.x, c.y), max(2, round(c.diameter / 2)), color, 1)
             text = f"A{c.area:.0f} D{c.diameter:.1f} C{c.circularity:.2f}"
+            if c.area_ratio is not None:
+                text += f" x{c.area_ratio:.2f}"
             cv2.putText(
                 frame,
                 text,
@@ -1307,13 +1393,13 @@ class MainWindow(QMainWindow):
             return
 
         px_trajectory = self.tracker.trajectory
-        max_jump_distance = self.tracker.max_jump_distance
 
         segment = [points[0]]
         for i in range(1, len(points)):
             prev_px, curr_px = px_trajectory[i - 1], px_trajectory[i]
             px_distance = ((curr_px.x - prev_px.x) ** 2 + (curr_px.y - prev_px.y) ** 2) ** 0.5
-            if px_distance >= max_jump_distance:
+            # 25단계: 기준은 그 위치 근처의 px 값 (캘리브레이션이 있으면 max_jump_distance_mm 기준)
+            if px_distance >= self.tracker.max_jump_threshold((prev_px.x, prev_px.y)):
                 if len(segment) >= 2:
                     self._draw_polyline(canvas, segment)
                 segment = [points[i]]
@@ -1355,9 +1441,15 @@ class MainWindow(QMainWindow):
             return
         stats = current[0]
 
+        # 25단계: 종료 사유 (홀인이면 컵 번호)
+        reason = self.tracker.finish_reason or "-"
+        if self.tracker.finish_hole is not None:
+            reason += f" ({self.tracker.finish_hole}번 컵)"
+
         # mm -> cm
         self.stats_label.setText(
             "<b>요약 통계</b><br>"
+            f"결과: {reason}<br>"
             f"총 거리: {stats.total_distance / 10:.1f}cm<br>"
             f"소요 시간: {stats.duration:.2f}초<br>"
             f"평균 속도: {stats.average_speed / 10:.1f}cm/초<br>"

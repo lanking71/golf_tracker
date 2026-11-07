@@ -25,6 +25,8 @@ MAT_COLOR_BGR = (60, 160, 60)  # 녹색
 # 자홍색: HSV 색상(H)이 약 150이라 매트(녹색, H 약 60)와 확실히 구분된다.
 BALL_COLOR_BGR = (255, 0, 255)
 BALL_RADIUS = 18
+# 25단계: 홀컵 역할의 큰 원. 반지름 26px = 면적이 공의 약 2.1배 (현장의 흰 컵이 공의 약 2배)
+CUP_RADIUS = 26
 FRAME_SIZE = (1280, 720)  # (너비, 높이)
 
 
@@ -36,6 +38,8 @@ class FakeCamera:
         self.show_mat = show_mat  # False면 매트가 안 보이는 화면
         # 공과 똑같이 생긴 다른 물체(예: 흰 컵 역할)의 위치 목록. 24단계 검색 영역 테스트용
         self.decoys: list[tuple[int, int]] = []
+        # 공과 같은 색의 큰 원(홀컵 역할) 위치 목록. 25단계 크기 판정·고정 물체·홀인 테스트용
+        self.cups: list[tuple[int, int]] = []
         self.available = True  # False로 바꾸면 카메라가 끊긴 것처럼 동작한다
         self.open_calls = 0  # open()이 불린 횟수 (재연결 시도 간격을 확인하는 데 쓴다)
         self._opened = False
@@ -59,6 +63,8 @@ class FakeCamera:
             cv2.circle(frame, self.ball, BALL_RADIUS, BALL_COLOR_BGR, -1)
         for decoy in self.decoys:
             cv2.circle(frame, decoy, BALL_RADIUS, BALL_COLOR_BGR, -1)
+        for cup in self.cups:
+            cv2.circle(frame, cup, CUP_RADIUS, BALL_COLOR_BGR, -1)
         return frame
 
     def release(self) -> None:
@@ -96,7 +102,16 @@ def make_test_settings(tmp_dir: str, **overrides) -> mock._patch:
             "stop_threshold": 3,
             "stop_duration": 0.5,
             "lost_duration": 2.0,
+            # 25단계 mm 기준 이동 거리는 기존 테스트에서는 끈다 (null = px 값만 사용).
+            # mm 기준 동작은 tests/test_size_mm.py 등에서 따로 켜고 시험한다.
+            "arm_move_distance_mm": None,
+            "min_move_distance_mm": None,
+            "max_jump_distance_mm": None,
         },
+        # 25단계 mm 기준 공 크기: 가짜 영상의 공(반지름 18px, 약 1000px²)이 매트 가운데에서 예상 면적
+        # x1.0 정도가 되도록 '가짜 공의 지름'을 165mm로 잡는다 (실제 골프공은 42.67mm).
+        # 가짜 매트는 원근이 강해서 위치에 따라 x0.8~1.25로 나온다 (0.6~1.5 안).
+        "ball": {"diameter_mm": 165, "area_ratio_min": 0.6, "area_ratio_max": 1.5},
         "calibration": {
             "mat_width_mm": 4500,
             "mat_height_mm": 2000,
@@ -113,4 +128,10 @@ def make_test_settings(tmp_dir: str, **overrides) -> mock._patch:
 
     settings_path = Path(tmp_dir) / "settings.json"
     settings_path.write_text(json.dumps(settings, ensure_ascii=False), encoding="utf-8")
-    return mock.patch.object(src.config, "SETTINGS_PATH", settings_path)
+    # 25단계: 기본값 파일(settings.default.json)도 테스트 폴더의 '없는 파일'로 바꾼다. 그래야 저장소의
+    # 기본값이 바뀌어도 테스트 설정에 섞여 들어오지 않는다 (기본값 병합을 시험하는 테스트는 따로 만든다).
+    return mock.patch.multiple(
+        src.config,
+        SETTINGS_PATH=settings_path,
+        DEFAULT_SETTINGS_PATH=Path(tmp_dir) / "settings.default.json",
+    )

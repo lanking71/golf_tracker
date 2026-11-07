@@ -26,7 +26,7 @@ UI 없이도 테스트할 수 있다. 상세 규격은 docs/PROTOCOL.md 참고.
     CAMERA      event=OK/LOST: 카메라 영상 수신이 시작·복구되거나 끊긴 순간 1회
     TRACK       event=START: 공이 움직여 추적이 시작된 순간 1회
     ADDR        event=IN/OUT: 공이 어드레스 위치 안으로 들어오거나 나갈 때 1회
-    RESULT      추적이 끝났을 때(정지/이탈) 결과 1회
+    RESULT      추적이 끝났을 때(정지/이탈/홀인) 결과 1회
 
 명령에 대한 응답은 그 명령을 보낸 앱에게만 간다. 좌표는 모두 매트 mm 좌표이고
 원점은 좌상단이다.
@@ -37,7 +37,7 @@ import math
 import time
 
 from src.stats import compute_point_series, compute_trajectory_stats
-from src.tracker import LOST_REASON, STOP_REASON, TrackerState
+from src.tracker import HOLE_REASON, LOST_REASON, STOP_REASON, TrackerState
 
 logger = logging.getLogger("protocol")
 
@@ -46,7 +46,9 @@ logger = logging.getLogger("protocol")
 # 2.2: CAMERA 이벤트, 명령 처리 오류 응답(internal_error) 추가.
 # 2.3: HELLO에 처리 프레임 크기(frame_w, frame_h) 추가. 픽셀 좌표(ALIGN corners)는
 #      전처리(축소·왜곡 보정)가 끝난 프레임 기준임을 명시.
-PROTOCOL_VERSION = "2.3"
+# 2.4: 홀인 판정 추가 - RESULT.reason에 "HOLE_IN", RESULT.hole(홀 번호, 홀인이 아니면 null),
+#      HELLO.holes(홀컵 목록 [{id, x_mm, y_mm}]) 추가. 기존 필드는 그대로라 2.3용 컨트롤도 동작한다.
+PROTOCOL_VERSION = "2.4"
 
 # config/settings.json의 "protocol" 항목에 없을 때 쓸 기본값
 DEFAULT_ADDR_RADIUS_MM = 100
@@ -56,7 +58,7 @@ DEFAULT_RESULT_POINTS = True
 ADDR_OUT_MARGIN = 1.2
 
 # 종료 사유를 앱에 보낼 때 쓰는 영문 코드
-FINISH_REASON_CODES = {STOP_REASON: "STOP", LOST_REASON: "LOST"}
+FINISH_REASON_CODES = {STOP_REASON: "STOP", LOST_REASON: "LOST", HOLE_REASON: "HOLE_IN"}
 
 # RESULT.points 한 점의 각 값이 무엇인지 (컨트롤이 읽기 쉽도록 RESULT에 함께 실어 보낸다)
 POINT_FIELDS = ["x", "y", "t", "dist", "speed"]
@@ -207,6 +209,8 @@ class ProtocolHandler:
             # 아직 첫 프레임을 못 받았으면 null.
             "frame_w": frame_size[0] if frame_size else None,
             "frame_h": frame_size[1] if frame_size else None,
+            # 2.4: 홀컵 목록 (고정 물체 중 컵으로 본 것, 홀 번호 순서). 모르면 빈 목록
+            "holes": self._engine.hole_list() if hasattr(self._engine, "hole_list") else [],
         })
         reply(self._build_status(time.time()))
 
@@ -410,7 +414,10 @@ class ProtocolHandler:
         self._send({"cmd": "TRACK", "event": "START", "ts": int(started_at * 1000)})
 
     def on_finished(self, reason: str) -> None:
-        """추적이 정지/이탈로 끝났을 때 호출. 결과(RESULT)를 만들어 1회 보내고 보관해 둔다."""
+        """추적이 정지/이탈/홀인으로 끝났을 때 호출. 결과(RESULT)를 만들어 1회 보내고 보관해 둔다.
+
+        홀인이면 stop(끝 위치)은 컵 중심이다 (Tracker가 stop_position을 컵 중심으로 둔다).
+        """
         trajectory = self._engine.trajectory_to_real() if self.calibration.is_calibrated() else []
 
         start = self._to_mm(self.tracker.start_position)
@@ -424,6 +431,8 @@ class ProtocolHandler:
         result = {
             "cmd": "RESULT",
             "reason": FINISH_REASON_CODES.get(reason, "STOP"),
+            # 2.4: 홀인이면 들어간 컵의 홀 번호 (HELLO.holes의 id), 아니면 null
+            "hole": self.tracker.finish_hole if reason == HOLE_REASON else None,
             "ts": int(time.time() * 1000),
             "start": start,
             "stop": stop,

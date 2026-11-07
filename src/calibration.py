@@ -66,6 +66,9 @@ MIN_MAT_AREA_RATIO = 0.2
 # 모서리를 찍는 순서 (상태 배지에 다음에 찍을 위치를 안내하는 데 쓴다)
 CORNER_NAMES = ["좌상단", "우상단", "우하단", "좌하단"]
 
+# 공의 예상 면적을 계산할 때 매트 위 원을 몇 개의 점(다각형)으로 그릴지 (25단계)
+BALL_OUTLINE_POINTS = 16
+
 
 # 모서리 네 점이 이루는 사각형의 넓이가 이보다 작으면(px²) 사각형으로 보지 않는다.
 MIN_CORNERS_AREA_PX = 100
@@ -421,6 +424,29 @@ class Calibration:
         pixels = cv2.perspectiveTransform(points, np.linalg.inv(self.matrix))[0]
         distances = np.hypot(pixels[:, 0] - pixel_point[0], pixels[:, 1] - pixel_point[1])
         return float(distances.max())
+
+    def expected_ball_area_px(self, pixel_point, diameter_mm: float) -> float | None:
+        """화면의 이 위치에 지름 diameter_mm인 공이 있으면 몇 px²로 보일지 계산한다 (25단계).
+
+        원근 때문에 화면 위치마다 1mm가 몇 픽셀인지 다르고, 가로·세로 배율도 조금씩 다르다
+        (카메라가 비스듬하면 원이 타원으로 보인다). 그래서 그 위치를 mm로 바꾼 뒤, 매트 위에
+        반지름 (지름/2)mm인 원을 16개 점으로 그려서 다시 픽셀로 바꾸고, 그 다각형의 넓이를 잰다.
+        (mm_radius_to_px와 같은 방식: 그 위치 근처의 mm->px 배율을 쓴다)
+
+        공은 공(구)이라 실제로는 매트 위 원보다 아주 조금 다르게 보일 수 있지만, 카메라가
+        위에서 내려다보는 설치에서는 차이가 작다. 캘리브레이션 전이면 None.
+        """
+        if self.matrix is None:
+            return None
+        center_mm = self.pixel_to_real(pixel_point[0], pixel_point[1])
+        if center_mm is None:
+            return None
+        cx, cy = center_mm
+        r = float(diameter_mm) / 2
+        angles = np.linspace(0, 2 * np.pi, BALL_OUTLINE_POINTS, endpoint=False)
+        circle = np.stack([cx + r * np.cos(angles), cy + r * np.sin(angles)], axis=1)
+        pixels = cv2.perspectiveTransform(circle.reshape(1, -1, 2), np.linalg.inv(self.matrix))[0]
+        return float(cv2.contourArea(pixels.astype(np.float32)))
 
     def is_inside(self, x: int, y: int) -> bool:
         """(x, y)가 캘리브레이션된 매트 영역(모서리 4점 사각형) 안에 있는지 확인한다.

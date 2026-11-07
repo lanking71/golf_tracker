@@ -21,10 +21,11 @@
 - 이 프로그램이 전혀 쓰지 않는 PySide6 하위 모듈(QtWebEngine,
   QtQml/Quick, QtMultimedia 등 - 용량이 특히 큰 것들)은 excludes로
   빼서 exe 용량과 빌드 시간을 줄인다.
-- config/settings.json·settings.md를 "최초 실행용 기본값"으로 exe
-  안에 함께 담는다(datas). 실행 중에는 이 값을 직접 쓰지 않고, exe
-  옆에 config/settings.json이 없을 때만 딱 한 번 복사해서 꺼내놓는다
-  (src/config.py의 _ensure_settings_file_exists 참고). 그 이후로는
+- config/settings.default.json(기본값, 25단계부터 git이 관리하는 파일)·
+  settings.md를 exe 안에 함께 담는다(datas). exe 옆에 config/settings.json이
+  없으면 기본값을 딱 한 번 복사해서 꺼내놓고(src/config.py의
+  _ensure_settings_file_exists 참고), 실행할 때마다 settings.json에 빠진
+  키를 이 기본값으로 채운다(새 버전에서 설정 항목이 늘어나도 되도록). 그 이후로는
   exe 옆 파일이 진짜 설정 파일이 되어 사용자가 자유롭게 열어 고칠 수
   있고, data/results.db도 exe 옆에 생긴다(src/storage.py, 임시 폴더
   아님) - 둘 다 src/paths.py가 계산하는 "exe가 있는 폴더" 기준이다.
@@ -53,10 +54,10 @@ a = Analysis(
     pathex=[ROOT_DIR],
     binaries=[],
     datas=[
-        # exe 안에 "최초 실행용 기본 설정"으로 함께 담아둔다.
-        # src/config.py가 exe 옆에 config/settings.json이 없을 때만
-        # 이걸 복사해서 꺼내놓는다 (그 이후로는 exe 옆 파일이 진짜 설정이 된다).
-        (os.path.join(ROOT_DIR, 'config', 'settings.json'), 'config'),
+        # exe 안에 "기본 설정"으로 함께 담아둔다 (25단계: settings.json은 현장 파일이라
+        # git에도 exe에도 넣지 않는다). src/config.py가 exe 옆에 config/settings.json이
+        # 없을 때만 이걸 복사해서 꺼내놓고, 빠진 키를 채울 때도 이 파일을 읽는다.
+        (os.path.join(ROOT_DIR, 'config', 'settings.default.json'), 'config'),
         (os.path.join(ROOT_DIR, 'config', 'settings.md'), 'config'),
     ],
     hiddenimports=[
