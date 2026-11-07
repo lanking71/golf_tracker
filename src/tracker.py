@@ -495,8 +495,14 @@ class Tracker:
 
     @property
     def lost_hole(self):
-        """공이 홀컵 근처에서 사라져 홀인 확인을 기다리는 중이면 (홀 번호, 컵 중심 px), 아니면 None."""
-        return self._lost_hole if self._lost_since is not None else None
+        """공이 홀컵 근처에서 사라져 홀인 확인을 기다리는 중이면 (홀 번호, 컵 중심 px), 아니면 None.
+
+        추적 중(TRACKING)일 때만 값이 있다. (현장 수정: 홀인으로 끝난 뒤에도 값이 남아 있어서, 공을 꺼내는
+        손이 컵 위에 있는 동안 엔진이 '컵에 붙은 공' 검사를 매 프레임 하고 로그를 남겼다)
+        """
+        if self.state != TrackerState.TRACKING or self._lost_since is None:
+            return None
+        return self._lost_hole
 
     @property
     def lost_since(self) -> float | None:

@@ -40,6 +40,8 @@ class FakeCamera:
         self.decoys: list[tuple[int, int]] = []
         # 공과 같은 색의 큰 원(홀컵 역할) 위치 목록. 25단계 크기 판정·고정 물체·홀인 테스트용
         self.cups: list[tuple[int, int]] = []
+        # 아주 큰 같은 색 원(사람 신발 역할, 반지름 60px = 공의 약 11배) 위치 목록
+        self.big: list[tuple[int, int]] = []
         self.available = True  # False로 바꾸면 카메라가 끊긴 것처럼 동작한다
         self.open_calls = 0  # open()이 불린 횟수 (재연결 시도 간격을 확인하는 데 쓴다)
         self._opened = False
@@ -65,6 +67,8 @@ class FakeCamera:
             cv2.circle(frame, decoy, BALL_RADIUS, BALL_COLOR_BGR, -1)
         for cup in self.cups:
             cv2.circle(frame, cup, CUP_RADIUS, BALL_COLOR_BGR, -1)
+        for big in self.big:
+            cv2.circle(frame, big, 60, BALL_COLOR_BGR, -1)
         return frame
 
     def release(self) -> None:

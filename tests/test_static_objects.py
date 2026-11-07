@@ -187,6 +187,14 @@ class EngineStaticTests(EngineTestCase):
         self.step()
         self.assertIsNotNone(self.engine.last_detection)
 
+    def test_huge_blob_is_not_remembered(self):
+        # 수집할 때 매트 위에 있던 아주 큰 물체(사람 신발 등)는 고정 물체·홀컵으로 기억하지 않는다
+        self.camera.big = [(600, 250)]
+        self.calibrate_and_scan()
+        positions = [(round(o.x, -1), round(o.y, -1)) for o in self.engine.static_objects.objects]
+        self.assertEqual(positions, [(800, 400)])
+        self.assertEqual(self.engine.static_objects.objects[0].hole, 1)  # 컵이 1번 (큰 물체 때문에 밀리지 않음)
+
     def test_rescan_refused_while_tracking(self):
         self.calibrate_and_scan()
         self.assertEqual(self.engine.register_start(), "OK")

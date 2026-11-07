@@ -88,7 +88,8 @@
         "enabled": true,
         "scan_duration": 3.0,
         "still_tolerance_px": 3,
-        "rim_accept_ratio": 0.8
+        "rim_accept_ratio": 0.8,
+        "max_area_ratio": 4.0
     },
     "hole": {
         "enabled": true,

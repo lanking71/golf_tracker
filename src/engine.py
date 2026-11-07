@@ -1599,6 +1599,24 @@ class VisionEngine(QObject):
             self.static_scan_changed.emit(False)
             return
         calibrated = self.calibration.is_calibrated()
+        if calibrated:
+            # 공보다 훨씬 큰 덩어리(사람 신발 등)는 기억하지 않는다 (static.max_area_ratio 설명 참고)
+            max_ratio = float(self.static_config["max_area_ratio"])
+            kept = []
+            for obj in objects:
+                expected = self._expected_ball_area(obj.x, obj.y)
+                if expected and obj.area > expected * max_ratio:
+                    logger.info(
+                        "  고정 물체에서 뺌: 위치 (%.0f, %.0f)px, 면적 %.0fpx² (공 예상 면적의 x%.1f > x%.1f, 신발 등 큰 물체)",
+                        obj.x,
+                        obj.y,
+                        obj.area,
+                        obj.area / expected,
+                        max_ratio,
+                    )
+                else:
+                    kept.append(obj)
+            objects = kept
         number_holes(
             objects,
             self._expected_ball_area if calibrated else (lambda _x, _y: None),

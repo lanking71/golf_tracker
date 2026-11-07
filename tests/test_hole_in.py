@@ -154,6 +154,15 @@ class EngineHoleTests(EngineTestCase):
             self.step()
         self.assertEqual(self.engine.tracker.finish_reason, STOP_REASON)
 
+    def test_no_hole_check_after_finish(self):
+        # 홀인으로 끝난 뒤에는 홀인 확인 상태가 남지 않는다 (공을 꺼내는 손 때문에 검사·로그가 반복되던 문제)
+        self.roll(range(340, 741, 40))
+        self.camera.ball = None
+        for _ in range(15):
+            self.step()
+        self.assertEqual(self.engine.tracker.finish_reason, HOLE_REASON)
+        self.assertIsNone(self.engine.tracker.lost_hole)
+
     def test_lost_far_from_cup_is_lost(self):
         self.roll(range(340, 461, 40))  # 컵에서 먼 곳
         self.camera.ball = None
