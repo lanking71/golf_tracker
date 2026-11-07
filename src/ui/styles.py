@@ -94,6 +94,17 @@ QPushButton#primary:pressed {
     background-color: #B8890F;
 }
 
+/* 27단계: 카메라 창 위 보기 전환 버튼 ("카메라 보기" / "전체 보기").
+   선택된 버튼만 골드, 나머지는 기본 초록 버튼 */
+QPushButton#view_toggle {
+    padding: 8px 20px;
+}
+QPushButton#view_toggle:checked {
+    background-color: #D4A017;
+    color: #1B4332;
+    font-weight: bold;
+}
+
 /* 지금 상태에서 누를 수 없는 버튼 (Tracker.can()이 False일 때) */
 QPushButton:disabled {
     background-color: #1F4A38;

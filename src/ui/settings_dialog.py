@@ -81,6 +81,8 @@ class SettingsDialog(QDialog):
     detection_debug_toggled = Signal(bool)
     # 26단계: '자동 흐름' 체크박스를 바꿨을 때 (켬/끔)
     auto_toggled = Signal(bool)
+    # 27단계: '카메라 화면에 궤적 표시' 체크박스를 바꿨을 때
+    trajectory_toggled = Signal(bool)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -232,6 +234,12 @@ class SettingsDialog(QDialog):
         self.grid_checkbox = QCheckBox("카메라 화면에 격자선 표시")
         self.grid_checkbox.toggled.connect(self.grid_toggled.emit)
         layout.addWidget(self.grid_checkbox)
+
+        # 27단계: 카메라 화면(과 전체 보기)에 궤적을 직접 그릴지. 바로 적용되고 ui.show_trajectory에 저장된다
+        self.trajectory_checkbox = QCheckBox("카메라 화면에 궤적 표시")
+        self.trajectory_checkbox.setChecked(True)
+        self.trajectory_checkbox.toggled.connect(self.trajectory_toggled.emit)
+        layout.addWidget(self.trajectory_checkbox)
 
         self.debug_checkbox = QCheckBox("검출 디버그 표시 (면적·비율·고정 물체·검색 영역)")
         self.debug_checkbox.toggled.connect(self.detection_debug_toggled.emit)

@@ -8,17 +8,23 @@ EngineTestCase는 테스트마다
 """
 
 import logging
+import os
 import shutil
 import tempfile
 import unittest
 
-from PySide6.QtCore import QCoreApplication
+# 27단계: 화면(위젯) 테스트도 함께 돌리므로 QCoreApplication 대신 QApplication을 만든다.
+# 실제 창을 띄우지 않도록 'offscreen'(화면 없는) 방식으로 그린다. QApplication은 반드시
+# 다른 Qt 객체보다 먼저 하나만 만들어야 해서, 모든 테스트가 쓰는 이 파일에서 만든다.
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+from PySide6.QtWidgets import QApplication  # noqa: E402  (환경 변수를 먼저 정해야 해서 import가 아래에 있다)
 
 from src.engine import VisionEngine
 from tests.fake_camera import FakeCamera, make_test_settings
 
 # Qt 객체(시그널·타이머·TCP 서버)를 만들려면 Qt 애플리케이션이 하나 있어야 한다.
-qt_app = QCoreApplication.instance() or QCoreApplication([])
+qt_app = QApplication.instance() or QApplication([])
 
 # 테스트 중에는 로그를 어디에도 출력하지 않는다. (핸들러가 하나도 없으면 파이썬이 경고 이상의
 # 로그를 콘솔에 마구 찍기 때문에, 아무것도 안 하는 핸들러를 붙여 둔다. 로그 내용을 확인하는

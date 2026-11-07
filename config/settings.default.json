@@ -126,6 +126,10 @@
             255
         ]
     },
+    "ui": {
+        "view_mode": "camera",
+        "show_trajectory": true
+    },
     "protocol": {
         "enabled": true,
         "port": 9000,

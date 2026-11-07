@@ -82,6 +82,7 @@ import numpy as np
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import (
+    QButtonGroup,
     QHBoxLayout,
     QLabel,
     QMainWindow,
@@ -115,6 +116,7 @@ from src.protocol_server import DEFAULT_ENABLED as DEFAULT_PROTOCOL_ENABLED
 from src.protocol_server import DEFAULT_PORT as DEFAULT_PROTOCOL_PORT
 from src.tracker import TrackerState
 from src.ui.camera_label import CameraLabel
+from src.ui.mat_view import MatView
 from src.ui.records_dialog import RecordsDialog
 from src.ui.settings_dialog import SettingsDialog
 from src.ui.styles import QSS
@@ -154,20 +156,22 @@ CALIBRATION_FONT_THICKNESS = 2
 MAT_OUTLINE_COLOR_BGR = START_POINT_COLOR_BGR
 MAT_OUTLINE_THICKNESS = 1
 
-# 캘리브레이션됐을 때 궤적 패널을 매트 실제 비율(가로:세로)로 그리는
-# 기준 해상도. 라벨 크기에 맞춰 다시 스케일되므로 절대값은 중요하지
-# 않고 비율만 정확하면 된다.
-TRAJECTORY_REAL_CANVAS_WIDTH = 1000
-
-# 궤적 결과 패널 색상 (OpenCV는 BGR 순서)
-TRAJECTORY_BG_COLOR_BGR = (79, 106, 45)  # 패널 배경 (#2D6A4F)과 동일
-TRAJECTORY_START_RADIUS = 10  # 궤적 패널의 시작점(골드) 반지름
+# 궤적 그리기 (27단계: 카메라 화면 위와 '전체 보기' 위에 직접 그린다. 둘 다 가로 약 1440px 화면 기준)
+TRAJECTORY_START_RADIUS = 10  # 시작점(골드) 반지름 - 전체 보기에서만 (카메라 보기는 기존 시작점 표시를 쓴다)
 TRAJECTORY_PATH_COLOR_BGR = (178, 213, 149)  # 라임 (#95D5B2)
-TRAJECTORY_PATH_THICKNESS = 2
+TRAJECTORY_PATH_THICKNESS = 3
 TRAJECTORY_CURRENT_COLOR_BGR = (255, 255, 255)  # 현재 위치는 흰 점
 TRAJECTORY_CURRENT_RADIUS = 6
 TRAJECTORY_STOP_RADIUS = 14  # 정지 위치는 골드 "링"(테두리만)으로 표시
 TRAJECTORY_STOP_THICKNESS = 3
+
+# 27단계: 보기 모드 (카메라 창 위 토글 버튼). config/settings.json의 ui.view_mode에 저장된다
+VIEW_CAMERA = "camera"  # 카메라 영상 그대로 + 궤적
+VIEW_MAT = "mat"  # 캘리브레이션 영역을 위에서 반듯하게 펼친 '전체 보기'
+# 전체 보기 위에 그리는 공 반지름(mm, 골프공 지름 42.67mm의 절반)
+MAT_VIEW_BALL_RADIUS_MM = 21.3
+# 화면 그리기 시간을 로그에 남기는 간격(초) - 전체 보기 켬/끔 비교용
+RENDER_LOG_INTERVAL_S = 10.0
 
 # 요약 통계 패널 (궤적 캔버스 오른쪽의 별도 Qt 라벨). 캔버스에 직접 그리지
 # 않고 Qt 텍스트로 표시해서, 카메라 해상도/창 크기와 무관하게 항상 선명하다.
@@ -380,6 +384,20 @@ class MainWindow(QMainWindow):
         # 카메라 화면에 격자선을 그릴지 (설정창의 '격자선 표시'로 켠다)
         self._show_grid = False
 
+        # 27단계: 보기 모드와 궤적 표시 (config/settings.json의 ui 항목. 다시 켜도 유지)
+        ui_settings = load_settings().get("ui") or {}
+        self._view_mode = VIEW_MAT if ui_settings.get("view_mode") == VIEW_MAT else VIEW_CAMERA
+        self._show_trajectory = bool(ui_settings.get("show_trajectory", True))
+        self._mat_view = MatView()
+        # 마지막으로 화면에 보낸 그림과 그때 보기 (테스트·확인용)
+        self._last_view_frame = None
+        self._last_view = VIEW_CAMERA
+        # 화면 그리기 시간 집계 (RENDER_LOG_INTERVAL_S마다 로그)
+        self._render_total = 0.0
+        self._render_max = 0.0
+        self._render_count = 0
+        self._render_since = time.perf_counter()
+
         # 측정 결과 기록 보기 다이얼로그 (기록 메뉴에서 연다)
         self.records_dialog: RecordsDialog | None = None
 
@@ -387,7 +405,7 @@ class MainWindow(QMainWindow):
         engine.frame_processed.connect(self._on_frame_processed)
         engine.camera_unavailable.connect(self._show_camera_not_connected)
         engine.changed.connect(self._refresh_after_engine_change)
-        engine.trajectory_updated.connect(self._render_trajectory_panel)
+        engine.trajectory_updated.connect(self._refresh_trajectory_view)
         engine.tracking_started.connect(self._refresh_after_engine_change)
         engine.tracking_finished.connect(self._on_tracking_finished)
         engine.protocol_server.client_count_changed.connect(self._update_app_label)
@@ -396,12 +414,13 @@ class MainWindow(QMainWindow):
         engine.auto_changed.connect(self._refresh_after_engine_change)
 
         # 시작 상태(IDLE)에 맞게 배지 문구와 버튼 활성화 상태를 맞춘다.
+        self._update_view_buttons()
         self._update_auto_label()
         self._update_status_badge()
         self._update_button_states()
         self._update_start_point_label()
         self._update_stop_point_label()
-        self._render_trajectory_panel()
+        self._refresh_trajectory_view()
         self._update_warning_label()
 
     # 엔진의 부품에 self.tracker처럼 짧게 접근하기 위한 통로.
@@ -447,35 +466,36 @@ class MainWindow(QMainWindow):
         records_action.triggered.connect(self._open_records_dialog)
 
     def _build_left_panel(self) -> QVBoxLayout:
-        """왼쪽 영역: 위(실시간 카메라) / 아래(궤적 결과 + 요약 통계)를 세로로 배치"""
+        """왼쪽 영역: 위(보기 전환 버튼 2개) / 아래(카메라 창, 남는 공간을 모두 차지)
+
+        27단계: 예전에는 카메라 창 아래에 궤적 결과 창이 따로 있었다. 이제 궤적은 카메라 창 위에
+        직접 그리므로 아래 창을 없애고 그 자리만큼 카메라 창을 키웠다. 요약 통계는 오른쪽 버튼 열
+        아래로 옮겼다 (_build_right_panel).
+        """
         layout = QVBoxLayout()
         layout.setSpacing(12)
 
-        self.camera_label = CameraLabel("실시간 카메라 화면\n(다음 단계에서 연결)")
+        # 보기 전환: "카메라 보기" / "전체 보기" 중 하나만 선택된다 (QButtonGroup, exclusive)
+        view_row = QHBoxLayout()
+        view_row.setSpacing(10)
+        self.view_buttons: dict[str, QPushButton] = {}
+        self.view_group = QButtonGroup(self)
+        self.view_group.setExclusive(True)
+        for mode, text in ((VIEW_CAMERA, "카메라 보기"), (VIEW_MAT, "전체 보기")):
+            button = QPushButton(text)
+            button.setObjectName("view_toggle")  # 선택된 버튼만 골드 (styles.py)
+            button.setCheckable(True)
+            button.clicked.connect(lambda _checked=False, m=mode: self._set_view_mode(m))
+            self.view_group.addButton(button)
+            view_row.addWidget(button)
+            self.view_buttons[mode] = button
+        view_row.addStretch(1)
+        layout.addLayout(view_row)
+
+        self.camera_label = CameraLabel("실시간 카메라 화면")
         self.camera_label.setObjectName("panel")
         self.camera_label.setMinimumSize(400, 250)
-        # 카메라 화면을 크게 보이도록 아래 궤적 영역보다 2배 높이를 준다 (예전 1:1)
-        layout.addWidget(self.camera_label, 2)
-
-        trajectory_row = QHBoxLayout()
-        trajectory_row.setSpacing(12)
-        layout.addLayout(trajectory_row, 1)
-
-        self.trajectory_label = QLabel("궤적 결과 화면\n(다음 단계에서 연결)")
-        self.trajectory_label.setObjectName("panel")
-        self.trajectory_label.setMinimumSize(300, 250)
-        trajectory_row.addWidget(self.trajectory_label, 3)
-
-        # 요약 통계는 캔버스에 직접 그리지 않고 별도 Qt 라벨로 둬서,
-        # 카메라 해상도나 창 크기와 무관하게 글씨가 항상 선명하게 보이게 한다.
-        self.stats_label = QLabel(STATS_PLACEHOLDER_TEXT)
-        self.stats_label.setObjectName("stats_card")
-        self.stats_label.setMinimumWidth(180)
-        self.stats_label.setMaximumWidth(260)
-        self.stats_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
-        self.stats_label.setWordWrap(True)
-        trajectory_row.addWidget(self.stats_label, 1)
-
+        layout.addWidget(self.camera_label, 1)
         return layout
 
     def _build_right_panel(self) -> QVBoxLayout:
@@ -526,7 +546,17 @@ class MainWindow(QMainWindow):
         self.static_scan_button.clicked.connect(self._rescan_static_objects)
         layout.addWidget(self.static_scan_button)
 
-        # 버튼들을 위쪽으로 붙이고 아래는 빈 공간으로 남김
+        # 27단계: 요약 통계는 오른쪽 버튼 열 아래에 둔다 (예전에는 아래 궤적 창 옆).
+        # 캔버스에 직접 그리지 않고 별도 Qt 라벨로 둬서 창 크기와 무관하게 글씨가 항상 선명하다.
+        layout.addSpacing(8)
+        self.stats_label = QLabel(STATS_PLACEHOLDER_TEXT)
+        self.stats_label.setObjectName("stats_card")
+        self.stats_label.setMinimumWidth(180)
+        self.stats_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        self.stats_label.setWordWrap(True)
+        layout.addWidget(self.stats_label)
+
+        # 버튼·통계를 위쪽으로 붙이고 아래는 빈 공간으로 남김
         layout.addStretch(1)
         return layout
 
@@ -559,7 +589,7 @@ class MainWindow(QMainWindow):
         self._update_button_states()
         self._update_start_point_label()
         self._update_stop_point_label()
-        self._render_trajectory_panel()
+        self._refresh_trajectory_view()
 
     def _on_camera_clicked(self, x: int, y: int) -> None:
         """카메라 화면 왼쪽 클릭. CALIBRATING 상태일 때만 쓴다.
@@ -651,7 +681,7 @@ class MainWindow(QMainWindow):
         self._update_status_badge()
         self._update_calibration_guide()
         self._update_warning_label()
-        self._render_trajectory_panel()
+        self._refresh_trajectory_view()
 
     def _update_calibration_guide(self) -> None:
         """캘리브레이션 안내 띠와 보조 버튼(확정/직접 지정/다시 지정)을 지금 상태에 맞게 보여준다."""
@@ -980,6 +1010,7 @@ class MainWindow(QMainWindow):
             self.settings_dialog.grid_toggled.connect(self._on_grid_toggled)
             self.settings_dialog.detection_debug_toggled.connect(self.engine.set_detection_debug)
             self.settings_dialog.auto_toggled.connect(self._on_auto_toggled)
+            self.settings_dialog.trajectory_toggled.connect(self._on_trajectory_toggled)
         else:
             # 그 사이 다른 곳(HSV 튜닝 등)에서 바뀐 내용도 반영되도록 다시 불러온다.
             self.settings_dialog.reload_from_settings()
@@ -988,6 +1019,9 @@ class MainWindow(QMainWindow):
         self.settings_dialog.auto_checkbox.blockSignals(True)
         self.settings_dialog.auto_checkbox.setChecked(self.engine.auto.enabled)
         self.settings_dialog.auto_checkbox.blockSignals(False)
+        self.settings_dialog.trajectory_checkbox.blockSignals(True)
+        self.settings_dialog.trajectory_checkbox.setChecked(self._show_trajectory)
+        self.settings_dialog.trajectory_checkbox.blockSignals(False)
         self.settings_dialog.show()
         self.settings_dialog.raise_()
         self.settings_dialog.activateWindow()
@@ -996,7 +1030,7 @@ class MainWindow(QMainWindow):
         """프로필/매트 설정 창에서 뭔가 저장되면 엔진이 검출기·캘리브레이션을 새로 불러온다."""
         self.engine.reload_settings()
         # 매트 크기가 바뀌었을 수 있으니(비율이 달라짐) 궤적 패널을 다시 그린다.
-        self._render_trajectory_panel()
+        self._refresh_trajectory_view()
 
     def _open_records_dialog(self) -> None:
         """'기록 > 기록 보기...' 메뉴를 눌렀을 때 저장된 측정 기록 창을 연다."""
@@ -1024,7 +1058,7 @@ class MainWindow(QMainWindow):
         if self._frame_size != new_frame_size:
             self._frame_size = new_frame_size
             self.camera_label.set_frame_size(self._frame_size)
-            self._render_trajectory_panel()
+            self._refresh_trajectory_view()
 
         if result.paused and self._pick_mode:
             # 색 추출 모드: 마스크 대신 실제 영상을 보여줘야 공을 보고 클릭할 수 있다
@@ -1045,13 +1079,62 @@ class MainWindow(QMainWindow):
             self.camera_label.setPixmap(self._mask_to_pixmap(mask))
             return
 
-        # 엔진이 넘긴 원본은 다른 곳(캘리브레이션 등)에서도 쓰므로, 그림은 복사본에 그린다.
-        frame = raw_frame.copy()
-
+        render_started = time.perf_counter()
         self._update_coord_label(result.detection, result.outside_mat)
+        self._update_view_buttons()
+        view = self._effective_view()
+        if view == VIEW_MAT:
+            frame = self._compose_mat_view(result)
+        else:
+            frame = self._compose_camera_view(result)
+        self._last_view_frame = frame
+        self._last_view = view
+
+        self._update_fps()
+        self._update_warning_label()
+        self._update_calibration_guide()
+        if view == VIEW_CAMERA:
+            # 돋보기는 그림(모서리 점 등)이 그려진 카메라 프레임을 확대한다
+            self._last_drawn_frame = frame
+            if self._hover_point is not None or self._drag_point is not None:
+                self._update_magnifier()
+        pixmap = self._frame_to_pixmap(frame, self.camera_label.size())
+        self.camera_label.setPixmap(pixmap)
+        self._record_render_time(time.perf_counter() - render_started, view)
+
+    # ------------------------------------------------------------------
+    # 27단계: 카메라 보기 / 전체 보기
+    # ------------------------------------------------------------------
+    def _compose_camera_view(self, result: FrameResult):
+        """카메라 보기: 처리 프레임 위에 매트 윤곽·시작 구역·궤적·공 표시를 그린 그림을 돌려준다.
+
+        그리는 순서 (뒤에 그린 것이 위에 보인다):
+          격자선 → 매트 윤곽선·시작 구역 → 궤적 → 디버그(검색 영역·후보·고정 물체) → 공 검출 → 시작점
+          → 캘리브레이션 모서리
+        궤적을 공 표시보다 먼저 그려서, 선이 지금 공을 가리지 않게 한다.
+        """
+        # 엔진이 넘긴 원본은 다른 곳(캘리브레이션 등)에서도 쓰므로, 그림은 복사본에 그린다.
+        frame = result.frame.copy()
         if self._show_grid:
             # 격자선은 가장 먼저(맨 아래에) 그려서 공·모서리 표시를 가리지 않게 한다
             self._draw_grid(frame)
+
+        corners = list(self.calibration.corners)
+        if self._drag_index is not None and self._drag_point is not None and len(corners) == 4:
+            # 드래그 중인 점은 아직 저장 전이지만 새 위치로 미리 보여준다
+            corners[self._drag_index] = self._drag_point
+        if self.calibration.is_calibrated():
+            # 4점을 다 찍은 직후(아직 CALIBRATING 상태일 때)도 매트 영역이 바로 확인되게 한다
+            self._draw_mat_outline(frame, corners)
+            if self.engine.auto.enabled:
+                # 26단계: 자동 모드면 시작 구역을 얇은 원으로 항상 그린다
+                self._draw_start_zone(frame)
+
+        if self._show_trajectory and self.tracker.state != TrackerState.CALIBRATING:
+            # 27단계: 궤적을 카메라 화면 위에 픽셀 좌표 그대로 그린다. 시작점은 아래 _draw_start_point가 그린다.
+            points = [(p.x, p.y) for p in self.tracker.trajectory]
+            self._paint_trajectory(frame, points, None, self.tracker.stop_position)
+
         if result.candidates is not None:
             # 디버그 표시를 켰을 때만: 이번 프레임의 검색 영역(24단계)과 덩어리 정보,
             # 고정 물체(25단계, 파란 원)
@@ -1064,44 +1147,142 @@ class MainWindow(QMainWindow):
             # 공은 보이지만 매트 밖이라 무시된 검출은 경고색으로 표시한다.
             self._draw_outside_mat_detection(frame, result.raw_detection)
 
-        if self.engine.auto.enabled and self.calibration.is_calibrated():
-            # 26단계: 자동 모드면 시작 구역을 얇은 원으로 항상 그린다
-            self._draw_start_zone(frame)
-
         if self.tracker.start_position is not None:
             self._draw_start_point(frame, self.tracker.start_position)
 
-        corners = list(self.calibration.corners)
-        if self._drag_index is not None and self._drag_point is not None and len(corners) == 4:
-            # 드래그 중인 점은 아직 저장 전이지만 새 위치로 미리 보여준다
-            corners[self._drag_index] = self._drag_point
         if self.tracker.state == TrackerState.CALIBRATING:
             if self.engine.calibration_proposal is not None:
                 self._draw_proposal(frame, self.engine.calibration_proposal)
             self._draw_calibration_corners(frame, corners)
             if self._drag_index is not None and self._drag_point is not None:
                 cv2.circle(frame, self._drag_point, CALIBRATION_POINT_RADIUS + 4, DRAG_COLOR_BGR, 2)
-        if self.calibration.is_calibrated():
-            # 4점을 다 찍은 직후(아직 CALIBRATING 상태일 때)도 매트 영역이
-            # 바로 확인되도록, 두 그리기를 동시에 할 수 있게 elif가 아닌 if로 둔다.
-            self._draw_mat_outline(frame, corners)
+        return frame
 
-        self._update_fps()
-        self._update_warning_label()
-        self._update_calibration_guide()
-        # 돋보기는 그림(모서리 점 등)이 그려진 프레임을 확대한다
-        self._last_drawn_frame = frame
-        if self._hover_point is not None or self._drag_point is not None:
-            self._update_magnifier()
-        pixmap = self._frame_to_pixmap(frame, self.camera_label.size())
-        self.camera_label.setPixmap(pixmap)
+    def _compose_mat_view(self, result: FrameResult):
+        """전체 보기: 캘리브레이션 영역을 위에서 반듯하게 펼친 그림 위에 mm 좌표로 그린다.
+
+        펼치기(cv2.warpPerspective)는 src/ui/mat_view.py가 한다. 그 위에 시작 구역·홀컵·궤적·
+        지금 공 위치를 매트 mm 좌표 → 출력 화면 좌표로 바꿔서 그린다.
+        디버그 표시(검색 영역·후보)는 카메라 좌표 기준이라 전체 보기에서는 그리지 않는다.
+        """
+        calibration = self.calibration
+        view = self._mat_view.render(result.frame, calibration)
+        to_view = self._mat_view.mm_to_view
+
+        if self.engine.auto.enabled:
+            zone_mm = self.engine.auto_zone_mm()
+            if zone_mm is not None:
+                cv2.circle(
+                    view,
+                    to_view(zone_mm),
+                    self._mat_view.mm_length_to_view(self.engine.auto.zone_radius_mm),
+                    START_POINT_COLOR_BGR,
+                    1,
+                    cv2.LINE_AA,
+                )
+
+        for hole in self.engine.static_objects.holes():
+            center_mm = calibration.pixel_to_real(hole.x, hole.y)
+            px_per_mm = (calibration.mm_radius_to_px((hole.x, hole.y), 100.0) or 0) / 100.0
+            if center_mm is None or px_per_mm <= 0:
+                continue
+            center = to_view(center_mm)
+            radius = self._mat_view.mm_length_to_view(hole.radius / px_per_mm)
+            cv2.circle(view, center, radius, STATIC_OBJECT_COLOR_BGR, 2, cv2.LINE_AA)
+            cv2.putText(
+                view, f"H{hole.hole}", (center[0] - 12, center[1] - radius - 6),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, STATIC_OBJECT_COLOR_BGR, 2, cv2.LINE_AA,
+            )
+
+        if self._show_trajectory:
+            def pixel_to_view(point):
+                mm = calibration.pixel_to_real(*point)
+                return to_view(mm) if mm is not None else None
+
+            points = [pixel_to_view((p.x, p.y)) for p in self.tracker.trajectory]
+            if all(point is not None for point in points):
+                start = pixel_to_view(self.tracker.start_position) if self.tracker.start_position else None
+                stop = pixel_to_view(self.tracker.stop_position) if self.tracker.stop_position else None
+                self._paint_trajectory(view, points, start, stop)
+
+        if result.detection is not None:
+            ball_mm = calibration.pixel_to_real(result.detection.x, result.detection.y)
+            if ball_mm is not None:
+                center = to_view(ball_mm)
+                radius = self._mat_view.mm_length_to_view(MAT_VIEW_BALL_RADIUS_MM)
+                cv2.circle(view, center, radius, BALL_CIRCLE_COLOR_BGR, BALL_CIRCLE_THICKNESS, cv2.LINE_AA)
+                cv2.circle(view, center, BALL_CENTER_RADIUS, BALL_CENTER_COLOR_BGR, -1)
+        return view
+
+    def _effective_view(self) -> str:
+        """지금 실제로 보여줄 보기.
+
+        사용자가 '전체 보기'를 골랐어도 다음 경우에는 카메라 보기로 보여준다 (끝나면 원래 보기로 돌아간다):
+          - 캘리브레이션이 없거나 무효 (펼칠 기준이 없음)
+          - 캘리브레이션 중(모서리 찍기), 색 잡기 중, HSV 튜닝 미리보기 중: 카메라 화면을 클릭해야 하므로
+        """
+        if self._view_mode != VIEW_MAT or not self.calibration.is_calibrated():
+            return VIEW_CAMERA
+        if self.tracker.state == TrackerState.CALIBRATING or self._pick_mode or self._preview_hsv is not None:
+            return VIEW_CAMERA
+        return VIEW_MAT
+
+    def _set_view_mode(self, mode: str) -> None:
+        """보기 전환 버튼: 고른 보기를 기억하고 현장 파일(ui.view_mode)에 저장한다."""
+        if mode == VIEW_MAT and not self.calibration.is_calibrated():
+            mode = VIEW_CAMERA
+        self._view_mode = mode
+        settings = load_settings()
+        settings.setdefault("ui", {})["view_mode"] = mode
+        save_settings(settings)
+        self._update_view_buttons()
+
+    def _update_view_buttons(self) -> None:
+        """보기 버튼의 선택·활성 상태를 지금 실제로 보여주는 보기에 맞춘다 (매 프레임 불려도 가볍다)."""
+        effective = self._effective_view()
+        forced = self._view_mode == VIEW_MAT and effective == VIEW_CAMERA
+        mat_button = self.view_buttons[VIEW_MAT]
+        # 캘리브레이션이 없거나, 캘리브레이션·색 잡기 중에는 '전체 보기'를 누를 수 없다
+        mat_button.setEnabled(self.calibration.is_calibrated() and not forced)
+        for mode, button in self.view_buttons.items():
+            if button.isChecked() != (mode == effective):
+                button.blockSignals(True)
+                button.setChecked(mode == effective)
+                button.blockSignals(False)
+
+    def _on_trajectory_toggled(self, enabled: bool) -> None:
+        """설정창의 '카메라 화면에 궤적 표시' 체크박스: 바로 적용하고 저장한다."""
+        self._show_trajectory = bool(enabled)
+        settings = load_settings()
+        settings.setdefault("ui", {})["show_trajectory"] = self._show_trajectory
+        save_settings(settings)
+
+    def _record_render_time(self, elapsed: float, view: str) -> None:
+        """화면 그리기 시간을 모아 두었다가 RENDER_LOG_INTERVAL_S마다 로그에 남긴다 (전체 보기 켬/끔 비교용)."""
+        self._render_total += elapsed
+        self._render_max = max(self._render_max, elapsed)
+        self._render_count += 1
+        now = time.perf_counter()
+        if now - self._render_since < RENDER_LOG_INTERVAL_S:
+            return
+        logger.info(
+            "화면 그리기 - 보기 %s, 평균 %.1fms, 최대 %.1fms, 화면 FPS %.1f",
+            "전체 보기" if view == VIEW_MAT else "카메라 보기",
+            self._render_total / self._render_count * 1000,
+            self._render_max * 1000,
+            self._fps,
+        )
+        self._render_total = 0.0
+        self._render_max = 0.0
+        self._render_count = 0
+        self._render_since = now
 
     def _on_tracking_finished(self, *_reason) -> None:
         """정지·이탈 판정으로 TRACKING -> FINISHED 자동 전환이 일어났을 때 UI를 갱신한다."""
         self._update_status_badge()
         self._update_button_states()
         self._update_stop_point_label()
-        self._render_trajectory_panel()
+        self._refresh_trajectory_view()
 
     def _update_coord_label(self, detection: BallDetection | None, outside_mat: bool = False) -> None:
         """검출된 공의 중심 좌표를 상태 라벨 옆 배지에 표시한다.
@@ -1360,67 +1541,20 @@ class MainWindow(QMainWindow):
             Qt.SmoothTransformation,
         )
 
-    def _render_trajectory_panel(self) -> None:
-        """궤적 리스트를 바탕으로 아래쪽 궤적 결과 캔버스와 오른쪽 통계 패널을 새로 그린다.
+    def _refresh_trajectory_view(self) -> None:
+        """궤적이 바뀌었을 때 화면을 갱신한다.
 
-        캘리브레이션이 됐으면 매트 실제 비율(가로:세로)에 맞춘 캔버스에
-        mm 좌표로 변환해서 그리고, 안 됐으면(또는 아직 카메라 프레임
-        크기를 모르면) 기존처럼 카메라 프레임 비율 그대로 픽셀 좌표로
-        그린다. 통계 패널은 캔버스와 무관하므로 항상 별도로 갱신한다.
+        27단계부터 궤적은 카메라 보기·전체 보기 위에 매 프레임 직접 그리므로(_compose_camera_view,
+        _compose_mat_view) 여기서는 오른쪽 요약 통계만 다시 계산한다. 다음 프레임에 궤적도 새로 그려진다.
         """
         self._update_stats_panel()
 
-        if self.calibration.is_calibrated():
-            canvas = self._build_real_trajectory_canvas()
-        elif self._frame_size is not None:
-            canvas = self._build_pixel_trajectory_canvas()
-        else:
-            return
-
-        pixmap = self._frame_to_pixmap(canvas, self.trajectory_label.size())
-        self.trajectory_label.setPixmap(pixmap)
-
-    def _build_pixel_trajectory_canvas(self):
-        """캘리브레이션이 안 됐을 때: 카메라 프레임과 같은 비율·좌표로 궤적 캔버스를 만든다."""
-        width, height = self._frame_size
-        canvas = np.full((height, width, 3), TRAJECTORY_BG_COLOR_BGR, dtype=np.uint8)
-        points = [(p.x, p.y) for p in self.tracker.trajectory]
-        self._paint_trajectory(canvas, points, self.tracker.start_position, self.tracker.stop_position)
-        return canvas
-
-    def _build_real_trajectory_canvas(self):
-        """캘리브레이션됐을 때: 매트 실제 비율(가로:세로)로 캔버스를 만들고 mm 좌표로 그린다."""
-        width = TRAJECTORY_REAL_CANVAS_WIDTH
-        height = max(1, round(width * self.calibration.mat_height_mm / self.calibration.mat_width_mm))
-        canvas = np.full((height, width, 3), TRAJECTORY_BG_COLOR_BGR, dtype=np.uint8)
-
-        def to_canvas(mm_point):
-            mx, my = mm_point
-            # 매트 밖 픽셀은 원근 변환상 mat_width_mm/mat_height_mm을 넘는 값으로
-            # 계산될 수 있다 (원근 변환은 캘리브레이션 사각형 밖도 수학적으로
-            # 계속 외삽하기 때문). filter_outside_mat이 그런 점이 궤적에
-            # 기록되는 것 자체는 막아주지만, 혹시 몰라 캔버스 밖으로 그려지지
-            # 않도록 여기서도 0~캔버스 크기 범위로 한 번 더 잘라낸다.
-            canvas_x = int(mx / self.calibration.mat_width_mm * width)
-            canvas_y = int(my / self.calibration.mat_height_mm * height)
-            canvas_x = max(0, min(width - 1, canvas_x))
-            canvas_y = max(0, min(height - 1, canvas_y))
-            return (canvas_x, canvas_y)
-
-        points = [to_canvas(self.calibration.pixel_to_real(p.x, p.y)) for p in self.tracker.trajectory]
-        start = to_canvas(self.calibration.pixel_to_real(*self.tracker.start_position)) \
-            if self.tracker.start_position is not None else None
-        stop = to_canvas(self.calibration.pixel_to_real(*self.tracker.stop_position)) \
-            if self.tracker.stop_position is not None else None
-
-        self._paint_trajectory(canvas, points, start, stop)
-        return canvas
-
     def _paint_trajectory(self, canvas, points: list, start_point: tuple | None, stop_point: tuple | None) -> None:
-        """캔버스 위에 시작점(골드 점)·경로(라임 선)·현재 위치(흰 점)·정지 위치(골드 링)를 그린다.
+        """그림 위에 시작점(골드 점)·경로(라임 선)·현재 위치(흰 점)·정지 위치(골드 링)를 그린다.
 
-        points/start_point/stop_point는 이미 캔버스 좌표계로 변환된
-        값이어야 한다 (픽셀 그대로거나, mm을 캔버스 크기로 스케일한 값).
+        points/start_point/stop_point는 이미 그 그림의 좌표계로 바꾼 값이어야 한다
+        (카메라 보기는 처리 프레임 픽셀 그대로, 전체 보기는 mm를 출력 화면 좌표로 바꾼 값).
+        start_point가 None이면 시작점은 그리지 않는다.
         """
         if start_point is not None:
             cv2.circle(canvas, start_point, TRAJECTORY_START_RADIUS, START_POINT_COLOR_BGR, -1)
@@ -1526,16 +1660,12 @@ class MainWindow(QMainWindow):
         )
 
     def resizeEvent(self, event) -> None:
-        """창 크기가 바뀔 때 궤적 결과 패널을 새 크기에 맞게 다시 그린다.
+        """창 크기가 바뀔 때.
 
-        카메라 패널은 8ms마다 도는 타이머가 다음 프레임에 알아서 현재
-        라벨 크기로 다시 스케일링해서 그리지만(_frame_to_pixmap), 궤적
-        패널은 새 궤적 점이 생길 때만 다시 그려지므로, 창 크기 변경
-        시점에 즉시 다시 그려주지 않으면 리사이즈 전 크기로 남아 있게
-        된다.
+        카메라 창(궤적 포함)은 다음 프레임에 지금 라벨 크기에 맞춰 비율을 유지하며 다시 그려진다
+        (_frame_to_pixmap). 27단계에서 아래 궤적 창을 없앴으므로 따로 다시 그릴 것이 없다.
         """
         super().resizeEvent(event)
-        self._render_trajectory_panel()
 
     def _update_app_label(self, *_args) -> None:
         """상단의 앱 통신 상태 문구를 서버의 현재 상태로 갱신한다."""
@@ -1577,7 +1707,7 @@ class MainWindow(QMainWindow):
         self._update_button_states()
         self._update_start_point_label()
         self._update_stop_point_label()
-        self._render_trajectory_panel()
+        self._refresh_trajectory_view()
 
     def closeEvent(self, event) -> None:
         """창을 닫을 때 열려 있는 대화상자를 닫는다.
