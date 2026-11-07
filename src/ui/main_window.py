@@ -236,7 +236,7 @@ STATIC_OBJECT_COLOR_BGR = (255, 80, 0)
 # 고정 물체 수집 중 안내 문구
 STATIC_SCAN_GUIDE_TEXT = (
     "고정 물체(컵·티)를 찾는 중입니다 (약 3초) - 공과 손을 움직이지 마세요. "
-    "'고정 물체 다시 찾기'는 공을 매트에서 치운 뒤 누르세요."
+    "(공 크기 물체는 공일 수 있어서 기억하지 않습니다)"
 )
 STATIC_SCAN_BUTTON_TEXT = "고정 물체 다시 찾기"
 STATIC_SCANNING_BUTTON_TEXT = "고정 물체 찾는 중..."
@@ -443,7 +443,8 @@ class MainWindow(QMainWindow):
         self.camera_label = CameraLabel("실시간 카메라 화면\n(다음 단계에서 연결)")
         self.camera_label.setObjectName("panel")
         self.camera_label.setMinimumSize(400, 250)
-        layout.addWidget(self.camera_label, 1)
+        # 카메라 화면을 크게 보이도록 아래 궤적 영역보다 2배 높이를 준다 (예전 1:1)
+        layout.addWidget(self.camera_label, 2)
 
         trajectory_row = QHBoxLayout()
         trajectory_row.setSpacing(12)
@@ -891,6 +892,8 @@ class MainWindow(QMainWindow):
         self._update_calibration_guide()
         if frame is None or self.tuning_dialog is None:
             return
+        # 25단계: 공을 클릭한 자리가 고정 물체로 잘못 기억돼 있으면 지운다 (그대로 두면 공을 못 찾음)
+        self.engine.forget_static_at(x, y)
         sample = sample_ball_pixels(frame, (x, y))
         if sample is None:
             self.tuning_dialog.apply_color_result(None, len(self._color_samples))

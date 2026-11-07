@@ -38,7 +38,7 @@ class CollectorTests(unittest.TestCase):
         return collector.finish(lambda x, y: 9.0)
 
     def test_still_blob_is_kept_and_moving_blob_is_not(self):
-        frames = [[blob(100, 100), blob(200 + i * 10, 300, ball_ok=True)] for i in range(30)]
+        frames = [[blob(100, 100), blob(200 + i * 10, 300)] for i in range(30)]
         objects = self.run_scan(StaticObjectCollector(3.0, 3), frames, kind=SCAN_MANUAL)
         self.assertEqual(len(objects), 1)
         self.assertAlmostEqual(objects[0].x, 100)
@@ -58,8 +58,10 @@ class CollectorTests(unittest.TestCase):
         frames = [[blob(100, 100), blob(300, 300, area=200, diameter=16, ball_ok=True)] for _ in range(30)]
         auto = self.run_scan(StaticObjectCollector(3.0, 3), frames, kind=SCAN_AUTO)
         self.assertEqual(len(auto), 1)  # 공일 수도 있는 공 크기 덩어리는 기억하지 않음
+        # 수동 수집도 시작점이 없으면 공 크기 덩어리는 기억하지 않는다
+        # (현장에서 공을 매트에 둔 채 '고정 물체 다시 찾기'를 눌러 공 자리가 고정 물체가 됐던 문제)
         manual = self.run_scan(StaticObjectCollector(3.0, 3), frames, kind=SCAN_MANUAL)
-        self.assertEqual(len(manual), 2)  # 수동(공을 치운 상태)은 모두 기억
+        self.assertEqual(len(manual), 1)
 
     def test_too_few_frames_gives_none(self):
         self.assertIsNone(self.run_scan(StaticObjectCollector(3.0, 3), [[blob(1, 1)]] * 2))
@@ -172,6 +174,18 @@ class EngineStaticTests(EngineTestCase):
         self.step(ball=(800, 400 + 26 + 18 + 8))
         self.assertIsNotNone(self.engine.last_detection)
         self.assertAlmostEqual(self.engine.last_detection.y, 452, delta=2)
+
+    def test_color_pick_click_forgets_static_at_ball(self):
+        # 공 자리가 고정 물체로 잘못 기억된 상황 (예전 수동 수집에서 공을 둔 채 눌렀던 경우)
+        self.calibrate_and_scan()
+        self.engine.static_objects.objects.append(StaticObject(300, 400, 20, 1000))
+        self.step()
+        self.assertIsNone(self.engine.last_detection)  # 공을 못 찾음
+        self.assertEqual(self.engine.forget_static_at(302, 398), 1)  # 색 잡기에서 공 클릭
+        self.assertEqual(self.engine.forget_static_at(800, 400), 0)  # 홀컵은 지우지 않음
+        self.assertEqual(len(self.saved()["objects"]), 1)
+        self.step()
+        self.assertIsNotNone(self.engine.last_detection)
 
     def test_rescan_refused_while_tracking(self):
         self.calibrate_and_scan()

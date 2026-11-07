@@ -84,6 +84,9 @@ DEFAULT_HOLE_SETTINGS = {
     "min_area_ratio": 1.3,  # 고정 물체 면적이 공 예상 면적의 이 배수 이상이면 '홀컵'으로 본다
 }
 
+# 공 예상 면적을 기억해 두는 칸 크기(px). 이 칸 안에서는 같은 값을 쓴다 (처리 속도용)
+AREA_CACHE_CELL_PX = 16
+
 # 처리 프레임 크기·왜곡 보정이 바뀌어 저장된 캘리브레이션을 쓸 수 없을 때 알리는 문구
 CALIBRATION_STALE_MESSAGE = "해상도/왜곡 보정이 바뀌어 캘리브레이션을 다시 해야 합니다"
 
@@ -1077,8 +1080,21 @@ class VisionEngine(QObject):
         self._clock_hint = getattr(self, "_clock_hint", None)
 
     def _expected_ball_area(self, x: float, y: float) -> float | None:
-        """(x, y) 위치에서 공이 보여야 할 면적(px²). 캘리브레이션이 없으면 None (픽셀 기준 판정)."""
-        return self.calibration.expected_ball_area_px((x, y), self.ball["diameter_mm"])
+        """(x, y) 위치에서 공이 보여야 할 면적(px²). 캘리브레이션이 없으면 None (픽셀 기준 판정).
+
+        화면 전체를 찾을 때는 덩어리(매트 잔털 등)가 많아서 매번 계산하면 느려진다. 예상 면적은
+        위치에 따라 천천히 바뀌므로 16px 칸 단위로 한 번만 계산해서 기억해 둔다. 캘리브레이션이나
+        공 지름이 바뀌면 기억을 비운다.
+        """
+        key_owner = (id(self.calibration.matrix), self.ball["diameter_mm"])
+        if getattr(self, "_area_cache_owner", None) != key_owner:
+            self._area_cache_owner = key_owner
+            self._area_cache = {}
+        cell = (int(x) // AREA_CACHE_CELL_PX, int(y) // AREA_CACHE_CELL_PX)
+        if cell not in self._area_cache:
+            center = ((cell[0] + 0.5) * AREA_CACHE_CELL_PX, (cell[1] + 0.5) * AREA_CACHE_CELL_PX)
+            self._area_cache[cell] = self.calibration.expected_ball_area_px(center, self.ball["diameter_mm"])
+        return self._area_cache[cell]
 
     def _ball_radius_px(self, x: float, y: float) -> float | None:
         """(x, y) 위치에서 공 반경(px). 예상 면적에서 거꾸로 구한다 (넓이 = 원주율 x 반경²)."""
@@ -1153,6 +1169,37 @@ class VisionEngine(QObject):
                 len(saved.objects),
             )
         self.static_objects = StaticObjectMap(rim_accept_ratio=self.static_config["rim_accept_ratio"])
+
+    def forget_static_at(self, x: float, y: float) -> int:
+        """(x, y)에 있는 고정 물체 중 홀컵이 아닌 것을 지운다. 지운 개수를 돌려준다.
+
+        사용자가 색 잡기에서 공을 클릭했다면 그 자리에는 공이 있다는 확실한 표시다. 그 자리가
+        고정 물체로 기억돼 있으면(예: 공을 둔 채 '고정 물체 다시 찾기'를 눌렀던 경우) 공을 영영
+        못 찾으므로 지운다. 홀컵은 공보다 확실히 커서 공과 헷갈릴 일이 없으니 지우지 않는다.
+        """
+        keep = []
+        removed = []
+        for obj in self.static_objects.objects:
+            if obj.hole is None and math.hypot(x - obj.x, y - obj.y) <= obj.radius + 5:
+                removed.append(obj)
+            else:
+                keep.append(obj)
+        if not removed:
+            return 0
+        self.static_objects.objects = keep
+        self._saved_static_objects = self.static_objects
+        settings = load_settings()
+        settings["static_objects"] = self.static_objects.to_settings()
+        save_settings(settings)
+        for obj in removed:
+            logger.info(
+                "공을 클릭한 자리의 고정 물체를 지움 - 위치 (%.0f, %.0f)px, 면적 %.0fpx² (공을 고정 물체로 잘못 기억했던 것)",
+                obj.x,
+                obj.y,
+                obj.area,
+            )
+        self.changed.emit()
+        return len(removed)
 
     @property
     def static_scan_active(self) -> bool:
@@ -1247,8 +1294,10 @@ class VisionEngine(QObject):
                 obj.area,
                 f" (공 예상 면적의 x{obj.area / expected:.2f})" if expected else "",
             )
-        self.static_scan_changed.emit(False)
+        # changed(화면 전체 갱신)를 먼저 보내야, 그 뒤 static_scan_changed가 띄우는 "고정 물체 N개"
+        # 안내가 상태 배지 갱신에 바로 덮이지 않는다.
         self.changed.emit()
+        self.static_scan_changed.emit(False)
 
     # ------------------------------------------------------------------
     # 설정 다시 불러오기
